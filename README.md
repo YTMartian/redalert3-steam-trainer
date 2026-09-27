@@ -264,7 +264,8 @@ build.bat
 | `ascii_bats.py` | 重新生成所有 `.bat`（保证 100% ASCII，见下方说明）。幂等，可随时重跑 | 否 |
 | `verify_payload.py` | 构建一致性：trainer 精简 build 与 `assemble.py` 输出逐字节相同、`LABELS` 与固化标签一致、Capstone 段内非法跳转必须为 0 | 否 |
 | `test_tooltip.py` | GUI 悬停提示的自动化验证（文本 / 位置 / 绘制 / 销毁）+ 截图 | 否 |
-| `test_icon.py` | 图标端到端验证：ICO 各尺寸帧、`WM_GETICON` 回读窗口真实图标句柄、`iconphoto` 兜底路径 | 否（需桌面） |
+| `test_icon.py` | 图标端到端验证：ICO 各尺寸帧、`WM_GETICON` 回读窗口真实图标句柄、`iconphoto` 兜底路径、EXE 内嵌图标 | 否（需桌面） |
+| `test_readme.py` | README 结构自检：代码围栏成对、`5.x` 编号连续、正文引用的文件与图片都真实存在 | 否 |
 | `diag_unit.py` | 单位指针链**只读**诊断（不写内存），用于定位偏移 | 是 |
 | `rank_probe2.py` | 星级晋升机制**交互式**验证（详见 §5.3、§6） | 是 |
 
