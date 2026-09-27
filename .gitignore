@@ -1,0 +1,52 @@
+# ---------------------------------------------------------------
+#  游戏本体与第三方二进制（版权原因，禁止上传）
+# ---------------------------------------------------------------
+ra3_1.12.game
+ra3_*.game
+RA3.exe
+*.exe
+# ---------------------------------------------------------------
+#  大型二进制 / 分析 dump（体积大，可从游戏本体离线重新生成）
+#    ra3_image.bin <-> dump_module.py
+# ---------------------------------------------------------------
+ra3_image.bin
+image.bin
+tail.bin
+datasec.bin
+tail_strings.txt
+strings.txt
+scan_vet_code_result.txt
+analyze2_result.txt
+analyze3_result.txt
+veterancy_snap.json
+
+# ---------------------------------------------------------------
+#  构建产物
+# ---------------------------------------------------------------
+build/
+build_fix/
+dist/
+__pycache__/
+*.pyc
+_build.txt
+
+# ---------------------------------------------------------------
+#  运行期输出（每次跑脚本都会重新生成）
+# ---------------------------------------------------------------
+rank_probe_result.txt
+rank_probe2_result.txt
+unit_mgr_result.txt
+diag_unit_result.txt
+find_veterancy_result.txt
+debug.log
+dbg_mc.txt
+dbg_mc2.txt
+debug_mc.txt
+debug_mc2.txt
+parsed_trainer.txt
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
