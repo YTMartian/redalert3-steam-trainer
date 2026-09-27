@@ -9,8 +9,10 @@
   3. 通过界面按钮或全局热键开关各项功能。
 """
 import ctypes
+import os
 import queue
 import struct
+import sys
 import threading
 import time
 from ctypes import wintypes
@@ -1317,6 +1319,44 @@ class TrainerApp:
         self.root.destroy()
 
 
+def _resource_dir():
+    """返回资源（icon 等）所在目录。
+
+    源码运行时就是脚本所在目录；PyInstaller onefile 打包后是解包临时目录
+    `sys._MEIPASS`。两者都要能找到图标。
+    """
+    base = getattr(sys, '_MEIPASS', None)
+    if not base:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return base
+
+
+def apply_icon(root):
+    """给窗口和任务栏设置图标；失败一律静默忽略。
+
+    图标不是功能，绝不能因为它缺失或平台不支持就让修改器起不来。
+    优先用 .ico（`iconbitmap` 在 Windows 上同时影响标题栏和任务栏），
+    再用 .png 走 `iconphoto` 兜底（Tk 8.6 支持 PNG）。
+    """
+    base = _resource_dir()
+    ico = os.path.join(base, 'icon.ico')
+    png = os.path.join(base, 'icon.png')
+
+    if os.path.exists(ico):
+        try:
+            root.iconbitmap(default=ico)
+        except Exception:
+            pass
+    if os.path.exists(png):
+        try:
+            from tkinter import PhotoImage
+            ph = PhotoImage(file=png)
+            root.iconphoto(True, ph)
+            root._icon_ref = ph          # 防 GC 回收导致图标消失
+        except Exception:
+            pass
+
+
 def main():
     # 声明 DPI 感知，避免高 DPI（缩放 >100%）下 Tk 字体被拉伸而模糊
     try:
@@ -1330,6 +1370,7 @@ def main():
 
     import tkinter as tk
     root = tk.Tk()
+    apply_icon(root)
     app = TrainerApp(root)
     root.protocol('WM_DELETE_WINDOW', app.on_close)
     root.mainloop()

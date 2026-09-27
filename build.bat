@@ -17,7 +17,7 @@ where python >nul 2>nul || set "PY=py"
 if exist "H:\Miniconda\python.exe" set "PY=H:\Miniconda\python.exe"
 if exist "%LOCALAPPDATA%\Programs\Python\Python39\python.exe" set "PY=%LOCALAPPDATA%\Programs\Python\Python39\python.exe"
 
-echo [1/3] checking payload.py ...
+echo [1/4] checking payload.py ...
 if not exist payload.py (
     echo     payload.py missing, regenerating ...
     %PY% gen_payload.py || goto :err
@@ -25,12 +25,23 @@ if not exist payload.py (
     echo     payload.py present
 )
 
-echo [2/3] cleaning old build ...
+echo [2/4] cleaning old build ...
 if exist build rmdir /s /q build
 if exist dist  rmdir /s /q dist
 
-echo [3/3] PyInstaller packaging ...
-%PY% -m PyInstaller --onefile --noconsole --uac-admin --name RA3_Steam_Trainer --collect-all keystone trainer.py || goto :err
+echo [3/4] generating icon ...
+if not exist icon.ico (
+    %PY% make_icon.py || goto :err
+) else (
+    echo     icon.ico present
+)
+
+echo [4/4] PyInstaller packaging ...
+%PY% -m PyInstaller --onefile --noconsole --uac-admin ^
+    --name RA3_Steam_Trainer ^
+    --icon icon.ico ^
+    --add-data "icon.ico;." --add-data "icon.png;." ^
+    --collect-all keystone trainer.py || goto :err
 
 echo.
 echo ============================================================

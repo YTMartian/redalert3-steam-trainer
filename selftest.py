@@ -91,4 +91,29 @@ assert calls == ['FN_ADD_XP'], calls
 assert 'FN_RECALC' not in blk
 assert 'va_of(MGR_GLOBAL)' not in src, 'RVA 不能走 va_of'
 print('[OK] rank_up_via_engine 只调 %s，且数据指针用 module_base+RVA' % calls)
+
+# ---------- 4. 资源接线（图标） ----------
+import os
+
+assert callable(trainer.apply_icon)
+assert callable(trainer._resource_dir)
+res = trainer._resource_dir()
+assert os.path.isdir(res), res
+for fn in ('icon.ico', 'icon.png'):
+    p = os.path.join(res, fn)
+    assert os.path.exists(p), '缺少 %s（跑 python make_icon.py 生成）' % p
+    assert os.path.getsize(p) > 0, p
+
+from PIL import Image
+sizes = sorted(Image.open(os.path.join(res, 'icon.ico')).info.get('sizes', []))
+assert (16, 16) in sizes, sizes
+assert (256, 256) in sizes, sizes
+# 打包脚本必须把图标交给 PyInstaller（嵌进 exe + 带进 _MEIPASS）
+bat = io.open('build.bat', encoding='ascii').read()
+assert '--icon icon.ico' in bat, 'build.bat 未嵌入 exe 图标'
+assert '--add-data "icon.ico;."' in bat and '--add-data "icon.png;."' in bat, \
+    'build.bat 未把图标带进 onefile 解包目录'
+assert 'make_icon.py' in bat, 'build.bat 未在缺图标时自动生成'
+print('[OK] 图标资源：%d 帧 %s，build.bat 已接线' % (len(sizes), sizes[0]))
+
 print('\n全部通过。')

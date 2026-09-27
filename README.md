@@ -1,3 +1,5 @@
+<img src="icon.png" width="88" align="right" alt="RA3 Steam Trainer 图标">
+
 # 红警3 Steam 版修改器（RA3 Steam Trainer）
 
 基于 `RedAlert3_Trainer_1.12_FINAL3.exe` 逆向适配的 **《命令与征服：红色警戒3》Steam 版**独立修改器。
@@ -7,7 +9,7 @@
 - 无需修改游戏目录下的任何文件（所有代码写入通过 `VirtualAllocEx` 分配的内存）
 
 > **免责声明**：仅供单机 / 遭遇战娱乐与逆向学习使用，请勿在线上对战时使用。
-> 仓库不包含任何游戏本体文件（见 §5.6）。
+> 仓库不包含任何游戏本体文件（见 §5.7）。
 
 ## 快速开始
 
@@ -222,6 +224,8 @@ build.bat
 | `gen_payload.py` | 由中间产物重新生成 `payload.py`（含对齐固化） |
 | `verify_payload.py` | 校验 trainer 精简 build 与 `LABELS` 严格一致、跳转目标合法 |
 | `test_tooltip.py` | GUI 悬停提示的自动化验证（文本/位置/绘制/销毁）+ 截图 |
+| `make_icon.py` | **生成图标**：绘制并输出多尺寸 `icon.ico` + `icon.png` + 预览图（改设计改这里后重跑） |
+| `icon.ico` / `icon.png` | 图标资源（`icon.png` 供 `iconphoto` 与 README 预览用） |
 | `core_hooks.py` | 17 个 hook 定义（名称/VA/AOB/jmp 目标偏移） |
 | `hook_map.py` | 原版 → Steam 版 hook 地址映射表 |
 | `build.bat` | 一键打包脚本 |
@@ -260,6 +264,7 @@ build.bat
 | `ascii_bats.py` | 重新生成所有 `.bat`（保证 100% ASCII，见下方说明）。幂等，可随时重跑 | 否 |
 | `verify_payload.py` | 构建一致性：trainer 精简 build 与 `assemble.py` 输出逐字节相同、`LABELS` 与固化标签一致、Capstone 段内非法跳转必须为 0 | 否 |
 | `test_tooltip.py` | GUI 悬停提示的自动化验证（文本 / 位置 / 绘制 / 销毁）+ 截图 | 否 |
+| `test_icon.py` | 图标端到端验证：ICO 各尺寸帧、`WM_GETICON` 回读窗口真实图标句柄、`iconphoto` 兜底路径 | 否（需桌面） |
 | `diag_unit.py` | 单位指针链**只读**诊断（不写内存），用于定位偏移 | 是 |
 | `rank_probe2.py` | 星级晋升机制**交互式**验证（详见 §5.3、§6） | 是 |
 
@@ -275,7 +280,42 @@ build.bat
 > （它们自己设了 `PYTHONUTF8` / `PYTHONIOENCODING`）。
 > 要改批处理内容，请编辑 `ascii_bats.py` 后重跑它，**不要直接手改 `.bat`**。
 
-### 5.6 仓库内容说明
+### 5.6 图标
+
+![图标预览](icon_preview.png)
+
+设计呼应两件事：**红警系列的红星**，以及本修改器的招牌功能**「满级(3 星)」**
+——三颗五角星按军衔式三角排布。配色直接取自 GUI 主题
+（底板 `#1e1e26→#121216`、描边与主星 `#e04a3f`）。
+
+几个工程要点：
+
+- 图标由 `make_icon.py` **代码生成**（只依赖 Pillow），不手工绘制。
+  生成的 `icon.ico` 是二进制，**不要手改**，改设计请改脚本后重跑。
+- **每个尺寸都是独立绘制的**（16/20/24/32/40/48/64/128/256），不是从
+  256px 缩出来的。做法是先在该尺寸的 8 倍画布上绘制做超采样抗锯齿，
+  再 LANCZOS 降采样。
+- 小尺寸单独调参：笔触宽度设下限（`max(1.0, …)`）、16/24px 加大辅星并
+  去掉外发光 —— 否则细节被采样吃掉后三颗星会糊成一团。
+- **圆角外是透明的**（不是填深色），否则在浅色标题栏上会露出一个黑方块。
+  降采样时先按 alpha 预乘再除回来，避免半透明边缘混进透明区的黑色而
+  出现一圈暗边。`make_icon.py` 末尾会断言四角透明、中心不透明。
+- `trainer.apply_icon()` 同时设 `iconbitmap`（.ico，影响标题栏与任务栏）
+  和 `iconphoto`（.png，兜底），并**吞掉所有异常** —— 图标不是功能，
+  绝不能因为它缺失就让修改器起不来。
+- 资源定位走 `_resource_dir()`：源码运行取脚本目录，PyInstaller onefile
+  取 `sys._MEIPASS`，两种方式都能找到图标。
+
+```powershell
+python make_icon.py    # 重新生成 icon.ico / icon.png / icon_preview.png
+python test_icon.py    # 回读 WM_GETICON 验证窗口真的带上了图标，
+                       # 并校验 EXE 内嵌图标的 bpp/尺寸
+```
+
+> `icon_preview.png` 是给 README 用的预览图（棋盘底，方便看清圆角透明），
+> 会一起提交；它由 `make_icon.py` 生成，同样不要手改。
+
+### 5.7 仓库内容说明
 
 本仓库只包含**自己编写的代码、文档与少量小型数据文件**。
 以下内容被 `.gitignore` 排除，不会上传：
@@ -307,6 +347,8 @@ redalert3-steam-trainer/
 ├─ selftest.py             离线自检
 ├─ ascii_bats.py           重新生成所有 .bat（保持 ASCII）
 ├─ build.bat               一键打包
+├─ make_icon.py            图标生成器（输出 icon.ico / icon.png）
+├─ icon.ico / icon.png     图标资源
 ├─ README.md
 │
 ├─ 工具：进程/字段定位

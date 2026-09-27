@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = []
+datas = [('icon.ico', '.'), ('icon.png', '.')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('keystone')
@@ -49,4 +49,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     uac_admin=True,
+    icon=['icon.ico'],
 )
