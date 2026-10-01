@@ -1,13 +1,30 @@
 MC:
-pushad
-mov edx,[eax+0x28]
-mov [IDB],edx
-mov eax,[edx+0x20]
-mov [IDB+4],eax
-popad
-mov edx,[eax+0x28]
-mov eax,[edx+0x20]
-jmp _BackPlayerID
+jmp MC+0x1200
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
 nop
 nop
 nop
@@ -418,7 +435,7 @@ MC+0x3d0:
 pushfd
 pushad
 cmp byte ptr [FLAGS+0x15],0x00
-.byte 0x75,0x12
+.byte 0xEB,0x12
 mov ecx,[IDB+4]
 cmp [eax+0x0c],ecx
 .byte 0x74,0x07
@@ -3571,8 +3588,29 @@ nop
 nop
 nop
 MC+0x1200:
-mov eax,[MOD+0xe7565]
-ret
+pushad
+mov edx,[eax+0x28]
+test edx,edx
+jz _ExitPlayerIDClear
+mov [IDB],edx
+mov eax,[edx+0x20]
+mov [IDB+4],eax
+jmp _ExitPlayerIDAfterStore
+_ExitPlayerIDClear:
+xor eax,eax
+mov [IDB],eax
+mov [IDB+4],eax
+_ExitPlayerIDAfterStore:
+popad
+mov edx,[eax+0x28]
+test edx,edx
+jz _ExitPlayerIDNoLocal
+mov eax,[edx+0x20]
+jmp _BackPlayerID
+_ExitPlayerIDNoLocal:
+xor al,al
+add esp,0x0c
+ret 4
 MC2:
 mov esi,[MOD+0x8E08DC]
 mov ecx,[esi+0x5c]

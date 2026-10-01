@@ -38,10 +38,10 @@ HOOKS = [
 # 内部函数调用 (用于高级功能: 选中单位升级/摧毁/创建/复制)
 FUNCS = [
     dict(name='SelectUnitLevelUp', orig=0x35C200),
-    dict(name='DestroySelectUnit', orig=0x39EA50),
-    dict(name='GetUnitData2',      orig=0x3E4230),
-    dict(name='CreateUnit',        orig=0x205240),
-    dict(name='GetMouseXYZinMap',  orig=0x1ED4A0),
+    dict(name='DestroySelectUnit', orig=0x39EA50, steam=0x7DCDF0),
+    dict(name='GetUnitData2',      orig=0x3E4230),  # 复制时用实体+0x4，暂不依赖
+    dict(name='CreateUnit',        orig=0x205240, steam=0x6440F0),
+    dict(name='GetMouseXYZinMap',  orig=0x1ED4A0, steam=0x62C500),  # Steam: 屏幕像素→世界坐标
 ]
 
 # 全局指针/变量

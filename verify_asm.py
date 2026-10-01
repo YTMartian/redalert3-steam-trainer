@@ -33,7 +33,7 @@ KEYS = {
     0xAA0: 'CreateUnit',
     0xB00: 'SetUnitState',
     0x1120: 'GetMouseXYZinMap',
-    0x1200: 'FreeBuild',
+    0x1200: 'PlayerID',
 }
 
 print('=== MustCode 子块入口验证 ===')

@@ -54,6 +54,26 @@ kernel32.Module32Next.restype = wintypes.BOOL
 kernel32.VirtualProtectEx.restype = wintypes.BOOL
 kernel32.VirtualProtectEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
 
+user32.GetCursorPos.restype = wintypes.BOOL
+user32.GetCursorPos.argtypes = [ctypes.c_void_p]
+user32.ScreenToClient.restype = wintypes.BOOL
+user32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.c_void_p]
+user32.EnumWindows.restype = wintypes.BOOL
+user32.EnumWindows.argtypes = [ctypes.c_void_p, wintypes.LPARAM]
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+user32.IsWindowVisible.restype = wintypes.BOOL
+user32.IsWindowVisible.argtypes = [wintypes.HWND]
+user32.GetWindow.restype = wintypes.HWND
+user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+user32.GetWindowTextLengthW.restype = ctypes.c_int
+user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+
+
+class POINT(ctypes.Structure):
+    _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+
+
 PROCESS_ALL_ACCESS = 0x001F0FFF
 PROCESS_VM_OPERATION = 0x0008
 PROCESS_VM_READ = 0x0010
@@ -78,8 +98,22 @@ MOD_BASE = 0x400000
 #   不能走 va_of()（那个是给 VA 用的，会把地址再抬高一个 0x400000）。
 MGR_GLOBAL_RVA = 0x8E08DC
 
-# 星级相关的游戏函数（VA；诊断/实验用，正常游戏流程只调 FN_ADD_XP）
+# 本地玩家对象全局指针（VA 0xCEDE2C）。观战/观察者时模板 [player+0x28] 为空，
+# 或模板带 +0x106 / +0x123C 标志（见游戏函数 0x877010 / 0x877580）。
+LOCAL_PLAYER_RVA = 0x8EDE2C
+
+# 观战时会崩的资源类 hook：观战自动卸载，有本地势力时再装上
+PLAYER_HOOK_NAMES = {'PlayerID', 'Money', 'Power', 'SCPoint', 'HaveAllSC'}
+
+# 星级 / 摧毁相关的游戏函数（VA）
 FN_ADD_XP = 0x005173F0       # __cdecl(entity, int xp)  官方加经验接口（唯一安全）
+FN_DESTROY = 0x007DCDF0      # __thiscall(entity; args=6,0x19,0) 官方摧毁，ret 0xC
+FN_CREATE_UNIT = 0x006440F0  # __cdecl(flags, template, pos*, owner, owner+0x10)
+# Steam 屏幕像素 → 地图世界坐标（__cdecl(in*{x,y:i32}, out*{xyz:f32}, flag, flag)）。
+# 由 Zoom(0x62B82D) 相对零售 GetMouse 偏移定位；调用约定与 MustCode GetMouseXYZinMap 同形。
+FN_GET_MOUSE_XYZ = 0x0062C500
+# Steam 重定位：原 MustCode CreateUnit(零售 0x205240) 的等价工厂入口。
+# 签名与 MustCode+AA0 一致：push owner+0x10 / owner / pos / template / 0; add esp,14
 # 【危险·绝不要调用】0x0071B290 = tracker 的「按经验重算星级」。
 #   实测：跳过官方入口直接调它，游戏会直接挂掉（等级链状态不一致）。
 
@@ -220,6 +254,9 @@ class GameProcess:
         self.flags_base = 0
         self.idb_base = 0
         self.hooked = False
+        self.installed_hooks = []  # [(name, va_abs, aob), ...] 已打补丁，脱离时只还原这些
+        self.auto_spectator = False  # True=智能模式，随观战状态装卸资源 hook
+        self._spectator_cached = None  # 上次检测到的观战状态（用于状态栏提示）
         # 调用桩是共享的：多线程（例如连按两次 p）同时写会把机器码写坏，
         # 所以所有 call_remote 串行化。
         self._call_lock = threading.Lock()
@@ -451,8 +488,126 @@ class GameProcess:
         return True, None
 
     # ---- 注入 ----
-    def inject(self):
-        """分配内存、重汇编并写入、补丁 17 个 hook。"""
+    def _probe_module(self):
+        """用 PlayerID 处 AOB 校验模块版本。成功返回 None，失败返回错误串。"""
+        probe = next((h for h in CORE_HOOKS if h[0] == 'PlayerID'), CORE_HOOKS[0])
+        probe_va, probe_aob = probe[1], probe[2]
+        probe_len = len(probe_aob) // 2
+        got = self.read(self.va_of(probe_va), probe_len)
+        expect = bytes.fromhex(probe_aob)
+        if got == expect:
+            return None
+        if self.game_module and self.game_module.lower() != 'ra3_1.12.game':
+            return ('检测到游戏模块为 %s，但本修改器适配 ra3_1.12.game。'
+                    '请在 Steam 启动选项里添加 -runver 1.12 后重启游戏'
+                    % self.game_module)
+        return ('基址校验失败：模块 0x%X 地址 0x%X 处读到 %s，期望 %s'
+                '（游戏版本不符或基址错误）'
+                % (self.module_base, self.va_of(probe_va), got.hex(), expect.hex()))
+
+    def _patch_one_hook(self, name, hook_va_abs, aob, target_off):
+        """给单个 hook 打补丁。成功返回 None，失败返回错误串。"""
+        hook_va = self.va_of(hook_va_abs)
+        aob_len = len(aob) // 2
+        tag = 'mc_' + format(target_off, 'x')
+        label_off = LABELS['MC'].get(tag)
+        if label_off is None:
+            return '缺少标签 %s (%s)' % (tag, name)
+        jmp_target = self.mc_base + label_off
+        rel = jmp_target - (hook_va + 5)
+        if not (-0x80000000 <= rel <= 0x7FFFFFFF):
+            return '%s hook 跳转距离超出 ±2GB（MC 段分配地址过远）' % name
+        patch = b'\xE9' + struct.pack('<i', rel) + b'\x90' * (aob_len - 5)
+        if len(patch) != aob_len:
+            return '%s hook 补丁长度错误' % name
+        if not self.write_code(hook_va, patch):
+            return '%s hook 写入失败' % name
+        return None
+
+    def _installed_names(self):
+        return {n for n, _, _ in self.installed_hooks}
+
+    def install_named_hooks(self, names):
+        """安装名单中尚未安装的 hook。返回 (ok, err)。"""
+        want = set(names)
+        have = self._installed_names()
+        for name, hook_va_abs, aob, target_off in CORE_HOOKS:
+            if name not in want or name in have:
+                continue
+            err = self._patch_one_hook(name, hook_va_abs, aob, target_off)
+            if err:
+                return False, err
+            self.installed_hooks.append((name, hook_va_abs, aob))
+        return True, None
+
+    def uninstall_named_hooks(self, names):
+        """还原名单中已安装的 hook。"""
+        drop = set(names)
+        kept = []
+        for name, va, aob in self.installed_hooks:
+            if name in drop:
+                self.write_code(self.va_of(va), bytes.fromhex(aob))
+            else:
+                kept.append((name, va, aob))
+        self.installed_hooks = kept
+
+    def is_spectator(self):
+        """是否处于观战/无本地势力状态。
+
+        依据游戏自己的判定（0x877580 / 0x877010）：
+          · [LOCAL_PLAYER] 为空 → 视为观战（主菜单也是，资源 hook 先不装）
+          · [player+0x28] 模板为空 → 观战
+          · 模板 +0x106 或 +0x123C 非 0 → 观察者标志
+        """
+        if not self.handle or not self.module_base:
+            return True
+        player = self.read_u32(self.module_base + LOCAL_PLAYER_RVA)
+        if not self.is_ptr(player):
+            return True
+        tmpl = self.read_u32(player + 0x28)
+        if not self.is_ptr(tmpl):
+            return True
+        b106 = self.read(tmpl + 0x106, 1)
+        if b106 and b106[0] != 0:
+            return True
+        b123c = self.read(tmpl + 0x123C, 1)
+        if b123c and b123c[0] != 0:
+            return True
+        return False
+
+    def sync_player_hooks(self):
+        """智能模式：观战卸掉资源 hook，有本地势力再装上。
+
+        返回 (changed, spectator, msg)；changed=False 表示状态未变无需提示。
+        """
+        if not self.auto_spectator or not self.hooked:
+            return False, self._spectator_cached, ''
+        spec = self.is_spectator()
+        have_player = bool(self._installed_names() & PLAYER_HOOK_NAMES)
+        if spec and have_player:
+            self.uninstall_named_hooks(PLAYER_HOOK_NAMES)
+            self._spectator_cached = True
+            return True, True, '检测到观战/无本地势力：已禁用资源 hook（防崩溃）'
+        if (not spec) and (not have_player):
+            ok, err = self.install_named_hooks(PLAYER_HOOK_NAMES)
+            if not ok:
+                return True, False, '启用资源 hook 失败：' + err
+            self._spectator_cached = False
+            return True, False, '检测到本地玩家：已启用资源 hook'
+        if self._spectator_cached is None:
+            self._spectator_cached = spec
+        return False, spec, ''
+
+    def inject(self, enabled_names=None, auto_spectator=False):
+        """分配内存、重汇编并写入、按名单补丁 hook。
+
+        enabled_names:
+          None → 安装全部 CORE_HOOKS（或智能模式下先装非资源类）
+          空集合 → 只分配 MustCode/FLAGS，不打任何补丁（观战崩溃二分用）
+          名字集合 → 只安装名单内的 hook
+        auto_spectator:
+          True → 智能模式：始终装非资源 hook；资源 hook 按观战状态装卸
+        """
         self.mc_base = self.alloc(MC_SIZE)
         self.mc2_base = self.alloc(MC2_SIZE)
         self.flags_base = self.alloc(FLAGS_SIZE)
@@ -471,43 +626,39 @@ class GameProcess:
             return False, '写入 MustCode 失败'
         if not self.write(self.mc2_base, mc2):
             return False, '写入 MustCode2 失败'
-        # 初始化 FLAGS+0x24 数据（WeNeedBack 用，无害）
         self.write(self.flags_base + 0x24, b'\xA0\xA5\x86\x65')
+        self.write(self.flags_base + 0x20, b'\x00\x00\x00\x00')
 
-        # 校验基址：读回第一个 hook 处字节，应匹配 AOB（否则说明模块基址/版本不对）
-        probe_va = CORE_HOOKS[0][1]
-        probe_len = len(CORE_HOOKS[0][2]) // 2
-        probe = self.read(self.va_of(probe_va), probe_len)
-        expect = bytes.fromhex(CORE_HOOKS[0][2])
-        if probe != expect:
-            if self.game_module and self.game_module.lower() != 'ra3_1.12.game':
-                return False, ('检测到游戏模块为 %s，但本修改器适配 ra3_1.12.game。'
-                               '请在 Steam 启动选项里添加 -runver 1.12 后重启游戏'
-                               % self.game_module)
-            return False, ('基址校验失败：模块 0x%X 地址 0x%X 处读到 %s，期望 %s'
-                           '（游戏版本不符或基址错误）'
-                           % (self.module_base, self.va_of(probe_va), probe.hex(), expect.hex()))
+        err = self._probe_module()
+        if err:
+            return False, err
 
-        # 补丁 17 个 hook
-        for name, hook_va_abs, aob, target_off in CORE_HOOKS:
-            hook_va = self.va_of(hook_va_abs)
-            aob_len = len(aob) // 2
-            tag = 'mc_' + format(target_off, 'x')
-            label_off = LABELS['MC'].get(tag)
-            if label_off is None:
-                return False, '缺少标签 %s (%s)' % (tag, name)
-            jmp_target = self.mc_base + label_off
-            rel = jmp_target - (hook_va + 5)
-            if not (-0x80000000 <= rel <= 0x7FFFFFFF):
-                return False, '%s hook 跳转距离超出 ±2GB（MC 段分配地址过远）' % name
-            patch = b'\xE9' + struct.pack('<i', rel) + b'\x90' * (aob_len - 5)
-            if len(patch) != aob_len:
-                return False, '%s hook 补丁长度错误' % name
-            if not self.write_code(hook_va, patch):
-                return False, '%s hook 写入失败' % name
+        self.auto_spectator = bool(auto_spectator)
+        self._spectator_cached = None
+        self.installed_hooks = []
+
+        if auto_spectator:
+            # 先装安全 hook；资源 hook 交给 sync_player_hooks
+            selected = [h for h in CORE_HOOKS if h[0] not in PLAYER_HOOK_NAMES]
+        elif enabled_names is None:
+            selected = list(CORE_HOOKS)
+        else:
+            allow = set(enabled_names)
+            selected = [h for h in CORE_HOOKS if h[0] in allow]
+
+        for name, hook_va_abs, aob, target_off in selected:
+            err = self._patch_one_hook(name, hook_va_abs, aob, target_off)
+            if err:
+                return False, err
+            self.installed_hooks.append((name, hook_va_abs, aob))
 
         self.hooked = True
-        return True, ''
+        extra = ''
+        if auto_spectator:
+            changed, spec, msg = self.sync_player_hooks()
+            extra = ' | ' + (msg or ('观战中' if spec else '本地玩家'))
+        return True, '已安装 %d/%d 个 hook%s' % (
+            len(self.installed_hooks), len(CORE_HOOKS), extra)
 
     def set_flag_byte(self, offset, value):
         if not self.handle or not self.flags_base:
@@ -529,6 +680,13 @@ class GameProcess:
     def read_u32(self, addr):
         b = self.read(addr, 4)
         return struct.unpack('<I', b)[0] if len(b) == 4 else None
+
+    def read_f32(self, addr):
+        b = self.read(addr, 4)
+        return struct.unpack('<f', b)[0] if len(b) == 4 else None
+
+    def write_f32(self, addr, value):
+        return self.write(addr, struct.pack('<f', float(value)))
 
     def is_ptr(self, v):
         return v is not None and 0x10000 <= v < 0x7FFF0000 and (v & 3) == 0
@@ -565,6 +723,286 @@ class GameProcess:
                 break
             node = nxt
         return out
+
+    def _speed_nodes(self, ent):
+        """取出单位速度控制器节点列表（可能 0~2 个），结构同 MustCode2。
+
+        实体+0x374 → +0x200 → [0]=主节点 / [4]=副节点（副节点还需 +0x18==1.0）
+        节点 +0x8 = 当前倍率，+0x40 = 备份的原始倍率。
+        """
+        vec = self.read_u32(ent + 0x374)
+        if not self.is_ptr(vec):
+            return []
+        ctrl = self.read_u32(vec + 0x200)
+        if not self.is_ptr(ctrl):
+            return []
+        nodes = []
+        first = self.read_u32(ctrl)
+        if self.is_ptr(first):
+            nodes.append(first)
+        second = self.read_u32(ctrl + 4)
+        if self.is_ptr(second):
+            flag = self.read_f32(second + 0x18)
+            if flag is not None and abs(flag - 1.0) < 1e-6:
+                nodes.append(second)
+        return nodes
+
+    def _set_speed_node(self, node, target):
+        """按原脚本逻辑写速度倍率：特殊值之间切换不覆盖备份。"""
+        specials = (500.0, 10.0, 0.0)
+        cur = self.read_f32(node + 8)
+        if cur is None:
+            return False
+        if abs(cur - target) < 1e-4:
+            return True
+        # 当前不是「我们设过的特殊值」时，先备份到 +0x40
+        if not any(abs(cur - s) < 1e-4 for s in specials):
+            self.write_f32(node + 0x40, cur)
+        return self.write_f32(node + 8, target)
+
+    def _restore_speed_node(self, node):
+        """从 +0x40 恢复；若当前不是特殊值则不动。"""
+        specials = (500.0, 10.0, 0.0)
+        cur = self.read_f32(node + 8)
+        if cur is None:
+            return False
+        if not any(abs(cur - s) < 1e-4 for s in specials):
+            return True
+        bak = self.read_f32(node + 0x40)
+        if bak is None:
+            return False
+        return self.write_f32(node + 8, bak)
+
+    def apply_unit_speed(self, mode):
+        """对选中单位改速度。mode: max/slow/freeze/restore。不依赖 Money hook。"""
+        targets = {'max': 500.0, 'slow': 10.0, 'freeze': 0.0}
+        ents = self.selected_entities()
+        if not ents:
+            return False, '没读到选中单位（请先选中）'
+        n = 0
+        for ent in ents:
+            nodes = self._speed_nodes(ent)
+            if not nodes:
+                continue
+            ok = True
+            for node in nodes:
+                if mode == 'restore':
+                    ok = self._restore_speed_node(node) and ok
+                else:
+                    ok = self._set_speed_node(node, targets[mode]) and ok
+            if ok:
+                n += 1
+        if n == 0:
+            return False, '选中对象没有可写的速度组件'
+        names = {'max': '超速×500', 'slow': '慢速×10', 'freeze': '冻结',
+                 'restore': '恢复速度'}
+        return True, '已对 %d 个单位执行「%s」' % (n, names.get(mode, mode))
+
+    def apply_unit_hp(self, mode):
+        """对选中单位改血量。mode: max/min/normal。不依赖 Money hook。"""
+        ents = self.selected_entities()
+        if not ents:
+            return False, '没读到选中单位（请先选中）'
+        n = 0
+        for ent in ents:
+            hp = self.read_u32(ent + 0x33C)
+            if not self.is_ptr(hp):
+                continue
+            if mode == 'max':
+                if self.write_f32(hp + 4, 9999999.0) and self.write_f32(hp + 0xC, 9999999.0):
+                    n += 1
+            elif mode == 'min':
+                if self.write_f32(hp + 4, 1.0):
+                    n += 1
+            elif mode == 'normal':
+                mx = self.read_f32(hp + 0x10)
+                if mx is None:
+                    continue
+                if self.write_f32(hp + 4, mx) and self.write_f32(hp + 0xC, mx):
+                    n += 1
+        if n == 0:
+            return False, '选中对象没有可写的血量组件'
+        names = {'max': '无敌', 'min': '残血', 'normal': '恢复血量'}
+        return True, '已对 %d 个单位执行「%s」' % (n, names.get(mode, mode))
+
+    def kill_selected(self):
+        """在独立线程里调官方摧毁接口 0x7DCDF0，真正拆掉选中单位。
+
+        签名（与原版修改器 DestroySelectUnit 一致，Steam 重定位后地址）：
+          __thiscall  ecx=实体
+          栈参数 push 0 / push 0x19 / push 6
+          函数自身 ret 0xC 清栈，故 call_remote 必须 cleanup=False。
+
+        只写血量为 0 只会让单位「不能选中、血条消失」，并不会走死亡/拆除流程。
+        返回 (ok, 消息)。
+        """
+        ents = self.selected_entities()
+        if not ents:
+            mgr = self.read_u32(self.mgr_addr())
+            return False, ('没读到选中单位。诊断：管理器指针 [0x%08X] = 0x%s'
+                           '（先在游戏里选中单位）'
+                           % (self.mgr_addr(), ('%08X' % mgr) if mgr else '读不到'))
+        ok_n = 0
+        detail = []
+        for ent in ents:
+            ok, err = self.call_remote(
+                self.va_of(FN_DESTROY), this=ent,
+                args=(6, 0x19, 0), cleanup=False, timeout=4000)
+            if ok:
+                ok_n += 1
+                detail.append('0x%08X' % ent)
+            else:
+                detail.append('0x%08X 失败(%s)' % (ent, err))
+        if ok_n == 0:
+            return False, '摧毁失败：' + '；'.join(detail)
+        return True, '已摧毁 %d 个单位：%s' % (ok_n, '、'.join(detail))
+
+    def _local_owner(self):
+        """取本地玩家的「归属对象」（供 CreateUnit 使用）。
+
+        MustCode 的 CopyForMe 用 PlayerID hook 写入的 [ID]=[本地玩家+0x28]；
+        游戏生成单位时写到实体+0x418 的是 [本地玩家+0x30]。两者都试，优先 +0x28。
+        """
+        player = self.read_u32(self.module_base + LOCAL_PLAYER_RVA)
+        if not self.is_ptr(player):
+            return None
+        for off in (0x28, 0x30):
+            owner = self.read_u32(player + off)
+            if self.is_ptr(owner):
+                # +0x10 在 CreateUnit 里原样压栈，允许为 0
+                return owner
+        return None
+
+    def _game_hwnd(self):
+        """找本游戏进程的主窗口句柄（用于 ScreenToClient）。"""
+        if not self.pid:
+            return None
+        found = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _enum(hwnd, _lparam):
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value != self.pid:
+                return True
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            if user32.GetWindow(hwnd, 4):  # GW_OWNER
+                return True
+            if user32.GetWindowTextLengthW(hwnd) <= 0:
+                return True
+            found.append(hwnd)
+            return True
+
+        user32.EnumWindows(_enum, 0)
+        return found[0] if found else None
+
+    def _mouse_client_xy(self):
+        """当前鼠标在游戏客户区中的像素坐标。失败返回 None。"""
+        hwnd = self._game_hwnd()
+        if not hwnd:
+            return None
+        pt = POINT()
+        if not user32.GetCursorPos(ctypes.byref(pt)):
+            return None
+        if not user32.ScreenToClient(hwnd, ctypes.byref(pt)):
+            return None
+        return int(pt.x), int(pt.y)
+
+    def mouse_world_pos(self):
+        """把当前鼠标位置转换成地图世界坐标 (x,y,z)。
+
+        Win32 取客户区像素 → FN_GET_MOUSE_XYZ 投影到地形。
+        缓冲沿用 MustCode：输入 MC+0x1110，输出 MC+0x1080。失败返回 None。
+        """
+        if not self.mc_base:
+            return None
+        xy = self._mouse_client_xy()
+        if not xy:
+            return None
+        in_buf = self.mc_base + 0x1110
+        out_buf = self.mc_base + 0x1080
+        if not self.write(in_buf, struct.pack('<ii', xy[0], xy[1])):
+            return None
+        # 哨兵：若函数未改写输出，说明投影失败
+        if not self.write(out_buf, struct.pack('<III', 0x7F7F7F7F, 0x7F7F7F7F, 0x7F7F7F7F)):
+            return None
+        ok, _err = self.call_remote(
+            self.va_of(FN_GET_MOUSE_XYZ),
+            args=(in_buf, out_buf, 0, 0),
+            cleanup=True, timeout=4000)
+        if not ok:
+            return None
+        raw = self.read(out_buf, 12)
+        if len(raw) < 12:
+            return None
+        if raw == struct.pack('<III', 0x7F7F7F7F, 0x7F7F7F7F, 0x7F7F7F7F):
+            return None
+        x, y, z = struct.unpack('<fff', raw)
+        if any(v != v for v in (x, y, z)):
+            return None
+        return float(x), float(y), float(z)
+
+    def clone_selected(self, as_mine=True):
+        """复制选中单位（独立线程调 FN_CREATE_UNIT）。
+
+        as_mine=True  → 归属本地玩家（正常模式）
+        as_mine=False → 归属原单位阵营（观战模式，用实体+0x418）
+
+        模板取自实体+0x4（与 MustCode GetUnitData 一致）；
+        生成坐标取自当前鼠标在地图上的落点（FN_GET_MOUSE_XYZ）。
+        返回 (ok, 消息)。
+        """
+        ents = self.selected_entities()
+        if not ents:
+            return False, '没读到选中单位（请先选中）'
+        if not self.mc_base:
+            return False, 'MustCode 未分配，无法写入坐标缓冲'
+        spawn = self.mouse_world_pos()
+        if not spawn:
+            return False, '读不到鼠标地图坐标（请把鼠标移到战场地形上再试）'
+        pos_buf = self.mc_base + 0x1080
+        ok_n = 0
+        detail = []
+        for i, ent in enumerate(ents):
+            unit_data = self.read_u32(ent + 4)
+            if not self.is_ptr(unit_data):
+                detail.append('0x%08X 无模板' % ent)
+                continue
+            if as_mine:
+                owner = self._local_owner()
+                if not owner:
+                    return False, '读不到本地玩家归属（观战中请改用观战模式复制）'
+            else:
+                owner = self.read_u32(ent + 0x418)
+                if not self.is_ptr(owner):
+                    detail.append('0x%08X 无归属' % ent)
+                    continue
+            owner_info = self.read_u32(owner + 0x10)
+            if owner_info is None:
+                detail.append('0x%08X 归属+0x10 读失败' % ent)
+                continue
+            # owner+0x10 允许为 0（MustCode 原样压栈，不做空指针判断）
+            # 多个选中时在鼠标落点附近错开，避免互相重叠
+            x = spawn[0] + 15.0 * i
+            y = spawn[1]
+            z = spawn[2]
+            if not self.write(pos_buf, struct.pack('<fff', x, y, z)):
+                detail.append('0x%08X 写坐标失败' % ent)
+                continue
+            ok, err = self.call_remote(
+                self.va_of(FN_CREATE_UNIT),
+                args=(0, unit_data, pos_buf, owner, owner_info & 0xFFFFFFFF),
+                cleanup=True, timeout=4000)
+            if ok:
+                ok_n += 1
+                detail.append('0x%08X' % ent)
+            else:
+                detail.append('0x%08X 失败(%s)' % (ent, err))
+        if ok_n == 0:
+            return False, '复制失败：' + '；'.join(detail)
+        who = '己方' if as_mine else '原阵营'
+        return True, '已复制 %d 个单位到鼠标位置（归属%s）：%s' % (ok_n, who, '、'.join(detail))
 
     def read_level(self, tracker):
         """读跟踪器的 +0x24（当前等级序号）。"""
@@ -636,9 +1074,12 @@ class GameProcess:
 
     def detach_and_restore(self):
         if self.handle and self.hooked:
-            for name, va, aob, _ in CORE_HOOKS:
+            for name, va, aob in self.installed_hooks:
                 self.write_code(self.va_of(va), bytes.fromhex(aob))
+            self.installed_hooks = []
             self.hooked = False
+        self.auto_spectator = False
+        self._spectator_cached = None
         self.detach()
 
 
@@ -663,16 +1104,16 @@ FEATURES = [
     # 弹药 / 危险等级
     ('ammo',     '弹药无限',     'toggle', dict(flag=0x12)),
     ('danger',   '危险等级',     'danger', dict(flag=0x13)),
-    # 单位速度/血量操作：依赖「选中单位管理器」全局指针。
-    # Steam 版该指针已由 0x8DB73C 重定位为 0x8E08DC（经运行时差分扫描确认，
-    # 结构不变：+0x5C=选中数量，+0x50=选中单位链表头，节点+8 -> 对象+0x138=单位实体）。
-    ('speed_max',    '超速 ×500',   'cmd', dict(cmd=1)),
-    ('speed_slow',   '慢速 ×10',    'cmd', dict(cmd=2)),
-    ('speed_freeze', '冻结',        'cmd', dict(cmd=3)),
-    ('speed_restore','恢复速度',    'cmd', dict(cmd=4)),
-    ('hp_max',       '无敌',        'cmd', dict(cmd=5)),
-    ('hp_min',       '残血(1点)',   'cmd', dict(cmd=6)),
-    ('hp_normal',    '恢复血量',    'cmd', dict(cmd=7)),
+    # 单位速度/血量：改由修改器直接写内存（engine），观战模式无 Money hook 也能用
+    ('speed_max',    '超速 ×500',   'engine', dict(action='speed', mode='max')),
+    ('speed_slow',   '慢速 ×10',    'engine', dict(action='speed', mode='slow')),
+    ('speed_freeze', '冻结',        'engine', dict(action='speed', mode='freeze')),
+    ('speed_restore','恢复速度',    'engine', dict(action='speed', mode='restore')),
+    ('hp_max',       '无敌',        'engine', dict(action='hp', mode='max')),
+    ('hp_min',       '残血(1点)',   'engine', dict(action='hp', mode='min')),
+    ('hp_normal',    '恢复血量',    'engine', dict(action='hp', mode='normal')),
+    ('unit_kill',    '摧毁选中',   'engine', dict(action='kill')),
+    ('unit_clone',   '复制选中',   'engine', dict(action='clone')),
     # 星级（满级 3 星）：
     #   实体+0x3CC 是 ExperienceTrackerObject（经验追踪器），它的 +0x24 只是
     #   「当前等级」的缓存 —— 纯粹写内存改它，游戏里一点变化都没有（实测）。
@@ -701,8 +1142,8 @@ HOTKEYS = {
     'nocbuild':     ([], 0x79),   # F10
     'ammo':         ([], 0xBA),   # ;
     'oremine':      ([], 0xDE),   # '
-    'danger_max':   ([], 0x2C),   # ,
-    'danger_min':   ([], 0x2E),   # .
+    'danger_max':   ([], 0xBC),   # ,
+    'danger_min':   ([], 0xBE),   # .  （原先误写成 0x2E=Delete）
     'danger_norm':  ([], 0xBF),   # /
     # 单位操作（需先选中单位）
     'speed_max':    ([], 0xBD),   # -
@@ -713,16 +1154,25 @@ HOTKEYS = {
     'hp_min':       ([], 0xDD),   # ]
     'hp_normal':    ([], 0xDC),   # \
     'unit_rank':    ([], 0x50),   # p
+    'unit_kill':    ([], 0x2E),   # Delete
+    'unit_clone':   ([], 0x2D),   # Insert
 }
 
 CTRL_VK = 0x11
+
+# 运行模式：正常=装全部 hook；观战=不打补丁（只分配内存，避免资源 hook 闪退）
+PLAY_MODES = [
+    ('normal', '正常模式'),
+    ('spectate', '观战模式'),
+]
+PLAY_MODE_LABELS = {k: v for k, v in PLAY_MODES}
 
 # 虚拟键码 -> 可读按键名（用于 GUI 悬停提示）
 VK_NAMES = {
     0x08: 'Backspace', 0x09: 'Tab', 0x0D: 'Enter', 0x1B: 'Esc', 0x20: '空格',
     0x21: 'PageUp', 0x22: 'PageDown', 0x23: 'End', 0x24: 'Home',
     0x25: '←', 0x26: '↑', 0x27: '→', 0x28: '↓',
-    0x2C: ',', 0x2E: '.', 0x2F: '/',
+    0x2D: 'Insert', 0x2E: 'Delete',
     0xBA: ';', 0xBB: '=', 0xBC: ',', 0xBD: '-', 0xBE: '.', 0xBF: '/',
     0xC0: '`', 0xDB: '[', 0xDC: '\\', 0xDD: ']', 0xDE: "'",
 }
@@ -760,6 +1210,8 @@ FEATURE_HINTS = {
                      '走游戏官方的「加经验」接口，所以星星图标、数值加成、'
                      'EVA 语音都会自己出来；一次调用可能跨多级，'
                      '这里会自动反复调用直到封顶',
+    'unit_kill':     '调用官方摧毁接口拆掉选中单位（观战/正常都可用）',
+    'unit_clone':    '复制选中单位到鼠标地图落点：正常模式归属自己，观战模式归属原阵营',
 }
 
 FEATURE_BY_KEY = {f[0]: f for f in FEATURES}
@@ -770,7 +1222,8 @@ FEATURE_GROUPS = [
     ('超武 / 建造 / 地图', ['superpower', 'disableallsp', 'map', 'nocbuild']),
     ('弹药 / 危险等级', ['ammo', 'danger']),
     ('单位操作（需先选中单位）', ['speed_max', 'speed_slow', 'speed_freeze', 'speed_restore',
-                          'hp_max', 'hp_min', 'hp_normal', 'unit_rank']),
+                          'hp_max', 'hp_min', 'hp_normal', 'unit_rank', 'unit_kill',
+                          'unit_clone']),
 ]
 
 # F1-F12 需要 Ctrl；其它单键不需修饰
@@ -908,6 +1361,7 @@ class TrainerApp:
         self.c = self.colors
 
         self.status_var = tk.StringVar(value='未附加：请先启动游戏，再点击「附加游戏」')
+        self.play_mode = tk.StringVar(value='normal')
         self._build_ui()
 
         # 固定窗口尺寸：以构建完成后的自然尺寸为准，锁定宽高，
@@ -966,7 +1420,8 @@ class TrainerApp:
         self.attach_btn.pack(side='left')
         add_tooltip(self.attach_btn, ['附加到游戏进程',
                                       '目标进程：ra3_1.12.game',
-                                      '需要管理员权限运行'])
+                                      '需要管理员权限运行',
+                                      '附加前请先选好「正常模式」或「观战模式」'])
         self.detach_btn = tk.Button(conn, text='脱离', font=font, width=7,
                                     bg=c['card'], fg=c['fg'], activebackground=c['card_hover'],
                                     activeforeground=c['fg'], relief='flat', bd=0, cursor='hand2',
@@ -975,6 +1430,35 @@ class TrainerApp:
         self.detach_btn.pack(side='left', padx=(8, 0))
         add_tooltip(self.detach_btn, ['脱离游戏并还原全部 17 个 hook',
                                       '退出修改器前建议先点这里'])
+
+        # 模式切换：两个互斥按钮，风格与功能开关一致
+        mode_wrap = tk.Frame(conn, bg=c['panel'])
+        mode_wrap.pack(side='left', padx=(14, 0))
+        tk.Label(mode_wrap, text='模式', font=font_small, bg=c['panel'], fg=c['dim']
+                 ).pack(side='left', padx=(0, 6))
+        self.mode_btns = {}
+        for key, label in PLAY_MODES:
+            btn = tk.Button(
+                mode_wrap, text=label, font=font_small, width=8,
+                relief='flat', bd=0, cursor='hand2', highlightthickness=0,
+                padx=6, pady=3,
+                command=lambda k=key: self._set_play_mode(k))
+            btn.pack(side='left', padx=2)
+            self.mode_btns[key] = btn
+            tip = {
+                'normal': ['正常模式：注入全部 17 个 hook',
+                           '适合自己操控的遭遇战 / 战役',
+                           '观战进对局会闪退，请改用观战模式',
+                           '复制单位归属自己'],
+                'spectate': ['观战模式：只分配内存，不打 hook 补丁',
+                             '适合电脑互打时旁观',
+                             '金钱/电力等资源功能不可用；',
+                             '速度/血量/满级/摧毁/复制仍可用',
+                             '（复制出的单位归属原阵营）'],
+            }[key]
+            add_tooltip(btn, tip)
+        self._refresh_mode_btns()
+
         self.status_dot = tk.Label(conn, text='●', font=('Microsoft YaHei UI', 10),
                                    bg=c['panel'], fg=c['dim'])
         self.status_dot.pack(side='left', padx=(14, 4))
@@ -1156,13 +1640,37 @@ class TrainerApp:
     def _ui_danger(self, val):
         self._update_danger_btns(val)
 
+    def _set_play_mode(self, key):
+        if self.attached:
+            return
+        self.play_mode.set(key)
+        self._refresh_mode_btns()
+
+    def _refresh_mode_btns(self):
+        c = self.c
+        cur = self.play_mode.get()
+        for key, btn in self.mode_btns.items():
+            on = (key == cur)
+            btn.config(
+                bg=c['primary'] if on else c['card'],
+                fg='#ffffff' if on else c['fg'],
+                activebackground=c['primary_dark'] if on else c['card_hover'],
+                activeforeground='#ffffff' if on else c['fg'],
+                state='disabled' if self.attached else 'normal',
+                disabledforeground='#d8b9b7' if on else c['dim'],
+            )
+
     def do_attach(self):
         ok, err = self.gp.attach()
         if not ok:
             self._beep('error')
             self.log_status('附加失败：' + err)
             return
-        ok, err = self.gp.inject()
+        mode = self.play_mode.get()
+        if mode == 'spectate':
+            ok, err = self.gp.inject(enabled_names=set(), auto_spectator=False)
+        else:
+            ok, err = self.gp.inject(enabled_names=None, auto_spectator=False)
         if not ok:
             self._beep('error')
             self.gp.detach()
@@ -1171,14 +1679,21 @@ class TrainerApp:
         self.attached = True
         self.attach_btn.config(state='disabled')
         self.detach_btn.config(state='normal')
+        self._refresh_mode_btns()
         self._beep('on')
-        self.log_status('已附加：模块 0x%X  MustCode 0x%X' % (self.gp.module_base, self.gp.mc_base))
+        mode_name = PLAY_MODE_LABELS.get(mode, mode)
+        if mode == 'spectate':
+            self.log_status('已附加（%s）：未打 hook，单位操作/满级/摧毁仍可用' % mode_name)
+        else:
+            self.log_status('已附加（%s）：模块 0x%X  MustCode 0x%X'
+                            % (mode_name, self.gp.module_base, self.gp.mc_base))
 
     def do_detach(self):
         self.gp.detach_and_restore()
         self.attached = False
         self.attach_btn.config(state='normal')
         self.detach_btn.config(state='disabled')
+        self._refresh_mode_btns()
         self._beep('off')
         self.log_status('已脱离，hook 已还原')
 
@@ -1222,22 +1737,30 @@ class TrainerApp:
         self.log_status('%s 已发送（需选中单位）' % FEATURE_BY_KEY[key][1])
 
     def do_engine(self, key):
-        """由修改器直接在游戏进程的独立线程里调引擎函数（见 rank_up_via_engine）。
-
-        调用可能要花上几百毫秒到几秒，所以放到工作线程里跑，
-        免得卡住热键轮询线程和界面。
-        """
+        """由修改器直接在游戏进程里执行（晋升 / 摧毁等），不依赖 Money hook。"""
         if not self._ensure_attached():
             return
         self._beep('click')
-        self._post(self.log_status, '%s：正在调用官方晋升接口…'
-                   % FEATURE_BY_KEY[key][1])
+        self._post(self.log_status, '%s：执行中…' % FEATURE_BY_KEY[key][1])
         threading.Thread(target=self._engine_worker, args=(key,),
                          daemon=True).start()
 
     def _engine_worker(self, key):
+        params = FEATURE_BY_KEY[key][3]
+        action = params.get('action')
         try:
-            ok, msg = self.gp.rank_up_via_engine(**FEATURE_BY_KEY[key][3])
+            if action == 'kill':
+                ok, msg = self.gp.kill_selected()
+            elif action == 'clone':
+                as_mine = self.play_mode.get() != 'spectate'
+                ok, msg = self.gp.clone_selected(as_mine=as_mine)
+            elif action == 'speed':
+                ok, msg = self.gp.apply_unit_speed(params['mode'])
+            elif action == 'hp':
+                ok, msg = self.gp.apply_unit_hp(params['mode'])
+            else:
+                ok, msg = self.gp.rank_up_via_engine(**{
+                    k: v for k, v in params.items() if k != 'action'})
         except Exception as e:
             ok, msg = False, '异常：%s' % e
         self._post(self.log_status, ('✓ ' if ok else '✗ ') + msg)
@@ -1309,6 +1832,7 @@ class TrainerApp:
             self.attached = False
             self.attach_btn.config(state='normal')
             self.detach_btn.config(state='disabled')
+            self._refresh_mode_btns()
             self.log_status('游戏已退出')
         self.root.after(2000, self._refresh_status)
 

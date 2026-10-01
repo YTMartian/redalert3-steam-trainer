@@ -48,20 +48,13 @@ iEnable+24:
 db A0 A5 86 65
 |
 ra3_1.12.game+FF95B:
-jmp MustCode
+jmp MustCode+1200
 nop
 _BackPlayerID:
 |
+// PlayerID 旧入口：转发到加固版（观战/无本地势力时 [eax+28] 可能为空）
 MustCode:
-pushad
-mov edx,[eax+28]
-mov [ID],edx
-mov eax,[edx+20]
-mov [ID+4],eax
-popad
-mov edx,[eax+28]
-mov eax,[edx+20]
-jmp _BackPlayerID
+jmp MustCode+1200
 |
 //Player Money Code
 ra3_1.12.game+6CFDFE:
@@ -407,6 +400,10 @@ sub eax,[ecx+14]
 jmp _BackRestoreOreMine
 |
 // Enemy Can't Build Code
+// 原脚本在 flag==0 时仍会把非本地玩家的建造增量写成 0x1388（并非真正关闭）。
+// 观战模式下若没有合法本地 ID，会对所有电脑乱写，刚进对局就可能崩。
+// 这里把 flag==0 分支改成无条件跳过（db EB），关闭时真正 no-op；
+// flag==1 时行为不变。
 ra3_1.12.game+30F530:
 jmp MustCode+3d0
 _BackEnemyCantBuild:
@@ -415,7 +412,7 @@ MustCode+3d0:
 pushfd
 pushad
 cmp byte ptr [iEnable+15],00
-db 75 12
+db EB 12
 mov ecx,[ID+4]
 cmp [eax+0c],ecx
 db 74 07
@@ -654,9 +651,32 @@ call Ra3_1.12.game+1ed4a0
 add esp,10
 ret
 |
-Mustcode+1200:
-mov eax,[Ra3_1.12.game+e7565]
-ret
+// PlayerID 加固版：观战/观察者没有势力模板时 [eax+28]==0，
+// 原逻辑会解引用空指针闪退。此处判空后清空 ID，并安全返回 false。
+MustCode+1200:
+pushad
+mov edx,[eax+28]
+test edx,edx
+jz _ExitPlayerIDClear
+mov [ID],edx
+mov eax,[edx+20]
+mov [ID+4],eax
+jmp _ExitPlayerIDAfterStore
+_ExitPlayerIDClear:
+xor eax,eax
+mov [ID],eax
+mov [ID+4],eax
+_ExitPlayerIDAfterStore:
+popad
+mov edx,[eax+28]
+test edx,edx
+jz _ExitPlayerIDNoLocal
+mov eax,[edx+20]
+jmp _BackPlayerID
+_ExitPlayerIDNoLocal:
+xor al,al
+add esp,0c
+ret 4
 |
 //SelectUnitSuperSpeed Code
 MustCode2:

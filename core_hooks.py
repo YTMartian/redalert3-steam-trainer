@@ -9,7 +9,7 @@ from capstone import Cs, CS_ARCH_X86, CS_MODE_32
 # 17 个已定位 hook（名称, Steam新RVA, AOB, jmp目标偏移）
 # jmp 目标偏移 = MustCode 块内偏移（十六进制）
 CORE_HOOKS = [
-    ('PlayerID',       0x54119B, '8b50288b4220',          0x0),
+    ('PlayerID',       0x54119B, '8b50288b4220',          0x1200),
     ('Money',          0xA64E9E, '0378048b11',            0x29),
     ('Power',          0xA64DAD, '8b40048b8eb0030000',    0x6c),
     ('SCPoint',        0xA64F0C, '8b78348b4e3c',          0x9f),
