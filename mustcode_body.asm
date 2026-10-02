@@ -1893,7 +1893,7 @@ lea eax,[MC+0x1080]
 push eax
 push ecx
 push 0
-call MOD+0x205240
+call MOD+0x2440F0
 add esp,0x14
 ret
 nop

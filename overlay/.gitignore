@@ -1,0 +1,22 @@
+# Overlay local build artifacts / bulky trees
+build/
+bin/*.dll
+!bin/ra3_overlay_v4.dll
+bin/*.exp
+bin/*.lib
+bin/*.pdb
+
+# Duplicate vendor checkouts
+third_party/imgui-master/
+third_party/minhook-master/
+
+# ImGui extras (keep core + dx9/win32 backends)
+third_party/imgui/examples/
+third_party/imgui/docs/
+third_party/imgui/misc/
+third_party/imgui/.github/
+
+# MinHook extras
+third_party/minhook/build/
+third_party/minhook/dll/
+third_party/minhook/examples/

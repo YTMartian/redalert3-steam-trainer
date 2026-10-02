@@ -121,6 +121,16 @@ FN_CREATE_UNIT = 0x006440F0  # __cdecl(flags, template, pos*, owner, owner+0x10)
 # Steam 屏幕像素 → 地图世界坐标（__cdecl(in*{x,y:i32}, out*{xyz:f32}, flag, flag)）。
 # 由 Zoom(0x62B82D) 相对零售 GetMouse 偏移定位；调用约定与 MustCode GetMouseXYZinMap 同形。
 FN_GET_MOUSE_XYZ = 0x0062C500
+# 单位类型表 this 指针（.data，Steam RVA 不变）。GetUnitData2(__thiscall) 用它查哈希→模板。
+GET_UNIT_DATA2_THIS_RVA = 0x8E6C58
+# 原版 GetMeBase（MustCode2+A00）三阵营基地车类型名哈希 → GetUnitData2
+MCV_TYPE_HASHES = (
+    0x28DA574E,  # 盟军基地车
+    0xAF4C0DA5,  # 苏军基地车
+    0x1C2EF767,  # 帝国基地车
+)
+# 零售 GetUnitData2 的 RVA（mustcode: call game+3E4230）；Steam 需运行时定位
+GET_UNIT_DATA2_RETAIL_RVA = 0x3E4230
 # Steam 重定位：原 MustCode CreateUnit(零售 0x205240) 的等价工厂入口。
 # 签名与 MustCode+AA0 一致：push owner+0x10 / owner / pos / template / 0; add esp,14
 # 【危险·绝不要调用】0x0071B290 = tracker 的「按经验重算星级」。
@@ -675,6 +685,7 @@ class GameProcess:
             return False, '写入 MustCode2 失败'
         self.write(self.flags_base + 0x24, b'\xA0\xA5\x86\x65')
         self.write(self.flags_base + 0x20, b'\x00\x00\x00\x00')
+        self._fn_get_unit_data2 = None
 
         err = self._probe_module()
         if err:
@@ -1144,6 +1155,249 @@ class GameProcess:
         return True, '已复制 %d 个单位到鼠标附近（归属%s）%s：%s' % (
             ok_n, who, extra, '、'.join(detail))
 
+    def _module_size_of_image(self):
+        """读 PE SizeOfImage；失败则给一个保守上限。"""
+        dos = self.read(self.module_base, 0x40)
+        if len(dos) < 0x40 or dos[:2] != b'MZ':
+            return 0xC00000
+        e_lfanew = struct.unpack_from('<I', dos, 0x3C)[0]
+        pe = self.read(self.module_base + e_lfanew, 0x60)
+        if len(pe) < 0x58 or pe[:4] != b'PE\0\0':
+            return 0xC00000
+        return struct.unpack_from('<I', pe, 0x50)[0] or 0xC00000
+
+    def _probe_get_unit_data2(self, fn_va, type_hash=MCV_TYPE_HASHES[0]):
+        """试调 GetUnitData2；成功返回模板指针，否则 None。"""
+        this_slot = self.module_base + GET_UNIT_DATA2_THIS_RVA
+        this_obj = self.read_u32(this_slot)
+        if not self.is_ptr(this_obj):
+            return None
+        ok, _err, eax = self.call_remote(
+            fn_va, this=this_obj, args=(type_hash & 0xFFFFFFFF,),
+            cleanup=False, timeout=3000, capture_eax=True)
+        if ok and self.is_ptr(eax):
+            return eax
+        return None
+
+    def _patch_mc_get_unit_data2_call(self, fn_va):
+        """把 MustCode+A60 里的 call 改写到已解析的 Steam GetUnitData2。"""
+        if not self.mc_base or not fn_va:
+            return False
+        off = LABELS.get('MC', {}).get('mc_a60', 0xA60)
+        base = self.mc_base + off
+        code = bytearray(self.read(base, 40))
+        if len(code) < 16:
+            return False
+        # 期望：50 | 8B 0D xx xx xx xx | E8 rr rr rr rr | ...
+        pos = 0
+        if code[0] == 0x50:
+            pos = 1
+        if code[pos:pos + 2] != b'\x8B\x0D':
+            # 容错：搜索 mov ecx,[imm]
+            idx = bytes(code).find(b'\x8B\x0D')
+            if idx < 0:
+                return False
+            pos = idx
+        call_at = pos + 6
+        if call_at + 5 > len(code) or code[call_at] != 0xE8:
+            return False
+        rel = (fn_va - (base + call_at + 5)) & 0xFFFFFFFF
+        # 有符号
+        if rel >= 0x80000000:
+            rel_signed = rel - 0x100000000
+        else:
+            rel_signed = rel
+        if not (-0x80000000 <= rel_signed <= 0x7FFFFFFF):
+            return False
+        patch = b'\xE8' + struct.pack('<i', rel_signed)
+        return self.write(base + call_at, patch)
+
+    def _resolve_get_unit_data2(self):
+        """定位 Steam 版 GetUnitData2（哈希→单位模板）。
+
+        优先扫描 ``mov ecx,[module+0x8E6C58]; call`` 的真实 call 目标并探测；
+        再试与 CreateUnit 等同幅度的偏移候选。探测用 MCV 哈希，需已进对局。
+        """
+        cached = getattr(self, '_fn_get_unit_data2', None)
+        if cached:
+            return cached
+
+        hits = {}
+        abs_this = (self.module_base + GET_UNIT_DATA2_THIS_RVA) & 0xFFFFFFFF
+        needle = b'\x8B\x0D' + struct.pack('<I', abs_this)
+        img_size = min(self._module_size_of_image(), 0x1000000)
+        chunk = 0x10000
+        for off in range(0, img_size, chunk - 16):
+            raw = self.read(self.module_base + off, min(chunk, img_size - off))
+            if not raw:
+                continue
+            start = 0
+            while True:
+                i = raw.find(needle, start)
+                if i < 0:
+                    break
+                after = self.module_base + off + i + 6
+                tail = self.read(after, 8)
+                if len(tail) >= 5 and tail[0] == 0xE8:
+                    rel = struct.unpack_from('<i', tail, 1)[0]
+                    target = (after + 5 + rel) & 0xFFFFFFFF
+                    hits[target] = hits.get(target, 0) + 1
+                start = i + 1
+
+        # 扫描命中优先（按出现次数）
+        ordered = [va for va, _ in sorted(hits.items(), key=lambda kv: -kv[1])]
+        create_delta = (FN_CREATE_UNIT - MOD_BASE) - 0x205240
+        for delta in (create_delta, 0):
+            rva = (GET_UNIT_DATA2_RETAIL_RVA + delta) & 0xFFFFFFFF
+            if 0x10000 < rva < 0x1000000:
+                ordered.append(self.module_base + rva)
+
+        seen = set()
+        for va in ordered:
+            if va in seen:
+                continue
+            seen.add(va)
+            if self._probe_get_unit_data2(va):
+                self._fn_get_unit_data2 = va
+                self._patch_mc_get_unit_data2_call(va)
+                return va
+        return None
+
+    def _lookup_unit_data_via_mc_stub(self, type_hash):
+        """走已注入的 MustCode+A60（需已 patch 到正确 GetUnitData2）。"""
+        if not self.mc_base:
+            return None
+        off = LABELS.get('MC', {}).get('mc_a60', 0xA60)
+        stub_target = self.mc_base + off
+        if not getattr(self, '_stub', None):
+            self._stub = self.alloc(0x100)
+            if not self._stub:
+                return None
+        stub = self._stub
+        # mov eax, hash; call MustCode+A60; ret
+        body = bytearray()
+        body += b'\xB8' + struct.pack('<I', type_hash & 0xFFFFFFFF)
+        call_from = stub + len(body)
+        body += b'\xE8' + struct.pack('<i', stub_target - (call_from + 5))
+        body += b'\xC3'
+        pad = b'\xCC' * max(0, 0x100 - len(body))
+        if not self.write(stub, bytes(body) + pad):
+            return None
+        h = kernel32.CreateRemoteThread(
+            ctypes.c_void_p(self.handle), None, 0,
+            ctypes.c_void_p(stub), None, 0, None)
+        if not h:
+            return None
+        waited = kernel32.WaitForSingleObject(ctypes.c_void_p(h), 4000)
+        kernel32.CloseHandle(ctypes.c_void_p(h))
+        if waited != 0:
+            return None
+        eax = self.read_u32(self.mc_base + 0x1020)
+        return eax if self.is_ptr(eax) else None
+
+    def lookup_unit_data(self, type_hash):
+        """类型名哈希 → 单位模板指针。失败返回 None。"""
+        fn = self._resolve_get_unit_data2()
+        this_obj = self.read_u32(self.module_base + GET_UNIT_DATA2_THIS_RVA)
+        if not self.is_ptr(this_obj):
+            return None
+
+        if fn:
+            # 策略 A：标准 thiscall(hash)
+            ok, _err, eax = self.call_remote(
+                fn, this=this_obj, args=(type_hash & 0xFFFFFFFF,),
+                cleanup=False, timeout=4000, capture_eax=True)
+            if ok and self.is_ptr(eax):
+                return eax
+            # 策略 B：cdecl 清栈
+            ok, _err, eax = self.call_remote(
+                fn, this=this_obj, args=(type_hash & 0xFFFFFFFF,),
+                cleanup=True, timeout=4000, capture_eax=True)
+            if ok and self.is_ptr(eax):
+                return eax
+
+        # 策略 C：MustCode+A60（已 patch）
+        via = self._lookup_unit_data_via_mc_stub(type_hash)
+        if self.is_ptr(via):
+            return via
+        return None
+
+    def spawn_faction_mcvs(self, as_mine=True):
+        """在鼠标落点召唤三阵营基地车各一辆（原版 GetMeBase / cmd=0xB）。"""
+        if not self.mc_base:
+            return False, 'MustCode 未分配，无法写入坐标缓冲'
+        spawn = self.mouse_world_pos()
+        if not spawn:
+            return False, '读不到鼠标地图坐标（请把鼠标移到战场地形上再试）'
+        owner = self._local_owner_for_unit_ops()
+        if not self.is_ptr(owner):
+            return False, ('读不到本地玩家归属（正常对战需有己方势力；'
+                           '观战需已附加）')
+        owner_vt = self.read_u32(owner)
+        if not self.is_ptr(owner_vt):
+            return False, '本地归属指针无效'
+        owner_info = self.read_u32(owner + 0x10)
+        if owner_info is None:
+            return False, '归属+0x10 读失败'
+
+        # 确保 GetUnitData2 已定位并 patch 进 MustCode
+        fn = self._resolve_get_unit_data2()
+        if fn:
+            self._patch_mc_get_unit_data2_call(fn)
+        else:
+            this_obj = self.read_u32(self.module_base + GET_UNIT_DATA2_THIS_RVA)
+            return False, (
+                '无法定位 GetUnitData2（单位模板查询）。'
+                'this=[0x%08X]=0x%s。请确认已进入对局后再试'
+                % (self.module_base + GET_UNIT_DATA2_THIS_RVA,
+                   ('%08X' % this_obj) if this_obj is not None else '????'))
+
+        # 写入归属到 MustCode+1040（CreateUnit / GetMeBase 约定）
+        self.write(self.mc_base + 0x1040, struct.pack('<I', owner & 0xFFFFFFFF))
+
+        templates = []
+        for h in MCV_TYPE_HASHES:
+            td = self.lookup_unit_data(h)
+            if not self.is_ptr(td):
+                return False, (
+                    '解析基地车模板失败（哈希 0x%08X，GetUnitData2=0x%08X）。'
+                    '请确认已进入对局' % (h, fn))
+            templates.append((h, td))
+
+        pos_buf = self.mc_base + 0x1080
+        self._clone_seq = (getattr(self, '_clone_seq', 0) + 1) & 0xFFFF
+        ok_n = 0
+        detail = []
+        names = ('盟军', '苏军', '帝国')
+        for i, (h, unit_data) in enumerate(templates):
+            radius = 40.0 + 25.0 * i
+            angle = i * 2.094395
+            x = spawn[0] + radius * math.cos(angle)
+            y = spawn[1] + radius * math.sin(angle)
+            z = spawn[2]
+            if not self.write(pos_buf, struct.pack('<fff', x, y, z)):
+                detail.append('%s写坐标失败' % names[i])
+                continue
+            # 同步模板到 MustCode+1020，便于与引擎路径一致
+            self.write(self.mc_base + 0x1020, struct.pack('<I', unit_data & 0xFFFFFFFF))
+            ok, err, new_ent = self.call_remote(
+                self.va_of(FN_CREATE_UNIT),
+                args=(0, unit_data, pos_buf, owner, owner_info & 0xFFFFFFFF),
+                cleanup=True, timeout=4000, capture_eax=True)
+            label = names[i]
+            if ok and self.is_ptr(new_ent):
+                ok_n += 1
+                detail.append('%s→0x%08X' % (label, new_ent))
+            elif ok:
+                detail.append('%s引擎拒绝' % label)
+            else:
+                detail.append('%s失败(%s)' % (label, err))
+            time.sleep(0.05)
+        if ok_n == 0:
+            return False, '召唤基地车失败：' + '；'.join(detail)
+        return True, '已在鼠标附近召唤 %d/3 辆基地车（三阵营，归属己方）：%s' % (
+            ok_n, '、'.join(detail))
+
     def convert_selected(self):
         """收编：把选中单位的实体+0x418 改为本地归属（同 MustCode MC2+0x800 写 [IDB]）。"""
         ents = self.selected_entities()
@@ -1450,6 +1704,7 @@ class GameProcess:
             self.hooked = False
         self.auto_spectator = False
         self._spectator_cached = None
+        self._fn_get_unit_data2 = None
         self.detach()
 
 
@@ -1500,6 +1755,7 @@ FEATURES = [
     ('spawn_unit',   '复制到己方', 'engine', dict(action='spawn_as_mine')),
     ('damage_mult',  '伤害×5',     'engine', dict(action='damage_mult', mult=5.0)),
     ('spec_gift',    '观战赠送单位', 'engine', dict(action='spec_gift')),
+    ('spawn_mcv',    '召唤基地车', 'engine', dict(action='spawn_mcv')),
     # 星级（满级 3 星）：
     #   实体+0x3CC 是 ExperienceTrackerObject（经验追踪器），它的 +0x24 只是
     #   「当前等级」的缓存 —— 纯粹写内存改它，游戏里一点变化都没有（实测）。
@@ -1620,6 +1876,7 @@ FEATURE_HINTS = {
                         '无独立协议接口，不长期占用开关）',
     'spawn_unit':    '按选中模板在鼠标处生成，归属强制本地玩家（观战下「复制选中」跟原阵营，'
                      '本键始终尝试己方；无兵种面板）',
+    'spawn_mcv':     '鼠标移到战场地形后点击：召唤盟军/苏军/帝国基地车各一辆（归属己方）',
     'damage_mult':   '把选中单位星级加成倍率(sub+0x08)写成 ×5（近似伤害/属性；'
                      '升星后可能被引擎重算覆盖）',
     'spec_gift':     '按选中单位模板在鼠标处生成，归属始终为原阵营（观战刷兵 / 给电脑送礼）',
@@ -1649,7 +1906,7 @@ FEATURE_GROUPS = [
     ]),
     ('情报', ['fog_toggle']),
     ('观战', ['spec_gift']),
-    ('趣味', ['chaos_mode', 'ore_convoy']),
+    ('趣味', ['chaos_mode', 'ore_convoy', 'spawn_mcv']),
 ]
 
 # 侧栏选中后，右侧标题下的补充说明（可选）
@@ -1814,12 +2071,12 @@ class TrainerApp:
         self.play_mode = tk.StringVar(value='normal')
         self._build_ui()
 
-        # 默认固定一屏：左侧导航 + 右侧当前分组，无需整页滚动。
+        # 默认窗口要能看见左侧全部「分类」（含趣味），避免还要手动拉高。
         root.update_idletasks()
-        self._win_w = 740
-        self._win_h = 540
+        self._win_w = 760
+        self._win_h = 620
         root.geometry('%dx%d' % (self._win_w, self._win_h))
-        root.minsize(680, 480)
+        root.minsize(720, 580)
         root.resizable(True, True)
 
         # 热键轮询线程
@@ -1868,18 +2125,15 @@ class TrainerApp:
 
         # ===== 顶部标题 =====
         header = tk.Frame(root, bg=c['bg'])
-        header.pack(fill='x', padx=16, pady=(14, 4))
+        header.pack(fill='x', padx=16, pady=(10, 2))
         title_row = tk.Frame(header, bg=c['bg'])
         title_row.pack(anchor='w', fill='x')
         tk.Label(title_row, text='红警3 Steam 修改器', font=font_title,
                  bg=c['bg'], fg=c['primary']).pack(side='left')
-        badge = tk.Label(title_row, text='[预] 规划中', font=font_badge,
-                         bg=c['primary_soft'], fg=c['primary'], padx=6, pady=1)
-        badge.pack(side='left', padx=(10, 0), pady=(4, 0))
         tk.Label(header, text='Command & Conquer: Red Alert 3 · 1.12 核心版',
                  font=font_sub, bg=c['bg'], fg=c['dim']).pack(anchor='w', pady=(2, 0))
         # 红色装饰线
-        tk.Frame(root, bg=c['primary'], height=3).pack(fill='x', padx=16, pady=(8, 8))
+        tk.Frame(root, bg=c['primary'], height=3).pack(fill='x', padx=16, pady=(6, 6))
 
         # ===== 连接栏 =====
         conn = self._panel(root, fill='x', padx=12)
@@ -1946,11 +2200,11 @@ class TrainerApp:
         main.pack(fill='both', expand=True, padx=12, pady=(10, 4))
 
         nav = self._panel(main)
-        nav.configure(width=122, padx=6, pady=8)
+        nav.configure(width=118, padx=4, pady=6)
         nav.pack(side='left', fill='y')
         nav.pack_propagate(False)
         tk.Label(nav, text='分类', font=font_badge, bg=c['panel'], fg=c['muted']
-                 ).pack(anchor='w', padx=8, pady=(2, 8))
+                 ).pack(anchor='w', padx=8, pady=(0, 4))
 
         content_shell = self._panel(main)
         content_shell.configure(padx=14, pady=12)
@@ -1972,14 +2226,8 @@ class TrainerApp:
         self._current_group = 0
 
         for gi, (gname, keys) in enumerate(FEATURE_GROUPS):
-            planned_n = sum(1 for k in keys if FEATURE_BY_KEY[k][2] == 'planned')
-            live_n = len(keys) - planned_n
-            if planned_n and live_n:
-                badge_txt = '已实现 %d · 规划 %d' % (live_n, planned_n)
-            elif planned_n:
-                badge_txt = '全部规划中'
-            else:
-                badge_txt = '已实现 · %d 项' % live_n
+            live_n = len(keys)
+            badge_txt = '共 %d 项' % live_n
             sub = GROUP_SUBTITLES.get(gname, '')
             meta_line = badge_txt if not sub else ('%s  ·  %s' % (badge_txt, sub))
             self._group_meta[gi] = (gname, meta_line)
@@ -1987,9 +2235,9 @@ class TrainerApp:
             nav_btn = tk.Button(
                 nav, text=gname, font=font_nav, anchor='w',
                 relief='flat', bd=0, cursor='hand2', highlightthickness=0,
-                padx=12, pady=8,
+                padx=10, pady=5,
                 command=lambda i=gi: self._show_group(i))
-            nav_btn.pack(fill='x', pady=2)
+            nav_btn.pack(fill='x', pady=1)
             self._nav_btns[gi] = nav_btn
 
             page = tk.Frame(pages_host, bg=c['panel'])
@@ -2370,6 +2618,8 @@ class TrainerApp:
             elif action == 'spawn_as_mine':
                 ok, msg = self.gp.spawn_as_mine(
                     copies=int(params.get('copies', 1)))
+            elif action == 'spawn_mcv':
+                ok, msg = self.gp.spawn_faction_mcvs(as_mine=True)
             elif action == 'damage_mult':
                 ok, msg = self.gp.apply_damage_mult(
                     mult=float(params.get('mult', 5.0)))

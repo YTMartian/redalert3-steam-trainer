@@ -580,6 +580,8 @@ mov [MustCode+1040],eax
 ret
 |
 //Call GetUnitData2 Code
+// eax=类型名哈希；结果写入 MustCode+1020，并留在 eax。
+// call 目标零售为 +3E4230；Steam 版在 inject 后由 trainer 运行时改写。
 MustCode+A60:
 push eax
 mov ecx,[ra3_1.12.game+8E6C58]
@@ -588,6 +590,7 @@ mov [MustCode+1020],eax
 ret
 |
 //Call CreateUnit Code
+// Steam：工厂入口 RVA 0x2440F0（VA 0x6440F0），勿再用零售 0x205240。
 MustCode+AA0:
 mov ecx,[MustCode+1020]
 test ecx,ecx
@@ -601,7 +604,7 @@ lea eax,[MustCode+1080]
 push eax
 push ecx
 push 0
-call ra3_1.12.game+205240
+call ra3_1.12.game+2440F0
 add esp,14
 ret
 |
