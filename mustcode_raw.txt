@@ -196,6 +196,10 @@ popad
 db eb e8
 |
 //Player Super Power Code
+// flag+D：己方超武立即就绪（只改当前 SP 的 [esi+20]）
+// flag+E：仅当归属 != 本地玩家时拖 [esi+20]——这是禁用「敌方」超武的主路径。
+//         己方单位技能/协议归属==ID，会被 jz 跳过，不受影响。
+//         观战且 [ID]==0 时，非 0 归属一律当敌方（接近全场禁用）。
 ra3_1.12.game+2EBB69:
 jmp MustCode+175
 nop
@@ -222,6 +226,8 @@ mov ebx,[eax+00000418]
 jmp _BackPlayerSuperPower
 |
 //Player Super Power 2 Code
+// flag+D：只清当前匹配节点的 ready_at（己方超武就绪）
+// flag+E：不在这里改表（原版一次清 4 个节点，且逻辑像「就绪」而非禁用，易误伤协议）
 ra3_1.12.game+43EC19:
 jmp MustCode+1ca
 _BackPlayerSuperPower2:
@@ -232,34 +238,18 @@ mov eax,[ecx]
 pushfd
 pushad
 cmp byte ptr [iEnable+D],01
-db 75 2e
+db 75 13
 mov ecx,[id]
 cmp [esp+28],ecx
-db 75 22
-mov [eax+0c],00000000
-mov eax,[eax]
-mov [eax+0c],00000000
-mov eax,[eax]
-mov [eax+0c],00000000
-mov eax,[eax]
-mov [eax+0c],00000000
-cmp byte ptr [iEnable+E],01
-db 75 2e
-mov ecx,[id]
-cmp [esp+28],ecx
-db 74 22
-mov [eax+0c],00000000
-mov eax,[eax]
-mov [eax+0c],00000000
-mov eax,[eax]
-mov [eax+0c],00000000
-mov eax,[eax]
+db 75 07
 mov [eax+0c],00000000
 popad
 popfd
 jmp _BackPlayerSuperPower2
 |
 //Disable All Super Power Code
+// 玩家对象 +0x218 共享冷却链表的「是否就绪」查询。
+// 只给当前匹配节点 +1（不再往后扫 3 个，避免拖到协议）。
 ra3_1.12.game+43ECA6:
 jmp MustCode+250
 nop
@@ -271,19 +261,15 @@ cmp edx,[eax+0c]
 pushfd
 pushad
 cmp byte ptr [iEnable+E],01
-db 75 22
-add [eax+0c],00000001
-mov eax,[eax]
-add [eax+0c],00000001
-mov eax,[eax]
-add [eax+0c],00000001
-mov eax,[eax]
+db 75 07
 add [eax+0c],00000001
 popad
 popfd
 jmp _BackDisableAllSuperPower
 |
 //Disable All Super Power 2 Code
+// 通用 [esi+20] 冷却比较（单位技能也走这里）。
+// 不再无条件 +1；敌方超武改由 SuperPower 的 flag+E（带归属判断）处理。
 ra3_1.12.game+30A5F6:
 jmp MustCode+294
 nop
@@ -292,13 +278,6 @@ _BackDisableAllSuperPower2:
 MustCode+294:
 mov ecx,[eax+50]
 cmp ecx,[esi+20]
-pushfd
-pushad
-cmp byte ptr [iEnable+E],01
-db 75 07
-add [esi+20],00000001
-popad
-popfd
 jmp _BackDisableAllSuperPower2
 |
 // Player Zoom Code

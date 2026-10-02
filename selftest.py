@@ -75,13 +75,22 @@ shown = set()
 for _, keys in trainer.FEATURE_GROUPS:
     shown.update(keys)
 assert not [k for k, _, _, _ in trainer.FEATURES if k not in shown]
+assert not [k for k, _, _, _ in trainer.PLANNED_FEATURES if k not in shown]
+assert not [k for k in shown if k not in trainer.FEATURE_BY_KEY]
+assert all(t == 'planned' for _, _, t, _ in trainer.PLANNED_FEATURES)
+assert len(trainer.PLANNED_FEATURES) == 0, '规划列表应已清空'
 assert not [k for k in trainer.HOTKEYS
             if k not in trainer.FEATURE_BY_KEY and not k.startswith('danger_')]
 assert trainer.HOTKEYS['unit_rank'] == ([], 0x50)              # p
 assert trainer.FEATURE_BY_KEY['unit_rank'][2] == 'engine'
+assert trainer.FEATURE_BY_KEY['unit_skill_ready'][2] == 'engine'
+assert trainer.FEATURE_BY_KEY['disable_protocol'][2] == 'engine'
+assert trainer.FEATURE_BY_KEY['spawn_unit'][2] == 'engine'
+assert trainer.FEATURE_BY_KEY['damage_mult'][2] == 'engine'
 assert not [x for x in trainer.FEATURES if x[3].get('cmd') == 8], 'cmd=8 应已停用'
-print('[OK] 功能接线：%d 个功能，unit_rank=%s' %
-      (len(trainer.FEATURES), trainer.FEATURE_BY_KEY['unit_rank']))
+print('[OK] 功能接线：已实现 %d · 规划 %d，unit_rank=%s' %
+      (len(trainer.FEATURES), len(trainer.PLANNED_FEATURES),
+       trainer.FEATURE_BY_KEY['unit_rank']))
 
 src = io.open('trainer.py', encoding='utf-8').read()
 blk = src[src.index('def rank_up_via_engine'):src.index('def detach_and_restore')]

@@ -32,7 +32,10 @@
   "mc_aa0": 2720,
   "mc_b00": 2816,
   "mc_1120": 4384,
-  "mc_1200": 4608
+  "mc_1200": 4608,
+  "exit_exitplayeridclear": 4632,
+  "exit_exitplayeridafterstore": 4644,
+  "exit_exitplayeridnolocal": 4660
  },
  "MC2": {
   "mc2_0": 0,
@@ -57,8 +60,6 @@
   "mc2_611": 1553,
   "mc2_62e": 1590,
   "mc2_700": 1792,
-  "mc2_711": 1809,
-  "mc2_73f": 1843,
   "mc2_800": 2048,
   "mc2_811": 2065,
   "mc2_872": 2162,

@@ -9,8 +9,10 @@
   3. 通过界面按钮或全局热键开关各项功能。
 """
 import ctypes
+import math
 import os
 import queue
+import random
 import struct
 import sys
 import threading
@@ -104,6 +106,13 @@ LOCAL_PLAYER_RVA = 0x8EDE2C
 
 # 观战时会崩的资源类 hook：观战自动卸载，有本地势力时再装上
 PLAYER_HOOK_NAMES = {'PlayerID', 'Money', 'Power', 'SCPoint', 'HaveAllSC'}
+
+# 观战模式可安全安装的 hook：不依赖本地玩家 ID / 资源模板。
+# DisableAllSP* 无条件拖超武冷却；SuperPower* 在 [ID]==0（未装 PlayerID）时
+# 会把所有非空归属都当「敌方」，效果等同禁用全场超武。
+SPECTATE_HOOK_NAMES = {
+    'DisableAllSP', 'DisableAllSP2', 'SuperPower', 'SuperPower2',
+}
 
 # 星级 / 摧毁相关的游戏函数（VA）
 FN_ADD_XP = 0x005173F0       # __cdecl(entity, int xp)  官方加经验接口（唯一安全）
@@ -260,6 +269,9 @@ class GameProcess:
         # 调用桩是共享的：多线程（例如连按两次 p）同时写会把机器码写坏，
         # 所以所有 call_remote 串行化。
         self._call_lock = threading.Lock()
+        self._stub = 0
+        self._eax_slot = 0   # 远程调用 EAX 返回值暂存槽（游戏进程内）
+        self._clone_seq = 0  # 连续复制计数，用于错开落点避免叠坐标崩溃
 
     # ---- 进程 / 模块查找 ----
     def find_game(self):
@@ -438,20 +450,25 @@ class GameProcess:
         return buf.raw[:read.value]
 
     # ---- 在目标进程里直接调用游戏函数（诊断/实验用） ----
-    def call_remote(self, addr, this=None, args=(), cleanup=True, timeout=4000):
+    def call_remote(self, addr, this=None, args=(), cleanup=True, timeout=4000,
+                    capture_eax=False):
         """在游戏进程内调用一个 x86 函数。
 
         addr    目标函数地址（绝对地址）
         this    传入 ecx（__thiscall 的 this），None 表示不管 ecx
         args    参数列表，按 cdecl 顺序（本方法会反向压栈）
         cleanup True 表示按 __cdecl 由调用方清栈（__thiscall 无栈参数时无影响）
+        capture_eax  True 时额外返回函数 EAX（用于 CreateUnit 等判断是否成功）
 
-        返回 (ok, err)。注意：会短暂冻结游戏，属正常现象。
+        返回 (ok, err) 或 capture_eax 时 (ok, err, eax)。
+        注意：会短暂冻结游戏，属正常现象。
         """
         with self._call_lock:
-            return self._call_remote_locked(addr, this, args, cleanup, timeout)
+            return self._call_remote_locked(
+                addr, this, args, cleanup, timeout, capture_eax)
 
-    def _call_remote_locked(self, addr, this=None, args=(), cleanup=True, timeout=4000):
+    def _call_remote_locked(self, addr, this=None, args=(), cleanup=True,
+                            timeout=4000, capture_eax=False):
         code = bytearray(b'\x60')                       # pushad 保存全部寄存器
         if this is not None:
             code += b'\xb9' + struct.pack('<I', this & 0xFFFFFFFF)
@@ -461,30 +478,60 @@ class GameProcess:
         code += b'\xff\xd0'                             # call eax
         if cleanup and args:
             code += b'\x81\xc4' + struct.pack('<I', 4 * len(args))
+        if capture_eax:
+            if not self._eax_slot:
+                self._eax_slot = self.alloc(4)
+                if not self._eax_slot:
+                    if capture_eax:
+                        return False, '分配 EAX 槽失败', 0
+                    return False, '分配 EAX 槽失败'
+            # call 后 EAX 是返回值；在 popad 之前写入槽
+            code += b'\xa3' + struct.pack('<I', self._eax_slot & 0xFFFFFFFF)
         code += b'\x61\xc3'                             # popad; ret
 
         if not getattr(self, '_stub', None):
             self._stub = self.alloc(0x100)
             if not self._stub:
+                if capture_eax:
+                    return False, '分配调用桩内存失败', 0
                 return False, '分配调用桩内存失败'
         stub = self._stub
         if not self.write(stub, b'\xcc' * 0x100):
+            if capture_eax:
+                return False, '清理调用桩失败', 0
             return False, '清理调用桩失败'
         if not self.write(stub, bytes(code)):
+            if capture_eax:
+                return False, '写入调用桩失败', 0
             return False, '写入调用桩失败'
+
+        if capture_eax and self._eax_slot:
+            self.write(self._eax_slot, b'\x00\x00\x00\x00')
 
         h = kernel32.CreateRemoteThread(
             ctypes.c_void_p(self.handle), None, 0,
             ctypes.c_void_p(stub), None, 0, None)
         if not h:
-            return False, 'CreateRemoteThread 失败 (err=%d)' % ctypes.get_last_error()
+            err = 'CreateRemoteThread 失败 (err=%d)' % ctypes.get_last_error()
+            if capture_eax:
+                return False, err, 0
+            return False, err
         waited = kernel32.WaitForSingleObject(ctypes.c_void_p(h), timeout)
         kernel32.CloseHandle(ctypes.c_void_p(h))
         if waited == 0x102:                 # WAIT_TIMEOUT
             # 远端线程可能还在跑：绝不能复用这块桩内存（会被下一次写入踩坏），
             # 直接丢弃，下次调用重新分配。
             self._stub = 0
-            return False, '调用超时（>%d ms），已放弃这一次' % timeout
+            err = '调用超时（>%d ms），已放弃这一次' % timeout
+            if capture_eax:
+                return False, err, 0
+            return False, err
+        eax = 0
+        if capture_eax and self._eax_slot:
+            raw = self.read(self._eax_slot, 4)
+            if len(raw) == 4:
+                eax = struct.unpack('<I', raw)[0]
+            return True, None, eax
         return True, None
 
     # ---- 注入 ----
@@ -798,32 +845,93 @@ class GameProcess:
                  'restore': '恢复速度'}
         return True, '已对 %d 个单位执行「%s」' % (n, names.get(mode, mode))
 
-    def apply_unit_hp(self, mode):
+    def _hp_component(self, ent):
+        hp = self.read_u32(ent + 0x33C)
+        return hp if self.is_ptr(hp) else None
+
+    def _write_entity_hp(self, ent, mode):
+        hp = self._hp_component(ent)
+        if not hp:
+            return False
+        if mode == 'max':
+            return self.write_f32(hp + 4, 9999999.0) and self.write_f32(hp + 0xC, 9999999.0)
+        if mode == 'min':
+            return self.write_f32(hp + 4, 1.0)
+        if mode == 'normal':
+            mx = self.read_f32(hp + 0x10)
+            if mx is None:
+                return False
+            return self.write_f32(hp + 4, mx) and self.write_f32(hp + 0xC, mx)
+        return False
+
+    def _entity_owner(self, ent):
+        return self.read_u32(ent + 0x418)
+
+    def _local_owner_for_unit_ops(self):
+        """实体 +0x418 上的归属；优先本地玩家，观战时可读 PlayerID hook 写入的 IDB。"""
+        owner = self._local_owner()
+        if self.is_ptr(owner):
+            return owner
+        if self.idb_base:
+            cached = self.read_u32(self.idb_base)
+            if self.is_ptr(cached):
+                return cached
+        return None
+
+    def _filter_entities_by_owner(self, ents, relation):
+        """relation: ally=与本地同归属；enemy=非本地归属。无本地归属时仅处理当前选中。"""
+        local = self._local_owner_for_unit_ops()
+        out = []
+        for ent in ents:
+            ow = self._entity_owner(ent)
+            if relation == 'ally':
+                if local:
+                    if self.is_ptr(ow) and ow == local:
+                        out.append(ent)
+                else:
+                    out.append(ent)
+            elif relation == 'enemy':
+                if local:
+                    if self.is_ptr(ow) and ow != local:
+                        out.append(ent)
+                else:
+                    if self.is_ptr(ow):
+                        out.append(ent)
+        return out, local
+
+    def apply_unit_hp(self, mode, entities=None):
         """对选中单位改血量。mode: max/min/normal。不依赖 Money hook。"""
-        ents = self.selected_entities()
+        ents = entities if entities is not None else self.selected_entities()
         if not ents:
             return False, '没读到选中单位（请先选中）'
         n = 0
         for ent in ents:
-            hp = self.read_u32(ent + 0x33C)
-            if not self.is_ptr(hp):
-                continue
-            if mode == 'max':
-                if self.write_f32(hp + 4, 9999999.0) and self.write_f32(hp + 0xC, 9999999.0):
-                    n += 1
-            elif mode == 'min':
-                if self.write_f32(hp + 4, 1.0):
-                    n += 1
-            elif mode == 'normal':
-                mx = self.read_f32(hp + 0x10)
-                if mx is None:
-                    continue
-                if self.write_f32(hp + 4, mx) and self.write_f32(hp + 0xC, mx):
-                    n += 1
+            if self._write_entity_hp(ent, mode):
+                n += 1
         if n == 0:
             return False, '选中对象没有可写的血量组件'
         names = {'max': '无敌', 'min': '残血', 'normal': '恢复血量'}
         return True, '已对 %d 个单位执行「%s」' % (n, names.get(mode, mode))
+
+    def apply_unit_hp_relation(self, mode, relation):
+        """按归属筛选后再改血（无全体单位列表，仅当前选中里符合条件的）。"""
+        ents = self.selected_entities()
+        if not ents:
+            return False, '没读到选中单位（请先选中）'
+        filtered, local = self._filter_entities_by_owner(ents, relation)
+        rel_name = '友军/己方' if relation == 'ally' else '敌方'
+        if not filtered:
+            if local:
+                return False, ('选中里没有可识别的%s单位（请框选对应阵营）'
+                               % rel_name)
+            return False, '选中里没有带有效归属的单位'
+        ok, msg = self.apply_unit_hp(mode, entities=filtered)
+        if not ok:
+            return ok, msg
+        scope = ('（仅当前选中中符合条件的单位，非地图全体）'
+                 if len(filtered) < len(ents) or len(ents) < 64 else
+                 '（仅当前选中，非地图全体）')
+        return True, msg + scope
 
     def kill_selected(self):
         """在独立线程里调官方摧毁接口 0x7DCDF0，真正拆掉选中单位。
@@ -943,16 +1051,19 @@ class GameProcess:
             return None
         return float(x), float(y), float(z)
 
-    def clone_selected(self, as_mine=True):
+    def clone_selected(self, as_mine=True, copies=1):
         """复制选中单位（独立线程调 FN_CREATE_UNIT）。
 
         as_mine=True  → 归属本地玩家（正常模式）
         as_mine=False → 归属原单位阵营（观战模式，用实体+0x418）
+        copies        → 每个选中模板各复制几份（批量复制）
 
         模板取自实体+0x4（与 MustCode GetUnitData 一致）；
         生成坐标取自当前鼠标在地图上的落点（FN_GET_MOUSE_XYZ）。
+        连续复制会自动错开落点，避免多单位叠在同一坐标引发碰撞/寻路崩溃。
         返回 (ok, 消息)。
         """
+        copies = max(1, int(copies))
         ents = self.selected_entities()
         if not ents:
             return False, '没读到选中单位（请先选中）'
@@ -962,12 +1073,16 @@ class GameProcess:
         if not spawn:
             return False, '读不到鼠标地图坐标（请把鼠标移到战场地形上再试）'
         pos_buf = self.mc_base + 0x1080
+        self._clone_seq = (self._clone_seq + 1) & 0xFFFF
         ok_n = 0
+        fail_n = 0
         detail = []
+        slot_base = self._clone_seq * 3
         for i, ent in enumerate(ents):
             unit_data = self.read_u32(ent + 4)
             if not self.is_ptr(unit_data):
                 detail.append('0x%08X 无模板' % ent)
+                fail_n += copies
                 continue
             if as_mine:
                 owner = self._local_owner()
@@ -977,32 +1092,287 @@ class GameProcess:
                 owner = self.read_u32(ent + 0x418)
                 if not self.is_ptr(owner):
                     detail.append('0x%08X 无归属' % ent)
+                    fail_n += copies
                     continue
+            # 归属对象本身再校验一次，避免野指针进 CreateUnit
+            owner_vt = self.read_u32(owner)
+            if not self.is_ptr(owner_vt):
+                detail.append('0x%08X 归属无效' % ent)
+                fail_n += copies
+                continue
             owner_info = self.read_u32(owner + 0x10)
             if owner_info is None:
                 detail.append('0x%08X 归属+0x10 读失败' % ent)
+                fail_n += copies
                 continue
             # owner+0x10 允许为 0（MustCode 原样压栈，不做空指针判断）
-            # 多个选中时在鼠标落点附近错开，避免互相重叠
-            x = spawn[0] + 15.0 * i
-            y = spawn[1]
-            z = spawn[2]
-            if not self.write(pos_buf, struct.pack('<fff', x, y, z)):
-                detail.append('0x%08X 写坐标失败' % ent)
-                continue
-            ok, err = self.call_remote(
-                self.va_of(FN_CREATE_UNIT),
-                args=(0, unit_data, pos_buf, owner, owner_info & 0xFFFFFFFF),
-                cleanup=True, timeout=4000)
-            if ok:
-                ok_n += 1
-                detail.append('0x%08X' % ent)
-            else:
-                detail.append('0x%08X 失败(%s)' % (ent, err))
+            for c in range(copies):
+                slot = slot_base + i * copies + c
+                radius = 35.0 + 18.0 * (slot % 12)
+                angle = (slot * 2.399963)  # 黄金角，近似均匀散开
+                x = spawn[0] + radius * math.cos(angle)
+                y = spawn[1] + radius * math.sin(angle)
+                z = spawn[2]
+                if not self.write(pos_buf, struct.pack('<fff', x, y, z)):
+                    detail.append('0x%08X 写坐标失败' % ent)
+                    fail_n += 1
+                    continue
+                ok, err, new_ent = self.call_remote(
+                    self.va_of(FN_CREATE_UNIT),
+                    args=(0, unit_data, pos_buf, owner, owner_info & 0xFFFFFFFF),
+                    cleanup=True, timeout=4000, capture_eax=True)
+                if ok and self.is_ptr(new_ent):
+                    ok_n += 1
+                    if copies == 1:
+                        detail.append('0x%08X→0x%08X' % (ent, new_ent))
+                elif ok:
+                    fail_n += 1
+                    if copies == 1:
+                        detail.append('0x%08X 引擎拒绝生成' % ent)
+                else:
+                    fail_n += 1
+                    if copies == 1:
+                        detail.append('0x%08X 失败(%s)' % (ent, err))
+                time.sleep(0.05)
         if ok_n == 0:
-            return False, '复制失败：' + '；'.join(detail)
+            return False, '复制失败：' + ('；'.join(detail) if detail else '引擎未生成任何单位')
         who = '己方' if as_mine else '原阵营'
-        return True, '已复制 %d 个单位到鼠标位置（归属%s）：%s' % (ok_n, who, '、'.join(detail))
+        extra = ('（%d 个被引擎拒绝/失败）' % fail_n) if fail_n else ''
+        if copies > 1:
+            return True, '已为 %d 个模板各复制约 %d 份到鼠标附近（归属%s，共成功 %d 个）%s' % (
+                len(ents), copies, who, ok_n, extra)
+        return True, '已复制 %d 个单位到鼠标附近（归属%s）%s：%s' % (
+            ok_n, who, extra, '、'.join(detail))
+
+    def convert_selected(self):
+        """收编：把选中单位的实体+0x418 改为本地归属（同 MustCode MC2+0x800 写 [IDB]）。"""
+        ents = self.selected_entities()
+        if not ents:
+            return False, '没读到选中单位（请先选中）'
+        owner = self._local_owner_for_unit_ops()
+        if not self.is_ptr(owner):
+            return False, ('读不到本地玩家归属（正常对战需有己方势力；'
+                           '观战需已附加且 PlayerID 曾写入缓存）')
+        owner_vt = self.read_u32(owner)
+        if not self.is_ptr(owner_vt):
+            return False, '本地归属指针无效'
+        n = 0
+        skip = 0
+        for ent in ents:
+            cur = self._entity_owner(ent)
+            if self.is_ptr(cur) and cur == owner:
+                skip += 1
+                continue
+            if self.write(ent + 0x418, struct.pack('<I', owner)):
+                n += 1
+        if n == 0:
+            if skip:
+                return False, '选中单位已是己方归属，无需收编'
+            return False, '未能写入任何单位的归属'
+        extra = ('，%d 个已是己方跳过' % skip) if skip else ''
+        return True, '已收编 %d 个单位到本地玩家%s' % (n, extra)
+
+    def _pulse_ammo_hook_for_selected(self):
+        """短暂打开弹药 hook，让选中单位走一遍装填逻辑（需已安装 UnitAmmo）。"""
+        if not self.flags_base:
+            return False
+        if 'UnitAmmo' not in self._installed_names():
+            return False
+        prev = self.get_flag_byte(0x12)
+        self.set_flag_byte(0x12, 1)
+        time.sleep(0.3)
+        if not prev:
+            self.set_flag_byte(0x12, 0)
+        return True
+
+    def full_buff_selected(self, xp=200000, max_calls=8):
+        """选中单位：满血 → 尽量拉满弹药 → 尽量满星。"""
+        ents = self.selected_entities()
+        if not ents:
+            return False, '没读到选中单位（请先选中）'
+        hp_n = sum(1 for ent in ents if self._write_entity_hp(ent, 'max'))
+        ammo_ok = self._pulse_ammo_hook_for_selected()
+        rank_ok, rank_msg = self.rank_up_via_engine(xp=xp, max_calls=max_calls)
+        parts = []
+        if hp_n:
+            parts.append('满血 %d 个' % hp_n)
+        else:
+            parts.append('满血：无可用血量组件')
+        if ammo_ok:
+            parts.append('已触发弹药装填（需已开 hook）')
+        else:
+            parts.append('弹药：请手动开「弹药无限」或确保 UnitAmmo hook 已装')
+        if rank_ok:
+            parts.append('满星：' + rank_msg.split('：', 1)[-1])
+        else:
+            parts.append('满星：' + rank_msg)
+        ok = hp_n > 0 or rank_ok
+        return ok, '；'.join(parts)
+
+    def chaos_selected(self):
+        """混乱模式：对每个选中单位随机改速度档位和/或血量。"""
+        ents = self.selected_entities()
+        if not ents:
+            return False, '没读到选中单位（请先选中）'
+        speed_modes = ('max', 'slow', 'freeze', 'restore')
+        hp_modes = ('max', 'min', 'normal')
+        speed_names = {'max': '超速', 'slow': '慢速', 'freeze': '冻结',
+                       'restore': '恢复速'}
+        hp_names = {'max': '满血', 'min': '残血', 'normal': '正常血'}
+        n = 0
+        detail = []
+        for ent in ents:
+            did = False
+            parts = []
+            # 约 70% 改速度、70% 改血量，至少一个生效
+            do_speed = random.random() < 0.7
+            do_hp = random.random() < 0.7
+            if not do_speed and not do_hp:
+                do_speed = True
+            if do_speed:
+                sm = random.choice(speed_modes)
+                nodes = self._speed_nodes(ent)
+                if nodes:
+                    ok = True
+                    for node in nodes:
+                        if sm == 'restore':
+                            ok = self._restore_speed_node(node) and ok
+                        else:
+                            targets = {'max': 500.0, 'slow': 10.0, 'freeze': 0.0}
+                            ok = self._set_speed_node(node, targets[sm]) and ok
+                    if ok:
+                        parts.append(speed_names[sm])
+                        did = True
+            if do_hp:
+                hm = random.choice(hp_modes)
+                if self._write_entity_hp(ent, hm):
+                    parts.append(hp_names[hm])
+                    did = True
+            if did:
+                n += 1
+                detail.append('0x%08X(%s)' % (ent, '+'.join(parts)))
+        if n == 0:
+            return False, '选中对象没有可写的速度/血量组件'
+        shown = '、'.join(detail[:6])
+        extra = ('…共 %d 个' % n) if n > 6 else ''
+        return True, '混乱已施加到 %d 个单位：%s%s' % (n, shown, extra)
+
+    def ore_convoy(self, as_mine=True, copies=8):
+        """刷矿车车队：无固定矿车类型 ID，改为对当前选中单位批量复制。
+
+        用法：先选中矿车（或任意要刷的单位），鼠标移到落点，再点本功能。
+        """
+        copies = max(1, int(copies))
+        ok, msg = self.clone_selected(as_mine=as_mine, copies=copies)
+        if not ok:
+            return ok, ('【车队】' + msg + '（请先选中矿车或其它单位）')
+        return True, '【车队·选中模板×%d】%s' % (copies, msg)
+
+    def toggle_fog(self):
+        """迷雾开关：翻转全地图 flag(0x11)。开=透视（关迷雾），关=恢复迷雾。"""
+        if not self.flags_base:
+            return False, '尚未注入（请先附加游戏）', None
+        if 'Map' not in self._installed_names():
+            return False, '未安装 Map hook（观战模式未装全地图，请用正常模式）', None
+        cur = self.get_flag_byte(0x11)
+        new = 0 if cur else 1
+        if not self.set_flag_byte(0x11, new):
+            return False, '写入迷雾 flag 失败', None
+        if new:
+            return True, '已关闭战争迷雾（全地图开启）', True
+        return True, '已恢复战争迷雾（全地图关闭）', False
+
+    def pulse_protocol_ready(self, hold_sec=1.0):
+        """协议/超武就绪：短暂打开 SuperPower flag(0x0D)，让己方冷却节点走就绪路径。
+
+        不长期占用「超级武器」开关；若该开关本来就是开的，结束后保持开启。
+        """
+        if not self.flags_base:
+            return False, '尚未注入（请先附加游戏）'
+        if 'SuperPower' not in self._installed_names():
+            return False, '未安装 SuperPower hook（请先附加游戏）'
+        prev = self.get_flag_byte(0x0D)
+        self.set_flag_byte(0x0D, 1)
+        time.sleep(max(0.2, float(hold_sec)))
+        if not prev:
+            self.set_flag_byte(0x0D, 0)
+        return True, '已脉冲协议/超武就绪约 %.1f 秒（己方冷却节点）' % hold_sec
+
+    def pulse_unit_skill_ready(self, hold_sec=1.2):
+        """单位技能无冷却：与协议就绪共用 SuperPower hook（己方冷却节点就绪路径）。
+
+        Steam 版无单独的「单位技能」hook；SuperPower 对己方归属的冷却槽生效，
+        单位特殊技能与顶部协议走同一类节点。不长期占用「超级武器」开关。
+        """
+        ok, msg = self.pulse_protocol_ready(hold_sec=hold_sec)
+        if not ok:
+            return ok, msg
+        return True, ('已脉冲单位技能/协议就绪约 %.1f 秒'
+                      '（与「协议无冷却」同 hook，己方冷却节点）' % hold_sec)
+
+    def pulse_disable_protocol(self, hold_sec=2.0):
+        """禁用敌方协议：短暂打开 DisableAllSP flag(0x0E)。
+
+        无独立的「仅协议」偏移；效果近似「禁用超武」脉冲——拖敌方超武/协议冷却。
+        不长期占用「禁用超武」开关。
+        """
+        if not self.flags_base:
+            return False, '尚未注入（请先附加游戏）'
+        if 'DisableAllSP' not in self._installed_names():
+            return False, '未安装 DisableAllSP hook（请先附加游戏；观战模式可用）'
+        prev = self.get_flag_byte(0x0E)
+        self.set_flag_byte(0x0E, 1)
+        time.sleep(max(0.2, float(hold_sec)))
+        if not prev:
+            self.set_flag_byte(0x0E, 0)
+        return True, ('已脉冲禁用敌方超武/协议约 %.1f 秒'
+                      '（近似「禁用超武」，非独立协议接口）' % hold_sec)
+
+    def spawn_as_mine(self, copies=1):
+        """按选中模板在鼠标处生成，归属强制为本地玩家（「复制到己方」）。
+
+        与「复制选中」的差别：观战模式下复制选中跟原阵营，本功能始终尝试己方归属。
+        无兵种面板 / 类型 ID 表，只能从当前选中单位取模板。
+        """
+        ok, msg = self.clone_selected(as_mine=True, copies=max(1, int(copies)))
+        if not ok:
+            return ok, '【复制到己方】' + msg
+        return True, '【复制到己方】' + msg
+
+    def apply_damage_mult(self, mult=5.0):
+        """选中单位伤害/属性近似倍率：写星级加成对象 sub+0x08。
+
+        已知偏移（README §6.2）：实体+0x3CC → tracker → +0x2C=sub，sub+0x08=当前加成倍率。
+        无独立「武器伤害」字段；升星或引擎重算加成时可能被覆盖。
+        """
+        ents = self.selected_entities()
+        if not ents:
+            return False, '没读到选中单位（请先选中）'
+        target = float(mult)
+        if target <= 0:
+            return False, '倍率必须 > 0'
+        n = 0
+        detail = []
+        for ent in ents:
+            tracker = self.read_u32(ent + 0x3CC)
+            if not self.is_ptr(tracker):
+                detail.append('0x%08X 无星级组件' % ent)
+                continue
+            sub = self.read_u32(tracker + 0x2C)
+            if not self.is_ptr(sub):
+                detail.append('0x%08X 无加成对象' % ent)
+                continue
+            if self.write_f32(sub + 0x08, target):
+                n += 1
+                detail.append('0x%08X×%.1f' % (ent, target))
+            else:
+                detail.append('0x%08X 写入失败' % ent)
+        if n == 0:
+            return False, '未能写入伤害倍率：' + ('；'.join(detail) if detail else '无可用组件')
+        shown = '、'.join(detail[:6])
+        extra = ('…共 %d 个' % n) if n > 6 else ''
+        return True, ('已将 %d 个单位星级加成倍率设为 ×%.1f（近似伤害/属性；'
+                      '升星后可能被重算覆盖）：%s%s' % (n, target, shown, extra))
 
     def read_level(self, tracker):
         """读跟踪器的 +0x24（当前等级序号）。"""
@@ -1098,7 +1468,7 @@ FEATURES = [
     ('oremine',  '恢复矿场',        'pulse',  dict(flag=0x14)),
     # 超武 / 建造 / 地图
     ('superpower',   '超级武器',       'toggle', dict(flag=0x0D)),
-    ('disableallsp', '禁用敌方超武',   'toggle', dict(flag=0x0E)),
+    ('disableallsp', '禁用超武',       'toggle', dict(flag=0x0E)),
     ('map',          '全地图',         'toggle', dict(flag=0x11)),
     ('nocbuild',     '敌人无法建造',   'toggle', dict(flag=0x15)),
     # 弹药 / 危险等级
@@ -1114,6 +1484,22 @@ FEATURES = [
     ('hp_normal',    '恢复血量',    'engine', dict(action='hp', mode='normal')),
     ('unit_kill',    '摧毁选中',   'engine', dict(action='kill')),
     ('unit_clone',   '复制选中',   'engine', dict(action='clone')),
+    ('clone_multi',  '批量复制',   'engine', dict(action='clone_multi', copies=5)),
+    ('convert_unit', '收编敌方',   'engine', dict(action='convert')),
+    ('full_buff',    '一键满状态', 'engine', dict(action='full_buff')),
+    ('enemy_weaken', '敌方残血',   'engine', dict(action='hp_relation', mode='min', relation='enemy')),
+    ('ally_god',     '友军无敌',   'engine', dict(action='hp_relation', mode='max', relation='ally')),
+    ('chaos_mode',   '混乱模式',   'engine', dict(action='chaos')),
+    ('ore_convoy',   '刷矿车车队', 'engine', dict(action='ore_convoy', copies=8)),
+    ('fog_toggle',   '迷雾开关',   'engine', dict(action='fog_toggle')),
+    ('protocol_ready', '协议无冷却', 'engine', dict(action='protocol_ready', hold_sec=1.0)),
+    ('unit_skill_ready', '单位技能无冷却', 'engine',
+     dict(action='unit_skill_ready', hold_sec=1.2)),
+    ('disable_protocol', '禁用敌方协议', 'engine',
+     dict(action='disable_protocol', hold_sec=2.0)),
+    ('spawn_unit',   '复制到己方', 'engine', dict(action='spawn_as_mine')),
+    ('damage_mult',  '伤害×5',     'engine', dict(action='damage_mult', mult=5.0)),
+    ('spec_gift',    '观战赠送单位', 'engine', dict(action='spec_gift')),
     # 星级（满级 3 星）：
     #   实体+0x3CC 是 ExperienceTrackerObject（经验追踪器），它的 +0x24 只是
     #   「当前等级」的缓存 —— 纯粹写内存改它，游戏里一点变化都没有（实测）。
@@ -1126,6 +1512,12 @@ FEATURES = [
     #   注意：这个调用必须跑在游戏进程的**独立线程**里（修改器侧 CreateRemoteThread），
     #   在 hook 里同步调会因为抢同一把全局锁而自死锁（上一版的卡死原因）。
     ('unit_rank',    '满级(3星)',   'engine', dict(xp=200000, max_calls=8)),
+]
+
+# 规划中的功能：仅 GUI 占位（灰色不可点），逻辑未实现。
+# 类型固定为 planned；实现时改类型并挪进 FEATURES，同时接上 handler。
+# 无已知偏移 / 无可行近似路径的项已移除（勿再加半残按钮）。
+PLANNED_FEATURES = [
 ]
 
 # 热键: (功能键, 修饰键VK列表, 主键VK)
@@ -1155,7 +1547,7 @@ HOTKEYS = {
     'hp_normal':    ([], 0xDC),   # \
     'unit_rank':    ([], 0x50),   # p
     'unit_kill':    ([], 0x2E),   # Delete
-    'unit_clone':   ([], 0x2D),   # Insert
+    'unit_clone':   ([], 0x49),   # I
 }
 
 CTRL_VK = 0x11
@@ -1211,20 +1603,61 @@ FEATURE_HINTS = {
                      'EVA 语音都会自己出来；一次调用可能跨多级，'
                      '这里会自动反复调用直到封顶',
     'unit_kill':     '调用官方摧毁接口拆掉选中单位（观战/正常都可用）',
-    'unit_clone':    '复制选中单位到鼠标地图落点：正常模式归属自己，观战模式归属原阵营',
+    'unit_clone':    '复制选中单位到鼠标附近（自动错开落点）：正常模式归属自己，观战模式归属原阵营',
+    'clone_multi':   '每个选中模板在鼠标附近螺旋错开各复制 5 份（串行执行，与「复制选中」相同归属规则）',
+    'convert_unit':  '把选中单位的归属改为本地玩家（写实体+0x418，同原版收编逻辑）',
+    'full_buff':     '选中单位满血 + 短暂触发弹药 hook 装填 + 官方接口尽量满星',
+    'enemy_weaken':  '当前选中里归属非己方的单位血量设为 1（无地图全体遍历）',
+    'ally_god':      '当前选中里归属己方的单位血量拉满（无地图全体遍历）',
+    'disableallsp':  '禁用敌方超级武器；己方单位技能/协议不受影响',
+    'chaos_mode':    '对每个选中单位随机改速度档位（超速/慢速/冻结/恢复）和/或血量',
+    'ore_convoy':    '选中矿车（或任意单位）后，在鼠标落点各复制 8 份（无矿车类型 ID，批量复制变体）',
+    'fog_toggle':    '翻转「全地图」flag：开=关闭战争迷雾，再点一次恢复迷雾',
+    'protocol_ready': '短暂打开己方超武/协议就绪 hook 约 1 秒（不长期占用「超级武器」开关）',
+    'unit_skill_ready': '短暂打开己方冷却就绪 hook 约 1.2 秒（与「协议无冷却」同路径；'
+                        '无独立单位技能 hook）',
+    'disable_protocol': '短暂打开「禁用超武」flag 约 2 秒（近似禁用敌方协议/超武；'
+                        '无独立协议接口，不长期占用开关）',
+    'spawn_unit':    '按选中模板在鼠标处生成，归属强制本地玩家（观战下「复制选中」跟原阵营，'
+                     '本键始终尝试己方；无兵种面板）',
+    'damage_mult':   '把选中单位星级加成倍率(sub+0x08)写成 ×5（近似伤害/属性；'
+                     '升星后可能被引擎重算覆盖）',
+    'spec_gift':     '按选中单位模板在鼠标处生成，归属始终为原阵营（观战刷兵 / 给电脑送礼）',
 }
 
-FEATURE_BY_KEY = {f[0]: f for f in FEATURES}
+FEATURE_BY_KEY = {f[0]: f for f in FEATURES + PLANNED_FEATURES}
 
 # 功能分组（用于 GUI 分区展示，顺序即显示顺序）
+# 已实现与规划中可混排；planned 类型按钮自动变灰不可点。
 FEATURE_GROUPS = [
-    ('资源', ['money', 'power', 'scpoint', 'haveallsc', 'fastbuild', 'oremine']),
-    ('超武 / 建造 / 地图', ['superpower', 'disableallsp', 'map', 'nocbuild']),
-    ('弹药 / 危险等级', ['ammo', 'danger']),
-    ('单位操作（需先选中单位）', ['speed_max', 'speed_slow', 'speed_freeze', 'speed_restore',
-                          'hp_max', 'hp_min', 'hp_normal', 'unit_rank', 'unit_kill',
-                          'unit_clone']),
+    ('资源', [
+        'money', 'power', 'scpoint', 'haveallsc', 'fastbuild', 'oremine',
+    ]),
+    ('超武 / 地图', [
+        'superpower', 'disableallsp', 'map', 'nocbuild',
+        'protocol_ready', 'unit_skill_ready', 'disable_protocol',
+    ]),
+    ('弹药 / 危险', ['ammo', 'danger']),
+    ('单位操作', [
+        'speed_max', 'speed_slow', 'speed_freeze', 'speed_restore',
+        'hp_max', 'hp_min', 'hp_normal', 'unit_rank', 'unit_kill', 'unit_clone',
+        'convert_unit', 'spawn_unit', 'clone_multi',
+        'damage_mult', 'full_buff',
+    ]),
+    ('战场', [
+        'enemy_weaken', 'ally_god',
+    ]),
+    ('情报', ['fog_toggle']),
+    ('观战', ['spec_gift']),
+    ('趣味', ['chaos_mode', 'ore_convoy']),
 ]
+
+# 侧栏选中后，右侧标题下的补充说明（可选）
+GROUP_SUBTITLES = {
+    '单位操作': '需先在游戏里选中单位',
+    '观战': '建议使用观战模式附加',
+    '趣味': '娱乐向，优先级较低',
+}
 
 # F1-F12 需要 Ctrl；其它单键不需修饰
 CTRL_REQUIRED = {'money', 'power', 'scpoint', 'haveallsc', 'fastbuild',
@@ -1242,10 +1675,12 @@ class ToolTip:
     - 不抢焦点、不进入任务栏
     """
 
-    def __init__(self, widget, text, delay_ms=320):
+    def __init__(self, widget, text, delay_ms=320, bg='#1f2937', fg='#f8fafc'):
         self.widget = widget
         self.text = text
         self.delay_ms = delay_ms
+        self.bg = bg
+        self.fg = fg
         self._after = None
         self._tip = None
         widget.bind('<Enter>', self._on_enter, add='+')
@@ -1283,11 +1718,13 @@ class ToolTip:
                 tip.attributes('-topmost', True)
             except Exception:
                 pass
-            tk.Label(tip, text=self.text, justify='left', anchor='w',
-                     bg='#111116', fg='#e9e9ec', bd=0, padx=9, pady=6,
+            frame = tk.Frame(tip, bg=self.bg, highlightthickness=1,
+                             highlightbackground='#94a3b8')
+            frame.pack()
+            tk.Label(frame, text=self.text, justify='left', anchor='w',
+                     bg=self.bg, fg=self.fg, bd=0, padx=10, pady=7,
                      font=('Microsoft YaHei UI', 8)).pack()
             tip.update_idletasks()
-
             w, h = tip.winfo_width(), tip.winfo_height()
             sw, sh = tip.winfo_screenwidth(), tip.winfo_screenheight()
             wx = self.widget.winfo_rootx()
@@ -1317,10 +1754,16 @@ class ToolTip:
             self._tip = None
 
 
-def add_tooltip(widget, lines):
+def add_tooltip(widget, lines, colors=None):
     """把若干行文本组装成悬停提示；全为空时不创建。"""
     text = '\n'.join(x for x in lines if x)
-    return ToolTip(widget, text) if text else None
+    if not text:
+        return None
+    kw = {}
+    if colors:
+        kw['bg'] = colors.get('tip_bg', '#1f2937')
+        kw['fg'] = colors.get('tip_fg', '#f8fafc')
+    return ToolTip(widget, text, **kw)
 
 
 # ============================================================
@@ -1339,24 +1782,31 @@ class TrainerApp:
         self.btn_widgets = {}    # 功能键 -> 按钮
         self.var_widgets = {}    # （保留兼容，toggle 已改用按钮式）
         self.ui_queue = queue.Queue()  # 热键线程 -> 主线程 UI 更新队列
+        self._engine_busy = False     # 单位操作串行，防连按并发崩游戏
 
         root.title('红警3 Steam 修改器')
-        root.resizable(False, False)
-        root.configure(bg='#1b1b20')
+        root.configure(bg='#e8ecf2')
 
-        # 配色方案（红警深色主题）
+        # 配色方案（默认浅色 · 红警红点缀）
         self.colors = {
-            'bg': '#1b1b20',          # 窗口背景
-            'panel': '#232329',       # 面板背景
-            'card': '#2b2b33',        # 卡片背景
-            'card_hover': '#34343f',  # 卡片悬停
-            'fg': '#e9e9ec',          # 主文字
-            'dim': '#8f8f9a',         # 次级文字
-            'primary': '#e04a3f',     # 红警红
-            'primary_dark': '#b7332a',
-            'green': '#3fae5a',       # 开启/成功
-            'orange': '#e8a23d',      # 警告/脱离
-            'border': '#34343e',
+            'bg': '#e8ecf2',            # 窗口底（冷灰蓝，非奶油白）
+            'panel': '#ffffff',         # 面板
+            'card': '#f7f9fc',          # 功能格
+            'card_hover': '#eef2f8',    # 悬停
+            'fg': '#1e293b',            # 主文字
+            'dim': '#64748b',           # 次级文字
+            'muted': '#94a3b8',         # 规划中文字
+            'planned_bg': '#eef1f6',    # 规划中底
+            'primary': '#c62828',       # 红警红
+            'primary_dark': '#9b1c1c',
+            'primary_soft': '#fdecea',  # 浅红底（导航未选悬停等）
+            'green': '#2e7d32',         # 开启 / 成功
+            'orange': '#e65100',        # 警告 / 脱离
+            'border': '#d0d7e2',
+            'nav_idle': '#ffffff',
+            'tip_bg': '#1e293b',
+            'tip_fg': '#f8fafc',
+            'on_fg': '#ffffff',
         }
         self.c = self.colors
 
@@ -1364,14 +1814,13 @@ class TrainerApp:
         self.play_mode = tk.StringVar(value='normal')
         self._build_ui()
 
-        # 固定窗口尺寸：以构建完成后的自然尺寸为准，锁定宽高，
-        # 避免状态文字/按钮文本变化导致窗口大小跳动。
+        # 默认固定一屏：左侧导航 + 右侧当前分组，无需整页滚动。
         root.update_idletasks()
-        self._win_w = max(root.winfo_reqwidth(), 560)
-        self._win_h = root.winfo_reqheight()
+        self._win_w = 740
+        self._win_h = 540
         root.geometry('%dx%d' % (self._win_w, self._win_h))
-        root.minsize(self._win_w, self._win_h)
-        root.maxsize(self._win_w, self._win_h)
+        root.minsize(680, 480)
+        root.resizable(True, True)
 
         # 热键轮询线程
         self.running = True
@@ -1391,49 +1840,74 @@ class TrainerApp:
             extra,
         ]
 
+    def _tip(self, widget, lines):
+        return add_tooltip(widget, lines, colors=self.c)
+
+    def _panel(self, parent, **pack_kw):
+        """带细边框的白色面板。"""
+        tk = self.tk
+        c = self.c
+        fr = tk.Frame(parent, bg=c['panel'],
+                      highlightthickness=1, highlightbackground=c['border'],
+                      highlightcolor=c['border'])
+        if pack_kw:
+            fr.pack(**pack_kw)
+        return fr
+
     def _build_ui(self):
         tk = self.tk
         root = self.root
         c = self.c
         font = ('Microsoft YaHei UI', 9)
-        font_title = ('Microsoft YaHei UI', 15, 'bold')
+        font_title = ('Microsoft YaHei UI', 16, 'bold')
         font_sub = ('Microsoft YaHei UI', 8)
-        font_group = ('Microsoft YaHei UI', 9, 'bold')
+        font_group = ('Microsoft YaHei UI', 11, 'bold')
         font_small = ('Microsoft YaHei UI', 8)
+        font_badge = ('Microsoft YaHei UI', 7)
+        font_nav = ('Microsoft YaHei UI', 9)
 
         # ===== 顶部标题 =====
         header = tk.Frame(root, bg=c['bg'])
-        header.pack(fill='x', padx=16, pady=(14, 8))
-        tk.Label(header, text='红警3 Steam 修改器', font=font_title,
-                 bg=c['bg'], fg=c['primary']).pack(anchor='w')
+        header.pack(fill='x', padx=16, pady=(14, 4))
+        title_row = tk.Frame(header, bg=c['bg'])
+        title_row.pack(anchor='w', fill='x')
+        tk.Label(title_row, text='红警3 Steam 修改器', font=font_title,
+                 bg=c['bg'], fg=c['primary']).pack(side='left')
+        badge = tk.Label(title_row, text='[预] 规划中', font=font_badge,
+                         bg=c['primary_soft'], fg=c['primary'], padx=6, pady=1)
+        badge.pack(side='left', padx=(10, 0), pady=(4, 0))
         tk.Label(header, text='Command & Conquer: Red Alert 3 · 1.12 核心版',
-                 font=font_sub, bg=c['bg'], fg=c['dim']).pack(anchor='w')
+                 font=font_sub, bg=c['bg'], fg=c['dim']).pack(anchor='w', pady=(2, 0))
+        # 红色装饰线
+        tk.Frame(root, bg=c['primary'], height=3).pack(fill='x', padx=16, pady=(8, 8))
 
         # ===== 连接栏 =====
-        conn = tk.Frame(root, bg=c['panel'], padx=10, pady=10)
-        conn.pack(fill='x', padx=12)
-        self.attach_btn = tk.Button(conn, text='⚡ 附加游戏', font=font, width=12,
-                                    bg=c['primary'], fg='#ffffff', activebackground=c['primary_dark'],
-                                    activeforeground='#ffffff', relief='flat', bd=0, cursor='hand2',
-                                    highlightthickness=0, padx=8, pady=5,
-                                    disabledforeground='#d8b9b7', command=self.do_attach)
+        conn = self._panel(root, fill='x', padx=12)
+        conn.configure(padx=12, pady=10)
+        self.attach_btn = tk.Button(
+            conn, text='附加游戏', font=font, width=11,
+            bg=c['primary'], fg=c['on_fg'], activebackground=c['primary_dark'],
+            activeforeground=c['on_fg'], relief='flat', bd=0, cursor='hand2',
+            highlightthickness=0, padx=10, pady=6,
+            disabledforeground='#f5c2c0', command=self.do_attach)
         self.attach_btn.pack(side='left')
-        add_tooltip(self.attach_btn, ['附加到游戏进程',
-                                      '目标进程：ra3_1.12.game',
-                                      '需要管理员权限运行',
-                                      '附加前请先选好「正常模式」或「观战模式」'])
-        self.detach_btn = tk.Button(conn, text='脱离', font=font, width=7,
-                                    bg=c['card'], fg=c['fg'], activebackground=c['card_hover'],
-                                    activeforeground=c['fg'], relief='flat', bd=0, cursor='hand2',
-                                    highlightthickness=0, padx=8, pady=5, state='disabled',
-                                    disabledforeground=c['dim'], command=self.do_detach)
+        self._tip(self.attach_btn, ['附加到游戏进程',
+                                    '目标进程：ra3_1.12.game',
+                                    '需要管理员权限运行',
+                                    '附加前请先选好「正常模式」或「观战模式」'])
+        self.detach_btn = tk.Button(
+            conn, text='脱离', font=font, width=7,
+            bg=c['card'], fg=c['fg'], activebackground=c['card_hover'],
+            activeforeground=c['fg'], relief='flat', bd=0, cursor='hand2',
+            highlightthickness=1, highlightbackground=c['border'],
+            padx=8, pady=5, state='disabled',
+            disabledforeground=c['muted'], command=self.do_detach)
         self.detach_btn.pack(side='left', padx=(8, 0))
-        add_tooltip(self.detach_btn, ['脱离游戏并还原全部 17 个 hook',
-                                      '退出修改器前建议先点这里'])
+        self._tip(self.detach_btn, ['脱离游戏并还原全部 17 个 hook',
+                                    '退出修改器前建议先点这里'])
 
-        # 模式切换：两个互斥按钮，风格与功能开关一致
         mode_wrap = tk.Frame(conn, bg=c['panel'])
-        mode_wrap.pack(side='left', padx=(14, 0))
+        mode_wrap.pack(side='left', padx=(16, 0))
         tk.Label(mode_wrap, text='模式', font=font_small, bg=c['panel'], fg=c['dim']
                  ).pack(side='left', padx=(0, 6))
         self.mode_btns = {}
@@ -1441,7 +1915,7 @@ class TrainerApp:
             btn = tk.Button(
                 mode_wrap, text=label, font=font_small, width=8,
                 relief='flat', bd=0, cursor='hand2', highlightthickness=0,
-                padx=6, pady=3,
+                padx=8, pady=4,
                 command=lambda k=key: self._set_play_mode(k))
             btn.pack(side='left', padx=2)
             self.mode_btns[key] = btn
@@ -1450,86 +1924,176 @@ class TrainerApp:
                            '适合自己操控的遭遇战 / 战役',
                            '观战进对局会闪退，请改用观战模式',
                            '复制单位归属自己'],
-                'spectate': ['观战模式：只分配内存，不打 hook 补丁',
+                'spectate': ['观战模式：只装超武禁用等安全 hook',
                              '适合电脑互打时旁观',
-                             '金钱/电力等资源功能不可用；',
+                             '不装金钱/电力等资源 hook（防闪退）',
                              '速度/血量/满级/摧毁/复制仍可用',
+                             '「禁用超武」= 关掉全场所有阵营超武',
                              '（复制出的单位归属原阵营）'],
             }[key]
-            add_tooltip(btn, tip)
+            self._tip(btn, tip)
         self._refresh_mode_btns()
 
         self.status_dot = tk.Label(conn, text='●', font=('Microsoft YaHei UI', 10),
                                    bg=c['panel'], fg=c['dim'])
-        self.status_dot.pack(side='left', padx=(14, 4))
+        self.status_dot.pack(side='left', padx=(16, 4))
         self.status_lbl = tk.Label(conn, textvariable=self.status_var, anchor='w',
                                    font=font_small, bg=c['panel'], fg=c['dim'])
         self.status_lbl.pack(side='left', fill='x', expand=True)
 
-        # ===== 功能分组 =====
-        body = tk.Frame(root, bg=c['bg'])
-        body.pack(fill='both', expand=True, padx=12, pady=(10, 4))
+        # ===== 主体：左侧导航 + 右侧分页 =====
+        main = tk.Frame(root, bg=c['bg'])
+        main.pack(fill='both', expand=True, padx=12, pady=(10, 4))
+
+        nav = self._panel(main)
+        nav.configure(width=122, padx=6, pady=8)
+        nav.pack(side='left', fill='y')
+        nav.pack_propagate(False)
+        tk.Label(nav, text='分类', font=font_badge, bg=c['panel'], fg=c['muted']
+                 ).pack(anchor='w', padx=8, pady=(2, 8))
+
+        content_shell = self._panel(main)
+        content_shell.configure(padx=14, pady=12)
+        content_shell.pack(side='left', fill='both', expand=True, padx=(8, 0))
+
+        self._page_title = tk.Label(content_shell, text='', font=font_group,
+                                    bg=c['panel'], fg=c['fg'])
+        self._page_title.pack(anchor='w')
+        self._page_sub = tk.Label(content_shell, text='', font=font_badge,
+                                  bg=c['panel'], fg=c['dim'])
+        self._page_sub.pack(anchor='w', pady=(2, 10))
+
+        pages_host = tk.Frame(content_shell, bg=c['panel'])
+        pages_host.pack(fill='both', expand=True)
+
+        self._nav_btns = {}
+        self._pages = {}
+        self._group_meta = {}
+        self._current_group = 0
 
         for gi, (gname, keys) in enumerate(FEATURE_GROUPS):
-            gf = tk.Frame(body, bg=c['panel'], padx=8, pady=8)
-            gf.pack(fill='x', pady=(0, 8))
-            tk.Label(gf, text=gname, font=font_group, bg=c['panel'], fg=c['primary']
-                     ).pack(anchor='w', padx=4, pady=(0, 6))
-            grid = tk.Frame(gf, bg=c['panel'])
-            grid.pack(fill='x')
-            cols = 3
-            for i, key in enumerate(keys):
-                _, name, ftype, _params = FEATURE_BY_KEY[key]
-                cell = tk.Frame(grid, bg=c['card'], padx=6, pady=4)
-                cell.grid(row=i // cols, column=i % cols, sticky='nsew', padx=3, pady=3)
-                if ftype == 'toggle':
-                    self.state[key] = False
-                    btn = tk.Button(cell, text='○ ' + name, font=font, width=13,
-                                    bg=c['card'], fg=c['fg'], activebackground=c['card_hover'],
-                                    activeforeground=c['fg'], relief='flat', bd=0, cursor='hand2',
-                                    highlightthickness=0, padx=4, pady=3,
-                                    command=lambda k=key: self.toggle_feature(k, not self.state.get(k, False)))
-                    btn.pack(padx=2, pady=2)
-                    self.btn_widgets[key] = btn
-                    add_tooltip(btn, self._feature_tip(key))
-                elif ftype == 'danger':
-                    tk.Label(cell, text=name, font=font, bg=c['card'], fg=c['fg']
-                             ).pack(anchor='w', padx=4, pady=(2, 0))
-                    sub = tk.Frame(cell, bg=c['card'])
-                    sub.pack(pady=2)
-                    self.danger_btns = {}
-                    self.state['danger'] = 0
-                    for val, txt in [(1, '最高'), (2, '最低'), (0, '正常')]:
-                        btn = tk.Button(sub, text=txt, font=font_small, width=4,
-                                        bg=c['card'], fg=c['dim'], activebackground=c['card_hover'],
-                                        activeforeground=c['fg'], relief='flat', bd=0, cursor='hand2',
-                                        highlightthickness=0, pady=2,
-                                        command=lambda v=val: self.set_danger(v))
-                        btn.pack(side='left', padx=2)
-                        self.danger_btns[val] = btn
-                        dkey = {1: 'danger_max', 2: 'danger_min', 0: 'danger_norm'}[val]
-                        add_tooltip(btn, self._feature_tip(dkey, '危险等级 → ' + txt))
-                else:  # pulse / cmd / engine
-                    cmd = (lambda k=key: self.do_pulse(k)) if ftype == 'pulse' \
-                        else (lambda k=key: self.do_engine(k)) if ftype == 'engine' \
-                        else (lambda k=key: self.do_command(k))
-                    btn = tk.Button(cell, text=name, font=font, width=13,
-                                    bg=c['card'], fg=c['fg'], activebackground=c['card_hover'],
-                                    activeforeground=c['fg'], relief='flat', bd=0, cursor='hand2',
-                                    highlightthickness=0, padx=4, pady=3, command=cmd)
-                    btn.pack(padx=2, pady=2)
-                    self.btn_widgets[key] = btn
-                    add_tooltip(btn, self._feature_tip(key))
-            for col in range(cols):
-                grid.columnconfigure(col, weight=1, uniform='cell')
+            planned_n = sum(1 for k in keys if FEATURE_BY_KEY[k][2] == 'planned')
+            live_n = len(keys) - planned_n
+            if planned_n and live_n:
+                badge_txt = '已实现 %d · 规划 %d' % (live_n, planned_n)
+            elif planned_n:
+                badge_txt = '全部规划中'
+            else:
+                badge_txt = '已实现 · %d 项' % live_n
+            sub = GROUP_SUBTITLES.get(gname, '')
+            meta_line = badge_txt if not sub else ('%s  ·  %s' % (badge_txt, sub))
+            self._group_meta[gi] = (gname, meta_line)
 
-        # ===== 底部热键提示 =====
-        foot = tk.Label(root, font=font_small, bg=c['bg'], fg=c['dim'], justify='left',
-                        text='热键  Ctrl+F1 金钱  F2 电力  F3 科技点  F4 全科技  F5 快速建造\n'
-                             'Ctrl+F6 超级武器  F7 禁用超武  F9 全图  F10 敌不可建\n'
-                             '; 弹药  , 危险高  . 危险低  / 危险正常  \' 恢复矿场')
-        foot.pack(fill='x', padx=16, pady=(2, 10))
+            nav_btn = tk.Button(
+                nav, text=gname, font=font_nav, anchor='w',
+                relief='flat', bd=0, cursor='hand2', highlightthickness=0,
+                padx=12, pady=8,
+                command=lambda i=gi: self._show_group(i))
+            nav_btn.pack(fill='x', pady=2)
+            self._nav_btns[gi] = nav_btn
 
+            page = tk.Frame(pages_host, bg=c['panel'])
+            self._pages[gi] = page
+            self._fill_feature_grid(page, keys, font, font_small)
+
+        self._show_group(0)
+
+        foot = tk.Label(
+            root, font=font_small, bg=c['bg'], fg=c['muted'], justify='left',
+            text='热键  Ctrl+F1~F7 / F9~F10 资源与超武    ; , . / \' 弹药·危险·矿场    '
+                 '- = PgUp/Dn [ ] \\ p I Del 单位操作')
+        foot.pack(fill='x', padx=16, pady=(4, 10))
+
+    def _fill_feature_grid(self, parent, keys, font, font_small):
+        """在右侧页面里按 3 列铺功能按钮。"""
+        tk = self.tk
+        c = self.c
+        grid = tk.Frame(parent, bg=c['panel'])
+        grid.pack(fill='both', expand=True)
+        cols = 3
+        for i, key in enumerate(keys):
+            _, name, ftype, _params = FEATURE_BY_KEY[key]
+            cell = tk.Frame(grid, bg=c['card'], padx=6, pady=5,
+                            highlightthickness=1, highlightbackground=c['border'],
+                            highlightcolor=c['border'])
+            cell.grid(row=i // cols, column=i % cols, sticky='nsew', padx=3, pady=3)
+            if ftype == 'planned':
+                btn = tk.Button(
+                    cell, text='[预] ' + name, font=font, width=13,
+                    bg=c['planned_bg'], fg=c['muted'],
+                    activebackground=c['planned_bg'], activeforeground=c['muted'],
+                    relief='flat', bd=0, cursor='arrow', highlightthickness=0,
+                    padx=4, pady=4, state='disabled',
+                    disabledforeground=c['muted'])
+                btn.pack(padx=2, pady=2)
+                self.btn_widgets[key] = btn
+                self._tip(btn, self._feature_tip(key, '尚未实现 · 界面预留'))
+            elif ftype == 'toggle':
+                self.state[key] = False
+                btn = tk.Button(
+                    cell, text='○ ' + name, font=font, width=13,
+                    bg=c['card'], fg=c['fg'], activebackground=c['card_hover'],
+                    activeforeground=c['fg'], relief='flat', bd=0, cursor='hand2',
+                    highlightthickness=0, padx=4, pady=4,
+                    command=lambda k=key: self.toggle_feature(k, not self.state.get(k, False)))
+                btn.pack(padx=2, pady=2)
+                self.btn_widgets[key] = btn
+                self._tip(btn, self._feature_tip(key))
+            elif ftype == 'danger':
+                tk.Label(cell, text=name, font=font, bg=c['card'], fg=c['fg']
+                         ).pack(anchor='w', padx=4, pady=(2, 0))
+                sub = tk.Frame(cell, bg=c['card'])
+                sub.pack(pady=2)
+                self.danger_btns = {}
+                self.state['danger'] = 0
+                for val, txt in [(1, '最高'), (2, '最低'), (0, '正常')]:
+                    btn = tk.Button(
+                        sub, text=txt, font=font_small, width=4,
+                        bg=c['card'], fg=c['dim'], activebackground=c['card_hover'],
+                        activeforeground=c['fg'], relief='flat', bd=0, cursor='hand2',
+                        highlightthickness=1, highlightbackground=c['border'], pady=2,
+                        command=lambda v=val: self.set_danger(v))
+                    btn.pack(side='left', padx=2)
+                    self.danger_btns[val] = btn
+                    dkey = {1: 'danger_max', 2: 'danger_min', 0: 'danger_norm'}[val]
+                    self._tip(btn, self._feature_tip(dkey, '危险等级 → ' + txt))
+            else:  # pulse / cmd / engine
+                cmd = (lambda k=key: self.do_pulse(k)) if ftype == 'pulse' \
+                    else (lambda k=key: self.do_engine(k)) if ftype == 'engine' \
+                    else (lambda k=key: self.do_command(k))
+                btn = tk.Button(
+                    cell, text=name, font=font, width=13,
+                    bg=c['card'], fg=c['fg'], activebackground=c['card_hover'],
+                    activeforeground=c['fg'], relief='flat', bd=0, cursor='hand2',
+                    highlightthickness=0, padx=4, pady=4, command=cmd)
+                btn.pack(padx=2, pady=2)
+                self.btn_widgets[key] = btn
+                self._tip(btn, self._feature_tip(key))
+        for col in range(cols):
+            grid.columnconfigure(col, weight=1, uniform='cell')
+
+    def _show_group(self, idx):
+        """切换左侧分类：只显示对应右侧页面。"""
+        if idx not in self._pages:
+            return
+        self._current_group = idx
+        for i, page in self._pages.items():
+            if i == idx:
+                page.pack(fill='both', expand=True)
+            else:
+                page.pack_forget()
+        gname, meta = self._group_meta[idx]
+        self._page_title.config(text=gname)
+        self._page_sub.config(text=meta)
+        c = self.c
+        for i, btn in self._nav_btns.items():
+            on = (i == idx)
+            btn.config(
+                bg=c['primary'] if on else c['nav_idle'],
+                fg=c['on_fg'] if on else c['fg'],
+                activebackground=c['primary_dark'] if on else c['primary_soft'],
+                activeforeground=c['on_fg'] if on else c['primary'],
+            )
     # ---- 动作 ----
     def _post(self, fn, *args):
         """跨线程安全地执行 UI 更新：主线程直接执行，否则入队由主线程轮询。"""
@@ -1576,9 +2140,9 @@ class TrainerApp:
         """播放提示音。
 
         kind:
-          'on'    —— 开启 / 勾选（上行音 do→sol）
-          'off'   —— 取消 / 关闭（下行音 sol→do）
-          'click' —— 普通单次触发按钮
+          'on'    —— 可撤销开关：开启（上行音 do→sol）
+          'off'   —— 可撤销开关：关闭（下行音 sol→do）
+          'click' —— 一次性操作成功（单位操作 / 脉冲等，无法撤销）
           'error' —— 失败提示（短促低音）
         """
         try:
@@ -1619,20 +2183,22 @@ class TrainerApp:
         if btn is None:
             return
         name = FEATURE_BY_KEY[key][1]
+        c = self.c
         if on:
-            btn.config(text='● ' + name, bg=self.c['green'], fg='#ffffff',
-                       activebackground=self.c['green'], activeforeground='#ffffff')
+            btn.config(text='● ' + name, bg=c['green'], fg=c['on_fg'],
+                       activebackground=c['green'], activeforeground=c['on_fg'])
         else:
-            btn.config(text='○ ' + name, bg=self.c['card'], fg=self.c['fg'],
-                       activebackground=self.c['card_hover'], activeforeground=self.c['fg'])
+            btn.config(text='○ ' + name, bg=c['card'], fg=c['fg'],
+                       activebackground=c['card_hover'], activeforeground=c['fg'])
 
     def _update_danger_btns(self, val):
         """更新危险等级三按钮高亮。"""
+        c = self.c
         for v, btn in getattr(self, 'danger_btns', {}).items():
             if v == val:
-                btn.config(bg=self.c['primary'], fg='#ffffff', activebackground=self.c['primary'])
+                btn.config(bg=c['primary'], fg=c['on_fg'], activebackground=c['primary'])
             else:
-                btn.config(bg=self.c['card'], fg=self.c['dim'], activebackground=self.c['card_hover'])
+                btn.config(bg=c['card'], fg=c['dim'], activebackground=c['card_hover'])
 
     def _ui_checkbox(self, key, val):
         self._update_toggle_btn(key, val)
@@ -1653,11 +2219,13 @@ class TrainerApp:
             on = (key == cur)
             btn.config(
                 bg=c['primary'] if on else c['card'],
-                fg='#ffffff' if on else c['fg'],
+                fg=c['on_fg'] if on else c['fg'],
                 activebackground=c['primary_dark'] if on else c['card_hover'],
-                activeforeground='#ffffff' if on else c['fg'],
+                activeforeground=c['on_fg'] if on else c['fg'],
                 state='disabled' if self.attached else 'normal',
-                disabledforeground='#d8b9b7' if on else c['dim'],
+                disabledforeground='#f5c2c0' if on else c['muted'],
+                highlightthickness=0 if on else 1,
+                highlightbackground=c['border'],
             )
 
     def do_attach(self):
@@ -1668,7 +2236,8 @@ class TrainerApp:
             return
         mode = self.play_mode.get()
         if mode == 'spectate':
-            ok, err = self.gp.inject(enabled_names=set(), auto_spectator=False)
+            ok, err = self.gp.inject(
+                enabled_names=SPECTATE_HOOK_NAMES, auto_spectator=False)
         else:
             ok, err = self.gp.inject(enabled_names=None, auto_spectator=False)
         if not ok:
@@ -1683,7 +2252,9 @@ class TrainerApp:
         self._beep('on')
         mode_name = PLAY_MODE_LABELS.get(mode, mode)
         if mode == 'spectate':
-            self.log_status('已附加（%s）：未打 hook，单位操作/满级/摧毁仍可用' % mode_name)
+            self.log_status(
+                '已附加（%s）：超武禁用 hook + 单位操作可用（模块 0x%X）'
+                % (mode_name, self.gp.module_base))
         else:
             self.log_status('已附加（%s）：模块 0x%X  MustCode 0x%X'
                             % (mode_name, self.gp.module_base, self.gp.mc_base))
@@ -1740,7 +2311,11 @@ class TrainerApp:
         """由修改器直接在游戏进程里执行（晋升 / 摧毁等），不依赖 Money hook。"""
         if not self._ensure_attached():
             return
-        self._beep('click')
+        if self._engine_busy:
+            self._beep('error')
+            self.log_status('上一次单位操作还在执行，请稍候再按')
+            return
+        self._engine_busy = True
         self._post(self.log_status, '%s：执行中…' % FEATURE_BY_KEY[key][1])
         threading.Thread(target=self._engine_worker, args=(key,),
                          daemon=True).start()
@@ -1748,23 +2323,74 @@ class TrainerApp:
     def _engine_worker(self, key):
         params = FEATURE_BY_KEY[key][3]
         action = params.get('action')
+        map_on = None
         try:
             if action == 'kill':
                 ok, msg = self.gp.kill_selected()
             elif action == 'clone':
                 as_mine = self.play_mode.get() != 'spectate'
                 ok, msg = self.gp.clone_selected(as_mine=as_mine)
+            elif action == 'clone_multi':
+                as_mine = self.play_mode.get() != 'spectate'
+                copies = int(params.get('copies', 5))
+                ok, msg = self.gp.clone_selected(as_mine=as_mine, copies=copies)
+            elif action == 'ore_convoy':
+                as_mine = self.play_mode.get() != 'spectate'
+                copies = int(params.get('copies', 8))
+                ok, msg = self.gp.ore_convoy(as_mine=as_mine, copies=copies)
+            elif action == 'spec_gift':
+                # 始终归属原阵营（观战刷兵 / 给对方送礼）
+                ok, msg = self.gp.clone_selected(as_mine=False, copies=1)
+            elif action == 'convert':
+                ok, msg = self.gp.convert_selected()
+            elif action == 'full_buff':
+                ok, msg = self.gp.full_buff_selected(
+                    xp=int(params.get('xp', 200000)),
+                    max_calls=int(params.get('max_calls', 8)))
+            elif action == 'hp_relation':
+                ok, msg = self.gp.apply_unit_hp_relation(
+                    params['mode'], params['relation'])
             elif action == 'speed':
                 ok, msg = self.gp.apply_unit_speed(params['mode'])
             elif action == 'hp':
                 ok, msg = self.gp.apply_unit_hp(params['mode'])
+            elif action == 'chaos':
+                ok, msg = self.gp.chaos_selected()
+            elif action == 'fog_toggle':
+                ok, msg, map_on = self.gp.toggle_fog()
+            elif action == 'protocol_ready':
+                ok, msg = self.gp.pulse_protocol_ready(
+                    hold_sec=float(params.get('hold_sec', 1.0)))
+            elif action == 'unit_skill_ready':
+                ok, msg = self.gp.pulse_unit_skill_ready(
+                    hold_sec=float(params.get('hold_sec', 1.2)))
+            elif action == 'disable_protocol':
+                ok, msg = self.gp.pulse_disable_protocol(
+                    hold_sec=float(params.get('hold_sec', 2.0)))
+            elif action == 'spawn_as_mine':
+                ok, msg = self.gp.spawn_as_mine(
+                    copies=int(params.get('copies', 1)))
+            elif action == 'damage_mult':
+                ok, msg = self.gp.apply_damage_mult(
+                    mult=float(params.get('mult', 5.0)))
             else:
                 ok, msg = self.gp.rank_up_via_engine(**{
                     k: v for k, v in params.items() if k != 'action'})
         except Exception as e:
             ok, msg = False, '异常：%s' % e
+        finally:
+            self._engine_busy = False
         self._post(self.log_status, ('✓ ' if ok else '✗ ') + msg)
-        self._post(self._beep, 'on' if ok else 'off')
+        # 迷雾开关与「全地图」共用 flag 0x11，同步按钮外观
+        if map_on is not None:
+            self._post(self._sync_map_toggle, map_on)
+        # 单位操作无法撤销，统一用 click / error，不用开关的 on/off 音
+        self._post(self._beep, 'click' if ok else 'error')
+
+    def _sync_map_toggle(self, on):
+        """雾开关翻转后，把「全地图」按钮状态对齐到 flag。"""
+        self.state['map'] = bool(on)
+        self._update_toggle_btn('map', bool(on))
 
     # ---- 热键 ----
     def _key_down(self, vk):
@@ -1810,6 +2436,8 @@ class TrainerApp:
             self._post(self.log_status, '危险等级 -> 正常')
             return
         ftype = FEATURE_BY_KEY[key][2]
+        if ftype == 'planned':
+            return
         if ftype == 'toggle':
             new = not self.state.get(key, False)
             self._mem_toggle(key, new)

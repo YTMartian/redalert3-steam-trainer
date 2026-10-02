@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""快速验证：新「满级(3星)」按钮存在、提示正确、窗口尺寸未变。"""
+"""快速验证：侧栏布局、「满级(3星)」按钮存在、提示正确。"""
 import ctypes
 import time
 import tkinter as tk
@@ -46,6 +46,12 @@ def main():
     ok = True
     print('窗口尺寸: %dx%d' % (root.winfo_width(), root.winfo_height()))
     print('按钮总数: %d' % len(app.btn_widgets))
+    print('侧栏分类: %d' % len(getattr(app, '_nav_btns', {})))
+
+    # 切到「单位操作」页，再测满级按钮悬停（隐藏页上的 tip 坐标不可靠）
+    unit_idx = next(i for i, (n, _) in enumerate(T.FEATURE_GROUPS) if n == '单位操作')
+    app._show_group(unit_idx)
+    pump(root, 0.3)
 
     btn = app.btn_widgets.get('unit_rank')
     print('unit_rank 按钮: %s  (文本 %r)' % (btn is not None, btn.cget('text') if btn else None))
@@ -58,8 +64,17 @@ def main():
         tips = all_toplevels(root)
         txt = ''
         if tips:
-            labels = [w for w in tips[0].winfo_children() if isinstance(w, tk.Label)]
-            txt = labels[0].cget('text') if labels else ''
+            # ToolTip 结构：Toplevel -> Frame -> Label
+            def _first_label(w):
+                if isinstance(w, tk.Label):
+                    return w
+                for ch in w.winfo_children():
+                    found = _first_label(ch)
+                    if found is not None:
+                        return found
+                return None
+            lab = _first_label(tips[0])
+            txt = lab.cget('text') if lab else ''
         print('悬停提示:', repr(txt))
         if 'P' not in txt:
             print('  [!] 提示里没有快捷键 P')
@@ -67,7 +82,6 @@ def main():
         btn.event_generate('<Leave>')
         pump(root, 0.4)
 
-    # 截图确认布局没有错乱
     x = root.winfo_rootx()
     y = root.winfo_rooty()
     from PIL import ImageGrab

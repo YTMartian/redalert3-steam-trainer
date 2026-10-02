@@ -227,32 +227,96 @@ mov eax,[ecx]
 pushfd
 pushad
 cmp byte ptr [FLAGS+0xD],0x01
-.byte 0x75,0x2e
+.byte 0x75,0x13
 mov ecx,[IDB]
 cmp [esp+0x28],ecx
-.byte 0x75,0x22
-mov dword ptr [eax+0x0c], 0x00000000
-mov eax,[eax]
-mov dword ptr [eax+0x0c], 0x00000000
-mov eax,[eax]
-mov dword ptr [eax+0x0c], 0x00000000
-mov eax,[eax]
-mov dword ptr [eax+0x0c], 0x00000000
-cmp byte ptr [FLAGS+0xE],0x01
-.byte 0x75,0x2e
-mov ecx,[IDB]
-cmp [esp+0x28],ecx
-.byte 0x74,0x22
-mov dword ptr [eax+0x0c], 0x00000000
-mov eax,[eax]
-mov dword ptr [eax+0x0c], 0x00000000
-mov eax,[eax]
-mov dword ptr [eax+0x0c], 0x00000000
-mov eax,[eax]
+.byte 0x75,0x07
 mov dword ptr [eax+0x0c], 0x00000000
 popad
 popfd
 jmp _BackPlayerSuperPower2
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
 nop
 nop
 nop
@@ -269,13 +333,7 @@ cmp edx,[eax+0x0c]
 pushfd
 pushad
 cmp byte ptr [FLAGS+0xE],0x01
-.byte 0x75,0x22
-.byte 0x81,0x40,0x0c,0x01,0x00,0x00,0x00
-mov eax,[eax]
-.byte 0x81,0x40,0x0c,0x01,0x00,0x00,0x00
-mov eax,[eax]
-.byte 0x81,0x40,0x0c,0x01,0x00,0x00,0x00
-mov eax,[eax]
+.byte 0x75,0x07
 .byte 0x81,0x40,0x0c,0x01,0x00,0x00,0x00
 popad
 popfd
@@ -290,17 +348,57 @@ nop
 nop
 nop
 nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
 MC+0x294:
 mov ecx,[eax+0x50]
 cmp ecx,[esi+0x20]
-pushfd
-pushad
-cmp byte ptr [FLAGS+0xE],0x01
-.byte 0x75,0x07
-.byte 0x81,0x46,0x20,0x01,0x00,0x00,0x00
-popad
-popfd
 jmp _BackDisableAllSuperPower2
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
+nop
 nop
 nop
 nop
