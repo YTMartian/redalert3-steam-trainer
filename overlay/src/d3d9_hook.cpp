@@ -6,6 +6,7 @@
 #include <Windows.h>
 #include <Psapi.h>
 #include <d3d9.h>
+#include <imm.h>
 
 #include "MinHook.h"
 #include "imgui.h"
@@ -14,6 +15,7 @@
 
 #pragma comment(lib, "d3d9.lib")
 #pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "imm32.lib")
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam,
                                                             LPARAM lParam);
@@ -53,6 +55,7 @@ volatile LONG g_skip_draw = 0;
 IDirect3DDevice9* g_ui_device = nullptr;
 
 HMODULE g_self = nullptr;
+HIMC g_overlay_imc = nullptr;
 
 bool module_contains(HMODULE mod, void* addr) {
   if (!mod || !addr) {
@@ -82,15 +85,44 @@ bool is_usable_target(void* addr) {
 
 bool io_want_keyboard_block(UINT msg) {
   if (!(msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_CHAR ||
-        msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP)) {
+        msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP || msg == WM_IME_CHAR ||
+        msg == WM_IME_COMPOSITION || msg == WM_IME_STARTCOMPOSITION ||
+        msg == WM_IME_ENDCOMPOSITION || msg == WM_IME_NOTIFY ||
+        msg == WM_IME_REQUEST || msg == WM_IME_SETCONTEXT ||
+        msg == WM_IME_SELECT || msg == WM_IME_CONTROL)) {
     return false;
   }
-  return ImGui::GetIO().WantCaptureKeyboard;
+  return ImGui::GetIO().WantCaptureKeyboard || ImGui::GetIO().WantTextInput;
+}
+
+void ensure_ime_enabled(HWND hwnd) {
+  if (!hwnd) return;
+  // RA3 (and many games) call ImmAssociateContext(hwnd, NULL) to disable IME.
+  // Keep our own HIMC associated while ImGui text fields are active.
+  if (!g_overlay_imc) {
+    g_overlay_imc = ImmCreateContext();
+  }
+  if (g_overlay_imc) {
+    ImmAssociateContext(hwnd, g_overlay_imc);
+  } else {
+    ImmAssociateContextEx(hwnd, nullptr, IACE_DEFAULT);
+  }
+}
+
+bool is_ime_msg(UINT msg) {
+  return msg == WM_IME_SETCONTEXT || msg == WM_IME_NOTIFY ||
+         msg == WM_IME_STARTCOMPOSITION || msg == WM_IME_ENDCOMPOSITION ||
+         msg == WM_IME_COMPOSITION || msg == WM_IME_CHAR ||
+         msg == WM_IME_REQUEST || msg == WM_IME_SELECT || msg == WM_IME_CONTROL;
 }
 
 LRESULT CALLBACK hk_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
-  if (input::menu_visible()) {
-    ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam);
+  if (ui::overlay_visible()) {
+    if (ImGui::GetIO().WantTextInput) {
+      ensure_ime_enabled(hwnd);
+    }
+    const LRESULT imgui_result =
+        ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam);
     // Swallow mouse to the game while cursor is over any ImGui window, so
     // clicking overlay buttons does not clear the in-game selection.
     const bool mouse_msg =
@@ -103,6 +135,15 @@ LRESULT CALLBACK hk_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       }
     }
     if (io_want_keyboard_block(msg)) {
+      // ImGui already DefWindowProc'd WM_IME_COMPOSITION. For other IME msgs,
+      // use DefWindowProc (not the game) so candidate/composition UI works and
+      // the game cannot re-disable IME mid-input.
+      if (is_ime_msg(msg)) {
+        if (msg == WM_IME_COMPOSITION || imgui_result != 0) {
+          return imgui_result;
+        }
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+      }
       return 0;
     }
   }
@@ -125,6 +166,13 @@ void teardown_ui() {
     SetWindowLongPtrW(g_game_hwnd, GWLP_WNDPROC,
                       reinterpret_cast<LONG_PTR>(g_orig_wndproc));
     g_orig_wndproc = nullptr;
+  }
+  if (g_overlay_imc) {
+    if (g_game_hwnd) {
+      ImmAssociateContext(g_game_hwnd, nullptr);
+    }
+    ImmDestroyContext(g_overlay_imc);
+    g_overlay_imc = nullptr;
   }
   ui::shutdown();
   g_ui_ready = false;
@@ -165,29 +213,31 @@ void ensure_ui(IDirect3DDevice9* device) {
   g_orig_wndproc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
       hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(hk_wndproc)));
   g_ui_ready = true;
+  ensure_ime_enabled(hwnd);
   // First frame: open menu once so user finds it; later reinits keep current visibility.
   static bool s_first_ui = true;
   if (s_first_ui) {
     input::set_menu_visible(true);
     s_first_ui = false;
   }
-  game_api::log("ImGui ready hwnd=%p device=%p", hwnd, device);
+  game_api::log("ImGui ready hwnd=%p device=%p unicode=%d", hwnd, device,
+                IsWindowUnicode(hwnd) ? 1 : 0);
 }
 
 void render_overlay(IDirect3DDevice9* device) {
   if (!device || g_skip_draw) {
     return;
   }
-  // Avoid touching D3D/ImGui during load screens when menu is closed.
-  if (!input::menu_visible() && g_ui_ready) {
+  // Avoid touching D3D/ImGui during load screens when overlay is closed.
+  if (!ui::overlay_visible() && g_ui_ready) {
     return;
   }
   const HRESULT coop = device->TestCooperativeLevel();
   if (coop != D3D_OK) {
     return;
   }
-  // Only create UI when user opens the menu (Home).
-  if (!input::menu_visible() && !g_ui_ready) {
+  // Only create UI when user opens the menu (Home) or pinned stats is on.
+  if (!ui::overlay_visible() && !g_ui_ready) {
     return;
   }
   ensure_ui(device);
@@ -197,8 +247,13 @@ void render_overlay(IDirect3DDevice9* device) {
   if (InterlockedCompareExchange(&g_drew_this_frame, 1, 0) != 0) {
     return;
   }
+  // Game may re-disable IME every frame; re-associate while typing.
+  // Check after draw so WantTextInput reflects the active InputText this frame.
   ui::begin_frame();
   ui::draw();
+  if (ImGui::GetIO().WantTextInput) {
+    ensure_ime_enabled(g_game_hwnd);
+  }
   ui::end_frame(device);
 }
 

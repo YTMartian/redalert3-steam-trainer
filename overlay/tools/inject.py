@@ -265,19 +265,19 @@ def unload_module_by_name(hproc, pid, module_name, max_frees=8):
 def inject(dll_path, pid=None):
     dll_path = os.path.abspath(dll_path)
     if not os.path.isfile(dll_path):
-        return False, 'DLL not found: %s' % dll_path
+        return False, u'找不到覆盖层 DLL：\n%s' % dll_path
     if not dll_path.lower().endswith('.dll'):
-        return False, 'Not a DLL: %s' % dll_path
+        return False, u'目标不是 DLL：\n%s' % dll_path
 
     dll_path = os.path.normpath(dll_path)
     if pid is None:
         pid = find_pid()
     if not pid:
-        return False, 'Process ra3_1.12.game not found (start the game with -runver 1.12)'
+        return False, u'没有找到游戏进程。\n请先启动红警 3，再运行注入器。'
 
     hproc = kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, pid)
     if not hproc:
-        return False, 'OpenProcess failed (run as Administrator), err=%d' % ctypes.get_last_error()
+        return False, u'无法打开游戏进程（错误 %d）。\n请用管理员身份运行注入器。' % ctypes.get_last_error()
 
     # Drop any previous overlay builds so DllMain runs again on LoadLibrary.
     unload_notes = []
@@ -289,14 +289,14 @@ def inject(dll_path, pid=None):
         if not ok_u and 'still present' in msg_u:
             kernel32.CloseHandle(hproc)
             return False, (
-                'Cannot unload %s while game holds it.\n%s\n'
-                'Please restart ra3_1.12.game, then inject again.'
-            ) % (name, '\n'.join(unload_notes))
+                u'旧的覆盖层还在游戏里，卸不掉（%s）。\n'
+                u'请先完全退出红警 3，再重新进游戏后注入。'
+            ) % name
 
     load_lib, err = resolve_remote_loadlibrary_w(pid)
     if not load_lib:
         kernel32.CloseHandle(hproc)
-        return False, err or 'GetProcAddress(LoadLibraryW) failed'
+        return False, err or u'无法在游戏进程里找到 LoadLibraryW。'
 
     path_bytes = (dll_path + '\0').encode('utf-16-le')
     remote = kernel32.VirtualAllocEx(
@@ -304,7 +304,7 @@ def inject(dll_path, pid=None):
     )
     if not remote:
         kernel32.CloseHandle(hproc)
-        return False, 'VirtualAllocEx failed, err=%d' % ctypes.get_last_error()
+        return False, u'无法在游戏里分配内存（错误 %d）。' % ctypes.get_last_error()
 
     written = ctypes.c_size_t(0)
     buf = ctypes.create_string_buffer(path_bytes)
@@ -313,7 +313,7 @@ def inject(dll_path, pid=None):
     ):
         kernel32.VirtualFreeEx(hproc, remote, 0, MEM_RELEASE)
         kernel32.CloseHandle(hproc)
-        return False, 'WriteProcessMemory failed, err=%d' % ctypes.get_last_error()
+        return False, u'无法把 DLL 路径写入游戏（错误 %d）。' % ctypes.get_last_error()
 
     thread = kernel32.CreateRemoteThread(
         hproc, None, 0, ctypes.c_void_p(load_lib), remote, 0, None
@@ -322,7 +322,7 @@ def inject(dll_path, pid=None):
         err_code = ctypes.get_last_error()
         kernel32.VirtualFreeEx(hproc, remote, 0, MEM_RELEASE)
         kernel32.CloseHandle(hproc)
-        return False, 'CreateRemoteThread failed, err=%d' % err_code
+        return False, u'无法在游戏里启动加载线程（错误 %d）。' % err_code
 
     kernel32.WaitForSingleObject(thread, 15000)
     exit_code = wintypes.DWORD(0)
@@ -333,25 +333,30 @@ def inject(dll_path, pid=None):
 
     if exit_code.value == 0:
         return False, (
-            'LoadLibraryW returned NULL — DLL failed to load '
-            '(must be Win32/x86; check Defender quarantine)\nUnload:\n%s'
-            % '\n'.join(unload_notes)
+            u'DLL 没有载入成功。\n'
+            u'请确认 ra3_overlay_v4.dll 和注入器在同一目录，且没有被安全软件隔离。\n'
+            u'日志：%TEMP%\\ra3_overlay.log'
         )
     return True, (
-        'Injected into PID %d, module=0x%X\nDLL: %s\nLoadLibraryW=0x%X\n'
-        'Unload:\n%s\nLog: %%TEMP%%\\ra3_overlay.log\n'
-        'If menu missing: type  type %%TEMP%%\\ra3_overlay.log'
-    ) % (pid, exit_code.value, dll_path, load_lib, '\n'.join(unload_notes))
+        u'覆盖层已载入。\n'
+        u'进程 PID：%d\n'
+        u'进局后按 Home 打开菜单。'
+    ) % pid
 
 
-def _msg(title, text, error=False):
+def _msg(ok, detail):
+    title = u'注入成功' if ok else u'注入失败'
+    text = (u'注入成功。\n\n' if ok else u'注入失败。\n\n') + (detail or u'')
     try:
-        MB_OK = 0x0
-        MB_ICONERROR = 0x10
-        MB_ICONINFORMATION = 0x40
-        ctypes.windll.user32.MessageBoxW(
-            None, text, title, MB_OK | (MB_ICONERROR if error else MB_ICONINFORMATION))
+        user32 = ctypes.WinDLL('user32', use_last_error=True)
+        user32.MessageBoxW.argtypes = [
+            ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint
+        ]
+        user32.MessageBoxW.restype = ctypes.c_int
+        flags = 0x0 | (0x40 if ok else 0x10) | 0x40000 | 0x10000
+        user32.MessageBoxW(None, text, title, flags)
     except Exception:
+        print(title)
         print(text)
 
 
@@ -381,10 +386,8 @@ def main():
         default_dll = candidates[0]
     dll = sys.argv[1] if len(sys.argv) > 1 else default_dll
     ok, msg = inject(dll)
-    line = ('OK: ' if ok else 'FAIL: ') + msg
-    print(line)
-    if getattr(sys, 'frozen', False) or os.environ.get('RA3_OVERLAY_MSGBOX'):
-        _msg(u'RA3 Overlay 注入器', msg if ok else line, error=not ok)
+    print((u'注入成功' if ok else u'注入失败') + u'\n' + msg)
+    _msg(ok, msg)
     return 0 if ok else 1
 
 

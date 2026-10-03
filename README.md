@@ -224,7 +224,7 @@ python verify_payload.py  # 构建一致性 + 段内跳转合法性
 
 ## 五、源码与构建
 
-> **另见进程内 ImGui 菜单**：[overlay/](overlay/) — 独立 C++/ImGui DLL，注入 `ra3_1.12.game` 后按 **Home / Insert / F8** 呼出菜单，功能与本 Python 修改器对齐（资源/超武/单位操作等）。提供 `RA3_Overlay_Inject.exe` 一键注入；与 Python MustCode **不要同时使用**。编译与用法见 [overlay/README.md](overlay/README.md)。
+> **另见进程内 ImGui 菜单**：[overlay/](overlay/) — 独立 C++/ImGui DLL，注入 `ra3_1.12.game` 后按 **Home / Insert / F8** 呼出菜单，功能与本 Python 修改器对齐（资源/超武/单位操作等），并带战况统计（颜色色块 + 阵营、场上单位图标、本局建造/损失/摧毁折线）。`RA3_Overlay_Inject.exe` 一键注入，弹窗标题直接显示「注入成功」或「注入失败」。与 Python MustCode **不要同时使用**。编译与用法见 [overlay/README.md](overlay/README.md)。
 
 ### 5.1 运行依赖
 ```powershell

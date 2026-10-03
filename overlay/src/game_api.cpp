@@ -143,6 +143,8 @@ bool probe_module() {
 
 }  // namespace
 
+void install_roster_hooks();
+
 void init() {
   if (!g_cs_ready) {
     InitializeCriticalSection(&g_log_cs);
@@ -158,6 +160,7 @@ void init() {
   } else {
     log("module base 0x%X", g_module);
   }
+  install_roster_hooks();
 }
 
 void shutdown() {
@@ -565,6 +568,16 @@ bool trigger_hotkey(const char* key, std::string* out_msg) {
     beep(ok ? "click" : "error");
     return ok;
   }
+  if (std::strcmp(f->type, "money") == 0) {
+    bool ok = adjust_local_money(money_self_step(), out_msg);
+    beep(ok ? "click" : "error");
+    return ok;
+  }
+  if (std::strcmp(f->type, "money_sel") == 0) {
+    bool ok = adjust_selected_player_money(money_sel_step(), out_msg);
+    beep(ok ? "click" : "error");
+    return ok;
+  }
   if (std::strcmp(f->type, "engine") == 0) {
     bool ok = run_engine(key, out_msg);
     beep(ok ? "click" : "error");
@@ -603,7 +616,8 @@ void sync_spectator_hooks() {
 // engine_run is implemented in game_features.cpp
 
 static const FeatureInfo kFeatures[] = {
-    {"money", u8"金钱+10万", "pulse", 0x08},
+    {"money", u8"己方资金", "money", 0},
+    {"money_sel", u8"选中玩家资金", "money_sel", 0},
     {"power", u8"电力无限", "toggle", 0x09},
     {"scpoint", u8"科技点无限", "toggle", 0x0A},
     {"haveallsc", u8"全科技", "toggle", 0x0B},
@@ -642,7 +656,7 @@ static const FeatureInfo kFeatures[] = {
     {"spawn_mcv", u8"召唤基地车", "engine", 0},
 };
 
-static const char* kGroupRes[] = {"money", "power", "scpoint", "haveallsc", "fastbuild", "oremine"};
+static const char* kGroupRes[] = {"money", "money_sel", "power", "scpoint", "haveallsc", "fastbuild", "oremine"};
 static const char* kGroupSw[] = {"superpower", "disableallsp", "map", "nocbuild",
                                  "protocol_ready", "unit_skill_ready", "disable_protocol"};
 static const char* kGroupAmmo[] = {"ammo", "danger"};
@@ -656,7 +670,7 @@ static const char* kGroupSpec[] = {"spec_gift"};
 static const char* kGroupFun[] = {"chaos_mode", "ore_convoy", "spawn_mcv"};
 
 static const GroupInfo kGroups[] = {
-    {u8"资源", kGroupRes, 6, nullptr},
+    {u8"资源", kGroupRes, 7, u8"己方默认 +10万；选中玩家单位后可加减其资金（默认 1万）"},
     {u8"超武 / 地图", kGroupSw, 7, nullptr},
     {u8"弹药 / 危险", kGroupAmmo, 2, nullptr},
     {u8"单位操作", kGroupUnit, 15, u8"需先在游戏里选中单位"},
@@ -750,6 +764,20 @@ bool run_engine(const char* key, std::string* out_msg) {
 }
 
 // Accessors used by game_features.cpp
+static int clamp_money_step(int v) {
+  if (v < 1000) return 1000;
+  if (v > 50000000) return 50000000;
+  return v;
+}
+
+static int g_money_self_step = 100000;
+static int g_money_sel_step = 10000;
+
+int money_self_step() { return g_money_self_step; }
+int money_sel_step() { return g_money_sel_step; }
+void set_money_self_step(int v) { g_money_self_step = clamp_money_step(v); }
+void set_money_sel_step(int v) { g_money_sel_step = clamp_money_step(v); }
+
 uint8_t* flags_base() { return g_flags; }
 uint8_t* mc_base() { return g_mc; }
 uint8_t* idb_base() { return g_idb; }

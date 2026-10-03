@@ -36,6 +36,104 @@ std::vector<uint32_t> selected_entities_stable(int limit = 64);
 void refresh_selection_cache();
 int selected_count();
 
+// Snapshot of the first selected unit (multi-select → first only).
+struct UnitInspect {
+  bool valid = false;
+  int selected_total = 0;
+  uint32_t ent = 0;
+  uint32_t unit_data = 0;
+  uint32_t owner = 0;
+  bool is_mine = false;
+  char type_id[96] = {};
+  char type_name[96] = {};
+  char name_key[96] = {};  // persistence key (TypeId or tpl_XXXXXXXX)
+  bool has_hp = false;
+  float hp_cur = 0.f;
+  float hp_disp = 0.f;
+  float hp_max = 0.f;
+  bool has_speed = false;
+  float speed = 0.f;
+  bool has_rank = false;
+  uint32_t rank_level = 0;
+  float xp = 0.f;
+  float xp_next = 0.f;
+  float damage_mult = 0.f;
+  // Primary weapon damage class (RA3 armor matrix). Not per-shot raw damage.
+  bool has_damage_type = false;
+  char damage_type[48] = {};      // e.g. CANNON
+  char damage_type_zh[64] = {};   // e.g. 加农/穿甲
+};
+
+// ---- Match economy ----
+// Money:  [[player+0xE4]]+0x04
+// Power:  [player+0x74]+0x08 used / +0x04 total  (MustCode Power hook fields)
+constexpr int kMaxEconPlayers = 16;
+constexpr int kMaxRosterTypes = 64;
+
+struct RosterType {
+  char key[96] = {};   // stable type id (for order / identity)
+  char name[64] = {};  // display (zh or type_id)
+  int count = 0;
+  bool is_building = false;
+};
+
+struct PlayerEconomy {
+  uint32_t player = 0;
+  uint32_t player_id = 0;
+  bool is_local = false;
+  char name[64] = {};
+  bool has_color = false;
+  uint8_t color_r = 210;
+  uint8_t color_g = 214;
+  uint8_t color_b = 220;
+  bool has_money = false;
+  uint32_t money = 0;
+  bool has_power = false;
+  uint32_t power_used = 0;
+  uint32_t power_total = 0;
+  int unit_total = 0;
+  int building_total = 0;
+  // Official ScoreKeeper at player+0x1F0. Cumulative for the whole match.
+  bool has_score = false;
+  uint32_t units_built = 0;
+  uint32_t units_lost = 0;
+  uint32_t units_destroyed = 0;
+  uint32_t buildings_built = 0;
+  uint32_t buildings_lost = 0;
+  uint32_t buildings_destroyed = 0;
+  uint32_t money_earned = 0;
+  uint32_t money_spent = 0;
+  int roster_count = 0;
+  RosterType roster[kMaxRosterTypes] = {};
+  // Plain text: "征召兵 5  防空部队 3"
+  char roster_text[768] = {};
+};
+
+struct MatchEconomy {
+  bool valid = false;
+  bool spectator = false;
+  float match_seconds = 0.f;
+  int player_count = 0;
+  PlayerEconomy players[kMaxEconPlayers] = {};
+  char note[192] = {};
+};
+
+bool collect_match_economy(MatchEconomy* out);
+bool inspect_first_selected(UnitInspect* out);
+
+// Direct money write (no MustCode hook). Works in match / spectator.
+int money_self_step();
+int money_sel_step();
+void set_money_self_step(int v);
+void set_money_sel_step(int v);
+bool adjust_local_money(int delta, std::string* out_msg);
+bool adjust_selected_player_money(int delta, std::string* out_msg);
+
+// Persistent unit display-name store (local file). File wins over builtins.
+bool set_unit_display_name(const char* type_id, const char* display_name,
+                           std::string* out_msg);
+const char* unit_names_store_path();  // UTF-8 path, valid until next call
+
 bool toggle_feature(const char* key, bool enabled, std::string* out_msg);
 bool pulse_feature(const char* key, std::string* out_msg);
 bool set_danger(int level, std::string* out_msg);

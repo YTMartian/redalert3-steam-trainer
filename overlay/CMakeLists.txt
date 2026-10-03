@@ -17,6 +17,7 @@ add_library(ra3_overlay SHARED
   src/d3d9_hook.cpp
   src/input.cpp
   src/ui.cpp
+  src/unit_icons.cpp
   src/game_api.cpp
   src/game_features.cpp
   ${IMGUI_DIR}/imgui.cpp
@@ -52,6 +53,9 @@ target_link_libraries(ra3_overlay PRIVATE
   gdi32
   dwmapi
   psapi
+  imm32
+  ole32
+  windowscodecs
 )
 
 # Primary output uses a distinct name so builds succeed while the game still

@@ -9,6 +9,7 @@ void shutdown();
 void begin_frame();
 void draw();
 void end_frame(IDirect3DDevice9* device);
+bool overlay_visible();  // main menu, or pinned stats window
 bool want_capture_mouse();
 bool want_capture_keyboard();
 

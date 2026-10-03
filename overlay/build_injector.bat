@@ -41,7 +41,9 @@ echo.
 echo Done:
 echo   overlay\bin\RA3_Overlay_Inject.exe
 echo   overlay\bin\arm_mustcode.exe
-echo Keep them beside ra3_overlay_v4.dll
+echo Keep them beside ra3_overlay_v4.dll + unit_names_csf.txt + unit_names.txt
+if exist "%REPO%\unit_names_csf.txt" copy /Y "%REPO%\unit_names_csf.txt" "%REPO%\overlay\bin\unit_names_csf.txt" >nul
+if exist "%REPO%\unit_names.txt" copy /Y "%REPO%\unit_names.txt" "%REPO%\overlay\bin\unit_names.txt" >nul
 exit /b 0
 
 :err
