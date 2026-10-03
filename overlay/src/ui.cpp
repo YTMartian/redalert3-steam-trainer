@@ -26,6 +26,7 @@ bool g_inited = false;
 HWND g_hwnd = nullptr;
 int g_group = 0;
 bool g_show_settings = false;
+bool g_show_build_lock = false;
 bool g_stats_open = false;
 bool g_stats_pinned = false;
 std::string g_last_msg =
@@ -341,7 +342,8 @@ void format_uint_grouped(char* out, size_t out_len, uint32_t v) {
 
 struct TrendPt {
   float t = 0.f;
-  uint32_t v[6] = {};
+  // 0..2 units built/lost/destroyed, 3..5 buildings, 6 earned, 7 spent
+  uint32_t v[8] = {};
 };
 struct TrendTrack {
   uint32_t player = 0;
@@ -366,7 +368,7 @@ static void sample_trends(const game_api::MatchEconomy& st) {
     const float now = (float)ImGui::GetTime();
     if (g_trend_clock < 0.f) g_trend_clock = now;
     t = now - g_trend_clock;
-  } else if (g_trend_clock >= 100.f && t + 2.f < g_trend_clock) {
+  } else if (g_trend_clock >= 0.f && t + 2.f < g_trend_clock) {
     reset_trends();
   }
   if (game_clock) g_trend_clock = t;
@@ -397,24 +399,25 @@ static void sample_trends(const game_api::MatchEconomy& st) {
       tr = &g_trends.back();
       tr->player = pe.player;
     }
-    const uint32_t v[6] = {pe.units_built,        pe.units_lost,           pe.units_destroyed,
-                           pe.buildings_built,    pe.buildings_lost,       pe.buildings_destroyed};
+    const uint32_t v[8] = {pe.units_built,     pe.units_lost,        pe.units_destroyed,
+                           pe.buildings_built, pe.buildings_lost,    pe.buildings_destroyed,
+                           pe.money_earned,    pe.money_spent};
     if (!tr->pts.empty()) {
       TrendPt& last = tr->pts.back();
       bool same = true;
-      for (int k = 0; k < 6; ++k) {
+      for (int k = 0; k < 8; ++k) {
         if (last.v[k] != v[k]) same = false;
       }
       if (same && t <= last.t + 1.f) continue;
       if (!same && t <= last.t + 0.25f) {
-        for (int k = 0; k < 6; ++k) last.v[k] = v[k];
+        for (int k = 0; k < 8; ++k) last.v[k] = v[k];
         last.t = t;
         continue;
       }
     }
     TrendPt pt;
     pt.t = t;
-    for (int k = 0; k < 6; ++k) pt.v[k] = v[k];
+    for (int k = 0; k < 8; ++k) pt.v[k] = v[k];
     tr->pts.push_back(pt);
     if (tr->pts.size() > 2400) {
       tr->pts.erase(tr->pts.begin(), tr->pts.begin() + 400);
@@ -430,12 +433,13 @@ static const TrendTrack* trend_for(uint32_t player) {
 }
 
 static uint32_t trend_total(const TrendPt& pt, int series) {
-  return pt.v[series] + pt.v[series + 3];
+  if (series < 3) return pt.v[series] + pt.v[series + 3];
+  return pt.v[series + 3];  // 3 → earned, 4 → spent
 }
 
 static void draw_trend_chart(const char* title, const TrendTrack* tr) {
   const float avail = ImGui::GetContentRegionAvail().x;
-  const float h = 96.f;
+  const float h = 118.f;
   const ImVec2 origin = ImGui::GetCursorScreenPos();
   ImDrawList* dl = ImGui::GetWindowDrawList();
   const ImVec2 box1(origin.x + avail, origin.y + h);
@@ -443,11 +447,13 @@ static void draw_trend_chart(const char* title, const TrendTrack* tr) {
   dl->AddRect(origin, box1, IM_COL32(80, 100, 130, 70), 6.f, 0, 1.f);
   dl->AddText(ImVec2(origin.x + 8.f, origin.y + 4.f), IM_COL32(176, 192, 210, 255), title);
 
-  const char* names[3] = {u8"建造", u8"损失", u8"摧毁"};
-  const ImU32 cols[3] = {
+  const char* names[5] = {u8"建造", u8"损失", u8"消灭", u8"收入", u8"支出"};
+  const ImU32 cols[5] = {
       IM_COL32(130, 214, 156, 255),
       IM_COL32(232, 122, 112, 255),
       IM_COL32(242, 186, 96, 255),
+      IM_COL32(176, 132, 255, 255),
+      IM_COL32(156, 186, 214, 255),
   };
   float lx = origin.x + ImGui::CalcTextSize(title).x + 18.f;
   for (int s = 0; s < 3; ++s) {
@@ -456,11 +462,18 @@ static void draw_trend_chart(const char* title, const TrendTrack* tr) {
     dl->AddText(ImVec2(lx, origin.y + 3.f), cols[s], names[s]);
     lx += ImGui::CalcTextSize(names[s]).x + 10.f;
   }
+  lx = origin.x + 8.f;
+  for (int s = 3; s < 5; ++s) {
+    dl->AddRectFilled(ImVec2(lx, origin.y + 26.f), ImVec2(lx + 10.f, origin.y + 34.f), cols[s], 2.f);
+    lx += 14.f;
+    dl->AddText(ImVec2(lx, origin.y + 21.f), cols[s], names[s]);
+    lx += ImGui::CalcTextSize(names[s]).x + 10.f;
+  }
 
   const float plot_x = origin.x + 8.f;
-  const float plot_y = origin.y + 26.f;
+  const float plot_y = origin.y + 44.f;
   const float plot_w = std::max(8.f, avail - 16.f);
-  const float plot_h = h - 34.f;
+  const float plot_h = h - 52.f;
   dl->AddLine(ImVec2(plot_x, plot_y + plot_h * 0.5f),
               ImVec2(plot_x + plot_w, plot_y + plot_h * 0.5f), IM_COL32(255, 255, 255, 22));
   dl->AddLine(ImVec2(plot_x, plot_y + plot_h), ImVec2(plot_x + plot_w, plot_y + plot_h),
@@ -469,32 +482,39 @@ static void draw_trend_chart(const char* title, const TrendTrack* tr) {
   const int n = tr ? (int)tr->pts.size() : 0;
   float tmin = 0.f, tmax = 1.f;
   uint32_t ymax = 4;
+  uint32_t money_ymax = 4;
   if (n > 0) {
     tmin = tr->pts.front().t;
     tmax = tr->pts.back().t;
     if (tmax <= tmin) tmax = tmin + 1.f;
     uint32_t peak = 1;
+    uint32_t money_peak = 1;
     for (const auto& pt : tr->pts) {
       for (int s = 0; s < 3; ++s) peak = std::max(peak, trend_total(pt, s));
+      for (int s = 3; s < 5; ++s) money_peak = std::max(money_peak, trend_total(pt, s));
     }
     ymax = peak < 4 ? 4u : (peak + 3u) & ~3u;
+    money_ymax = money_peak < 4 ? 4u : money_peak;
   }
 
-  auto at = [&](float t, uint32_t val) {
+  auto at_axis = [&](float t, uint32_t val, uint32_t axis_max) {
     const float u = (t - tmin) / (tmax - tmin);
-    const float vv = (float)val / (float)ymax;
+    const float vv = (float)val / (float)axis_max;
     return ImVec2(plot_x + u * plot_w, plot_y + plot_h * (1.f - vv));
+  };
+  auto at = [&](float t, uint32_t val, int series) {
+    return at_axis(t, val, series < 3 ? ymax : money_ymax);
   };
 
   if (n >= 1) {
-    for (int s = 0; s < 3; ++s) {
+    for (int s = 0; s < 5; ++s) {
       dl->PathClear();
       if (n == 1) {
         const uint32_t val = trend_total(tr->pts[0], s);
-        dl->PathLineTo(at(tmin, val));
-        dl->PathLineTo(at(tmax, val));
+        dl->PathLineTo(at(tmin, val, s));
+        dl->PathLineTo(at(tmax, val, s));
       } else {
-        for (const auto& pt : tr->pts) dl->PathLineTo(at(pt.t, trend_total(pt, s)));
+        for (const auto& pt : tr->pts) dl->PathLineTo(at(pt.t, trend_total(pt, s), s));
       }
       dl->PathStroke(cols[s], 0, 2.f);
     }
@@ -519,10 +539,10 @@ static void draw_trend_chart(const char* title, const TrendTrack* tr) {
       }
     }
     const TrendPt& pt = tr->pts[best];
-    const float x = at(pt.t, 0).x;
+    const float x = at(pt.t, 0, 0).x;
     dl->AddLine(ImVec2(x, plot_y), ImVec2(x, plot_y + plot_h), IM_COL32(255, 255, 255, 110), 1.f);
-    for (int s = 0; s < 3; ++s) {
-      const ImVec2 p = at(pt.t, trend_total(pt, s));
+    for (int s = 0; s < 5; ++s) {
+      const ImVec2 p = at(pt.t, trend_total(pt, s), s);
       dl->AddCircleFilled(p, 3.f, cols[s]);
     }
     int sec = (int)(pt.t + 0.5f);
@@ -533,6 +553,11 @@ static void draw_trend_chart(const char* title, const TrendTrack* tr) {
       ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(cols[s]), u8"%s  %u", names[s],
                          trend_total(pt, s));
       ImGui::TextDisabled(u8"    部队 %u    建筑 %u", pt.v[s], pt.v[s + 3]);
+    }
+    for (int s = 3; s < 5; ++s) {
+      char num[32];
+      format_uint_grouped(num, sizeof(num), trend_total(pt, s));
+      ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(cols[s]), u8"%s  %s", names[s], num);
     }
     ImGui::EndTooltip();
   }
@@ -577,6 +602,10 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
   if (p.is_local) {
     ImGui::SameLine();
     ImGui::TextDisabled(u8"己方");
+  }
+  if (p.defeated) {
+    ImGui::SameLine();
+    ImGui::TextDisabled(u8"已击败");
   }
 
   ImGui::Spacing();
@@ -634,37 +663,6 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
     ImGui::Spacing();
 
     draw_trend_chart(u8"本局", trend_for(p.player));
-    ImGui::Dummy(ImVec2(0.f, 4.f));
-
-    ImDrawList* sd = ImGui::GetWindowDrawList();
-    ImFont* font = ImGui::GetFont();
-    const float num_px = ImGui::GetFontSize() * 1.12f;
-    const float avail = ImGui::GetContentRegionAvail().x;
-    const float gap = 6.f;
-    const float money_h = ImGui::GetTextLineHeight() + num_px + 12.f;
-    const float money_w = (avail - gap) * 0.5f;
-    const ImVec2 money_origin = ImGui::GetCursorScreenPos();
-    auto money_chip = [&](float x, const char* cap, uint32_t v, ImU32 cap_fg, ImU32 val_fg,
-                          ImU32 bg, ImU32 border) {
-      const ImVec2 p0(x, money_origin.y);
-      const ImVec2 p1(x + money_w, money_origin.y + money_h);
-      sd->AddRectFilled(p0, p1, bg, 6.f);
-      sd->AddRect(p0, p1, border, 6.f, 0, 1.f);
-      const ImVec2 cts = ImGui::CalcTextSize(cap);
-      sd->AddText(ImVec2(p0.x + (money_w - cts.x) * 0.5f, p0.y + 5.f), cap_fg, cap);
-      char num[32];
-      format_uint_grouped(num, sizeof(num), v);
-      const ImVec2 nts = font->CalcTextSizeA(num_px, FLT_MAX, 0.f, num);
-      sd->AddText(font, num_px, ImVec2(p0.x + (money_w - nts.x) * 0.5f, p0.y + 6.f + cts.y),
-                  val_fg, num);
-    };
-    money_chip(money_origin.x, u8"收入", p.money_earned, IM_COL32(214, 184, 96, 255),
-               IM_COL32(255, 220, 120, 255), IM_COL32(40, 32, 14, 220),
-               IM_COL32(214, 176, 72, 70));
-    money_chip(money_origin.x + money_w + gap, u8"支出", p.money_spent,
-               IM_COL32(156, 176, 196, 255), IM_COL32(214, 226, 238, 255),
-               IM_COL32(16, 22, 32, 220), IM_COL32(120, 150, 180, 60));
-    ImGui::Dummy(ImVec2(avail, money_h));
   }
 
   if (p.roster_count > 0 || p.unit_total || p.building_total) {
@@ -1065,6 +1063,154 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
   }
 }
 
+static int build_faction_rank_ui(const char* id) {
+  if (!id) return 9;
+  if (_strnicmp(id, "Allied", 6) == 0) return 0;
+  if (_strnicmp(id, "Soviet", 6) == 0) return 1;
+  if (_strnicmp(id, "Japan", 5) == 0) return 2;
+  return 3;
+}
+
+static const char* build_faction_label(int rank) {
+  if (rank == 0) return u8"盟军";
+  if (rank == 1) return u8"苏联";
+  if (rank == 2) return u8"帝国";
+  return u8"其他";
+}
+
+static bool is_visible_rep(const game_api::BuildLockEntry* cat, int count, int index) {
+  const auto& e = cat[index];
+  if (!e.group[0]) return true;
+  for (int i = 0; i < count; ++i) {
+    if (i == index) continue;
+    if (std::strcmp(cat[i].group, e.group) != 0) continue;
+    if (cat[i].group_pref < e.group_pref || (cat[i].group_pref == e.group_pref && i < index)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool shown_banned(const game_api::BuildLockEntry* cat, int count, int index) {
+  const auto& e = cat[index];
+  if (!e.group[0]) return e.banned;
+  for (int i = 0; i < count; ++i) {
+    if (std::strcmp(cat[i].group, e.group) != 0) continue;
+    if (cat[i].banned) return true;
+  }
+  return false;
+}
+
+static void draw_lock_faction_icons(const game_api::BuildLockEntry* cat, int count,
+                                    bool want_banned) {
+  constexpr float kIcon = 40.f;
+  constexpr float kGap = 4.f;
+  ImDrawList* draw = ImGui::GetWindowDrawList();
+
+  for (int fac = 0; fac < 3; ++fac) {
+    ImGui::TextDisabled("%s", build_faction_label(fac));
+    const float avail = ImGui::GetContentRegionAvail().x;
+    float used = 0.f;
+    bool started = false;
+    bool any = false;
+    for (int i = 0; i < count; ++i) {
+      const auto& e = cat[i];
+      if (build_faction_rank_ui(e.type_id) != fac) continue;
+      if (!is_visible_rep(cat, count, i)) continue;
+      const bool banned = shown_banned(cat, count, i);
+      if (banned != want_banned) continue;
+
+      if (started && used + kIcon + kGap > avail) {
+        used = 0.f;
+        started = false;
+      }
+      if (started) ImGui::SameLine(0.f, kGap);
+
+      ImGui::PushID(want_banned ? i + 10000 : i);
+      const ImVec2 p0 = ImGui::GetCursorScreenPos();
+      ImGui::InvisibleButton("##ico", ImVec2(kIcon, kIcon));
+      const bool hovered = ImGui::IsItemHovered();
+      const bool clicked = ImGui::IsItemClicked();
+      const ImU32 bg = want_banned ? IM_COL32(48, 22, 22, 220) : IM_COL32(16, 22, 32, 220);
+      const ImU32 edge = hovered ? IM_COL32(255, 214, 120, 255)
+                                 : (want_banned ? IM_COL32(180, 90, 80, 255)
+                                                : IM_COL32(70, 96, 130, 255));
+      draw->AddRectFilled(p0, ImVec2(p0.x + kIcon, p0.y + kIcon), bg, 4.f);
+      draw->AddRect(p0, ImVec2(p0.x + kIcon, p0.y + kIcon), edge, 4.f, 0, hovered ? 2.f : 1.f);
+      const char* icon_id = e.icon_id[0] ? e.icon_id : e.type_id;
+      const char* icon_name = e.icon_name[0] ? e.icon_name : e.name;
+      IDirect3DTexture9* tex = unit_icons::get(icon_id, icon_name, e.building);
+      if (tex) {
+        draw->AddImage((ImTextureID)tex, ImVec2(p0.x + 2.f, p0.y + 2.f),
+                       ImVec2(p0.x + kIcon - 2.f, p0.y + kIcon - 2.f));
+      } else {
+        const char* mark = e.building ? u8"建" : u8"兵";
+        const ImVec2 ts = ImGui::CalcTextSize(mark);
+        draw->AddText(ImVec2(p0.x + (kIcon - ts.x) * 0.5f, p0.y + (kIcon - ts.y) * 0.5f),
+                      IM_COL32(210, 216, 224, 255), mark);
+      }
+      if (hovered) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(e.name[0] ? e.name : e.type_id);
+        if (e.paired) ImGui::TextDisabled(u8"车厂和船厂一起限制");
+        ImGui::EndTooltip();
+      }
+      if (clicked) {
+        std::string msg;
+        if (game_api::build_lock_set(e.type_id, !want_banned, &msg)) {
+          g_last_msg = msg;
+          game_api::beep("click");
+        } else {
+          g_last_msg = msg;
+          game_api::beep("error");
+        }
+      }
+      ImGui::PopID();
+      used += kIcon + kGap;
+      started = true;
+      any = true;
+    }
+    if (!any) ImGui::TextDisabled(u8"—");
+    ImGui::Spacing();
+  }
+}
+
+static void draw_build_lock_panel() {
+  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"建造限制");
+  ImGui::SameLine();
+  ImGui::TextDisabled(u8"对局内所有玩家生效");
+
+  int count = 0;
+  const game_api::BuildLockEntry* cat = game_api::build_lock_catalog(&count);
+  const float pane = ImGui::GetContentRegionAvail().y * 0.5f - 4.f;
+
+  ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.12f, 0.10f, 0.55f));
+  ImGui::BeginChild("##build_allow", ImVec2(0, pane), ImGuiChildFlags_Borders);
+  ImGui::TextColored(ImVec4(0.55f, 0.86f, 0.62f, 1.f), u8"允许");
+  ImGui::SameLine();
+  ImGui::TextDisabled(u8"点击图标后移到下方");
+  if (count <= 0) {
+    ImGui::TextWrapped(u8"还没读到可建造的单位。进入对局后再打开这一页。");
+  } else {
+    draw_lock_faction_icons(cat, count, false);
+  }
+  ImGui::EndChild();
+  ImGui::PopStyleColor();
+
+  ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.14f, 0.08f, 0.08f, 0.55f));
+  ImGui::BeginChild("##build_deny", ImVec2(0, 0), ImGuiChildFlags_Borders);
+  ImGui::TextColored(ImVec4(0.93f, 0.55f, 0.48f, 1.f), u8"禁止");
+  ImGui::SameLine();
+  ImGui::TextDisabled(u8"点击图标后恢复建造");
+  if (count <= 0) {
+    ImGui::TextDisabled(u8"—");
+  } else {
+    draw_lock_faction_icons(cat, count, true);
+  }
+  ImGui::EndChild();
+  ImGui::PopStyleColor();
+}
+
 static void draw_unit_inspector() {
   game_api::UnitInspect info{};
   game_api::inspect_first_selected(&info);
@@ -1344,7 +1490,7 @@ void draw() {
 
     ImGui::BeginChild("##side", ImVec2(side_w, -inspect_reserve), true);
     for (int i = 0; i < group_count; ++i) {
-      const bool sel = (!g_show_settings && g_group == i);
+      const bool sel = (!g_show_settings && !g_show_build_lock && g_group == i);
       if (sel) {
         ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.22f, 0.42f, 0.78f, 1.f));
         ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.30f, 0.52f, 0.90f, 1.f));
@@ -1353,6 +1499,7 @@ void draw() {
       if (ImGui::Selectable(groups[i].name, sel, 0, ImVec2(0, row_h))) {
         g_group = i;
         g_show_settings = false;
+        g_show_build_lock = false;
       }
       if (sel) ImGui::PopStyleColor(3);
     }
@@ -1373,6 +1520,20 @@ void draw() {
           g_stats_open = false;
         }
         g_show_settings = false;
+        g_show_build_lock = false;
+      }
+      if (sel) ImGui::PopStyleColor(3);
+    }
+    {
+      const bool sel = g_show_build_lock;
+      if (sel) {
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.22f, 0.42f, 0.78f, 1.f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.30f, 0.52f, 0.90f, 1.f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.36f, 0.60f, 1.0f, 1.f));
+      }
+      if (ImGui::Selectable(u8"建造限制", sel, 0, ImVec2(0, row_h))) {
+        g_show_build_lock = true;
+        g_show_settings = false;
       }
       if (sel) ImGui::PopStyleColor(3);
     }
@@ -1385,6 +1546,7 @@ void draw() {
       }
       if (ImGui::Selectable(u8"界面设置", sel, 0, ImVec2(0, row_h))) {
         g_show_settings = true;
+        g_show_build_lock = false;
       }
       if (sel) ImGui::PopStyleColor(3);
     }
@@ -1394,6 +1556,8 @@ void draw() {
     ImGui::BeginChild("##body", ImVec2(0, -inspect_reserve), true);
     if (g_show_settings) {
       draw_settings_panel();
+    } else if (g_show_build_lock) {
+      draw_build_lock_panel();
     } else if (g_group >= 0 && g_group < group_count) {
       const auto& g = groups[g_group];
       ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), "%s", g.name);

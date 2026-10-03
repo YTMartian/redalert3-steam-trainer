@@ -719,6 +719,9 @@ bool toggle_feature(const char* key, bool enabled, std::string* out_msg) {
     if (out_msg) *out_msg = u8"写 flag 失败";
     return false;
   }
+  if (std::strcmp(key, "disableallsp") == 0) {
+    build_lock_sync_disable_superweapon();
+  }
   if (out_msg) {
     *out_msg = std::string(f->label) + (enabled ? u8"：开" : u8"：关");
   }

@@ -20,7 +20,7 @@ bool g_indexed = false;
 
 struct FileRef {
   std::wstring path;
-  std::string faction;  // 苏联 / 盟军 / 帝国 / 中立单位建筑
+  std::string faction;  // 苏联 / 盟军 / 帝国 / 中立单位建筑 / 战役建筑 / 特殊单位
   bool building = false;
   std::string name;  // basename without .png
 };
@@ -117,13 +117,13 @@ void index_dir(const std::wstring& root) {
   };
 
   // unit_images/{faction}/{单位|建筑}/*.png
-  // unit_images/中立单位建筑/*.png  (flat, mostly tech / map props)
+  // unit_images/{中立单位建筑|战役建筑|特殊单位}/*.png  (flat folders)
   do {
     if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
     if (fd.cFileName[0] == L'.') continue;
     const std::string faction = narrow_utf8(fd.cFileName);
 
-    if (faction == u8"中立单位建筑") {
+    if (faction == u8"中立单位建筑" || faction == u8"战役建筑" || faction == u8"特殊单位") {
       const std::wstring kind_dir = root + L"\\" + fd.cFileName;
       const std::wstring glob = kind_dir + L"\\*.png";
       WIN32_FIND_DATAW ff{};
@@ -131,7 +131,7 @@ void index_dir(const std::wstring& root) {
       if (hf == INVALID_HANDLE_VALUE) continue;
       do {
         if (ff.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        add_png(kind_dir, ff.cFileName, faction, true);
+        add_png(kind_dir, ff.cFileName, faction, faction != u8"特殊单位");
       } while (FindNextFileW(hf, &ff));
       FindClose(hf);
       continue;
@@ -160,9 +160,9 @@ void index_dir(const std::wstring& root) {
 
 const char* faction_from_key(const char* key) {
   if (!key) return "";
-  if (std::strncmp(key, "Soviet", 6) == 0) return u8"苏联";
-  if (std::strncmp(key, "Allied", 6) == 0) return u8"盟军";
-  if (std::strncmp(key, "Japan", 5) == 0) return u8"帝国";
+  if (_strnicmp(key, "Soviet", 6) == 0) return u8"苏联";
+  if (_strnicmp(key, "Allied", 6) == 0) return u8"盟军";
+  if (_strnicmp(key, "Japan", 5) == 0) return u8"帝国";
   return "";
 }
 
@@ -188,6 +188,7 @@ static bool looks_like_japan_nano_core(const char* type_key, const char* disp) {
   if (disp && disp[0] && std::strstr(disp, u8"核心")) {
     // Keep finished structures that aren't pack cores on their own art.
     if (std::strstr(disp, u8"纳米主机") || std::strstr(disp, u8"奈米主機")) return false;
+    if (std::strstr(disp, u8"电力核心") || std::strstr(disp, u8"電力核心")) return false;
     return true;
   }
   return false;
@@ -219,6 +220,8 @@ const char* alias_image_name(const char* type_key, const char* disp) {
         {"SovietOutpost", u8"前线基地"},
         {"SovietVacuumImploder", u8"真空内爆弹"},
         {"SovietSuperWeapon", u8"真空内爆弹"},
+        {"SovietSuperWeaponAdvanced", u8"真空内爆弹"},
+        {"SOVIETSUPERWEAPONADVANCED", u8"真空内爆弹"},
         {"SovietNavalYard", u8"海军造船厂"},
         {"SovietShipyard", u8"海军造船厂"},
         {"SovietAntiVehicleInfantry", u8"防空步兵"},
@@ -244,6 +247,8 @@ const char* alias_image_name(const char* type_key, const char* disp) {
         {"JapanTechStructure", u8"纳米主机"},
         {"JapanNanotechMainframe", u8"纳米主机"},
         {"JapanPsionicDecimator", u8"超能波毁灭装置"},
+        {"JapanSuperWeaponAdvanced", u8"超能波毁灭装置"},
+        {"JAPANSUPERWEAPONADVANCED", u8"超能波毁灭装置"},
         {"JapanLightTransportVehicle", u8"迅雷运输艇"},
         {"JapanNavyScoutShip", u8"长枪迷你潜艇"},
         {"JapanAntiVehicleVehicle", u8"鬼王"},
@@ -253,7 +258,8 @@ const char* alias_image_name(const char* type_key, const char* disp) {
         {"HospitalTechBuilding", u8"医院"},
         {"HospitalTechStructure", u8"医院"},
         {"GarageTechStructure", u8"车库"},
-        {"ObservationPostTechStructure", u8"前哨战"},
+        {"ObservationPostTechStructure", u8"监视站"},
+        {"ObservationPostTechBuilding", u8"监视站"},
         {"OilDerrick", u8"油井"},
         {"OilDerrick_OnWater", u8"油井"},
         {"TechBuildingOilDerrick", u8"油井"},
@@ -291,12 +297,14 @@ const char* alias_image_name(const char* type_key, const char* disp) {
         {u8"战斗研究所", u8"作战实验室"},
         {u8"前哨站", u8"前线基地"},
         {u8"真空内爆器", u8"真空内爆弹"},
+        {u8"真空內爆彈", u8"真空内爆弹"},
         {u8"多功能步兵炮塔", u8"多功能炮塔"},
         {u8"多功能步兵车", u8"多功能步兵战车"},
         {u8"瞬息发电机", u8"瞬息发电厂"},
         {u8"波能坦克", u8"波能炮"},
         {u8"纳米科技电脑主机", u8"纳米主机"},
         {u8"心灵毁灭者", u8"超能波毁灭装置"},
+        {u8"超能波毀滅裝置", u8"超能波毁灭装置"},
         {u8"质子碰撞器", u8"质子撞击炮"},
         {u8"質子撞擊炮", u8"质子撞击炮"},  // CSF traditional
         {u8"質子碰撞器", u8"质子撞击炮"},
@@ -309,10 +317,51 @@ const char* alias_image_name(const char* type_key, const char* disp) {
         {u8"迅雷运输车", u8"迅雷运输艇"},
         {u8"迷你潜艇", u8"长枪迷你潜艇"},
         {u8"干船坞", u8"船坞"},
+        {u8"乾船坞", u8"船坞"},
         {u8"中立机场", u8"机场"},
-        {u8"监视哨", u8"前哨战"},
+        {u8"机场控制塔", u8"机场"},
+        {u8"监视哨", u8"监视站"},
         {u8"中立防御基地", u8"前哨战"},
         {u8"矿井高塔", u8"油井"},
+        {u8"钻井高塔", u8"油井"},
+        {u8"盟军V.I.P.碉堡", u8"盟军VIP碉堡"},
+        {u8"帝国V.I.P.碉堡", u8"帝国VIP碉堡"},
+        {u8"俄军VIP碉堡", u8"苏联VIP碉堡"},
+        {u8"苏联母亲的雕像", u8"苏联母亲雕像"},
+        {u8"远距离雷达", u8"远程雷达"},
+        {u8"天西机械公司", u8"天西机械实验室"},
+        {u8"天皇的宫殿", u8"天皇芳郎的宫殿"},
+        {u8"克里姆林的中心", u8"克里姆林宫"},
+        {u8"布莱顿沿岸炮台", u8"布莱顿海岸炮"},
+        {u8"帝国港口", u8"帝国港口建筑"},
+        {u8"港口管理处", u8"港口管理中心"},
+        {u8"白田港口", u8"白田港"},
+        {u8"纽约证交所", u8"纽约证券交易所"},
+        {u8"科技抑制装置", u8"科技抑制器"},
+        {u8"要塞电缆", u8"要塞电力核心"},
+        {u8"傲德萨教堂", u8"敖德萨教堂"},
+        {u8"傲德萨歌剧院", u8"敖德萨歌剧院"},
+        {u8"傲德萨要塞", u8"敖德萨城堡"},
+        {u8"未来科技总部", u8"未来科技公司"},
+        {u8"名椎道馆", u8"长间道场"},
+        {u8"东山高阶指挥", u8"帝国指挥总部"},
+        {u8"苏联总部", u8"海德堡总部"},
+        {u8"科学设施", u8"科技实验室"},
+        {u8"补给港务局", u8"补给中心"},
+        {u8"桥梁警卫室", u8"桥梁"},
+        {u8"华盛顿胸像", u8"华盛顿"},
+        {u8"林肯胸像", u8"林肯"},
+        {u8"罗斯福胸像", u8"罗斯福"},
+        {u8"杰佛逊胸像", u8"杰斐逊"},
+        {u8"末日杰佛逊", u8"末日杰斐逊"},
+        {u8"华盛顿石像控制", u8"机器头像控制中心"},
+        {u8"林肯石像控制", u8"机器头像控制中心"},
+        {u8"杰斐逊头像控制", u8"机器头像控制中心"},
+        {u8"杰佛逊头像控制", u8"机器头像控制中心"},
+        {u8"拉什莫尔发射基地", u8"总统山发射塔"},
+        {u8"拉什莫尔通讯塔", u8"总统山发射塔"},
+        {u8"双矿脉", u8"矿脉"},
+        {u8"四矿脉", u8"矿脉"},
         {u8"探矿车", u8"勘探者"},
         {u8"探礦車", u8"勘探者"},
     };
@@ -335,6 +384,7 @@ static std::string fold_zh_icon_name(const char* u8) {
   static const Pair kFold[] = {
       {u8"質", u8"质"}, {u8"擊", u8"击"}, {u8"車", u8"车"}, {u8"採", u8"采"},
       {u8"礦", u8"矿"}, {u8"戰", u8"战"}, {u8"國", u8"国"}, {u8"機", u8"机"},
+      {u8"毀", u8"毁"}, {u8"滅", u8"灭"}, {u8"裝", u8"装"}, {u8"內", u8"内"},
       {u8"動", u8"动"}, {u8"衛", u8"卫"}, {u8"達", u8"达"}, {u8"艦", u8"舰"},
       {u8"彈", u8"弹"}, {u8"導", u8"导"}, {u8"擊", u8"击"}, {u8"擊", u8"击"},
       {u8"廠", u8"厂"}, {u8"場", u8"场"}, {u8"營", u8"营"}, {u8"術", u8"术"},
@@ -354,30 +404,46 @@ static std::string fold_zh_icon_name(const char* u8) {
   return s;
 }
 
+static std::string simplify_zh(const char* u8) {
+  std::wstring w = widen_utf8(u8);
+  if (w.empty()) return {};
+  const int n = LCMapStringW(0x0804, LCMAP_SIMPLIFIED_CHINESE, w.c_str(), (int)w.size(),
+                             nullptr, 0);
+  if (n <= 0) return narrow_utf8(w.c_str());
+  std::wstring out((size_t)n, L'\0');
+  LCMapStringW(0x0804, LCMAP_SIMPLIFIED_CHINESE, w.c_str(), (int)w.size(), out.data(), n);
+  return narrow_utf8(out.c_str());
+}
+
 const FileRef* pick_file(const char* type_key, const char* disp, bool building) {
   if (!g_indexed) {
     index_dir(find_images_root());
   }
   const char* faction = faction_from_key(type_key);
-  const char* names_try[5] = {};
+  const char* names_try[8] = {};
   std::string folded;
+  std::string simplified;
+  std::string folded_simple;
   int ntry = 0;
+  auto push_name = [&](const char* s) {
+    if (!s || !s[0] || ntry >= 8) return;
+    for (int i = 0; i < ntry; ++i) {
+      if (names_try[i] && std::strcmp(names_try[i], s) == 0) return;
+    }
+    names_try[ntry++] = s;
+  };
   const char* aliased = alias_image_name(type_key, disp);
-  if (aliased && aliased[0]) names_try[ntry++] = aliased;
-  if (disp && disp[0] && (!aliased || std::strcmp(disp, aliased) != 0)) {
-    names_try[ntry++] = disp;
-  }
+  push_name(aliased);
+  push_name(disp);
   if (disp && disp[0]) {
     folded = fold_zh_icon_name(disp);
-    if (!folded.empty()) {
-      bool dup = false;
-      for (int i = 0; i < ntry; ++i) {
-        if (names_try[i] && folded == names_try[i]) {
-          dup = true;
-          break;
-        }
-      }
-      if (!dup && ntry < 5) names_try[ntry++] = folded.c_str();
+    push_name(folded.c_str());
+    simplified = simplify_zh(disp);
+    push_name(simplified.c_str());
+    if (!simplified.empty()) {
+      push_name(alias_image_name(nullptr, simplified.c_str()));
+      folded_simple = fold_zh_icon_name(simplified.c_str());
+      push_name(folded_simple.c_str());
     }
   }
 
@@ -396,7 +462,8 @@ const FileRef* pick_file(const char* type_key, const char* disp, bool building) 
 
   const bool want_neutral = looks_like_neutral_key(type_key) || !faction[0];
   auto score = [&](const FileRef& f) -> int {
-    const bool is_neutral = (f.faction == u8"中立单位建筑");
+    const bool is_neutral =
+        (f.faction == u8"中立单位建筑" || f.faction == u8"战役建筑");
     // Known faction → only own folder (or neutral). Never steal another faction's art.
     if (faction[0] && f.faction != faction && !is_neutral) return -1;
     int s = 0;
@@ -424,6 +491,37 @@ const FileRef* pick_file(const char* type_key, const char* disp, bool building) 
       }
     }
     if (best && best_sc >= 100) break;
+  }
+  // "火山要塞" / "基洛夫发射台" → the numbered file (…1, …2) when there is no exact png.
+  if (!best) {
+    int num_ord = 9999;
+    for (int t = 0; t < ntry; ++t) {
+      const std::string q = names_try[t] ? names_try[t] : "";
+      if (q.empty()) continue;
+      for (const auto& kv : g_by_name) {
+        const std::string& fn = kv.first;
+        if (fn.size() <= q.size() || fn.compare(0, q.size(), q) != 0) continue;
+        bool digits = true;
+        int ord = 0;
+        for (size_t i = q.size(); i < fn.size(); ++i) {
+          if (fn[i] < '0' || fn[i] > '9') {
+            digits = false;
+            break;
+          }
+          ord = ord * 10 + (fn[i] - '0');
+        }
+        if (!digits) continue;
+        for (int idx : kv.second) {
+          const int sc = score(g_files[idx]);
+          if (sc < 0) continue;
+          if (sc > best_sc || (sc == best_sc && ord < num_ord)) {
+            best_sc = sc;
+            num_ord = ord;
+            best = &g_files[idx];
+          }
+        }
+      }
+    }
   }
   return best;
 }

@@ -374,6 +374,110 @@ void load_unit_names_unlocked() {
   g_unit_names_loaded = true;
 }
 
+static void fold_trad_glyphs(std::string* s) {
+  if (!s || s->empty()) return;
+  struct Pair {
+    const char* from;
+    const char* to;
+  };
+  static const Pair kFold[] = {
+      {u8"質", u8"质"}, {u8"擊", u8"击"}, {u8"車", u8"车"}, {u8"採", u8"采"},
+      {u8"礦", u8"矿"}, {u8"戰", u8"战"}, {u8"國", u8"国"}, {u8"機", u8"机"},
+      {u8"毀", u8"毁"}, {u8"滅", u8"灭"}, {u8"裝", u8"装"}, {u8"內", u8"内"},
+      {u8"動", u8"动"}, {u8"衛", u8"卫"}, {u8"達", u8"达"}, {u8"艦", u8"舰"},
+      {u8"彈", u8"弹"}, {u8"導", u8"导"}, {u8"廠", u8"厂"}, {u8"場", u8"场"},
+      {u8"營", u8"营"}, {u8"術", u8"术"}, {u8"無", u8"无"}, {u8"電", u8"电"},
+      {u8"氣", u8"气"}, {u8"飛", u8"飞"}, {u8"轉", u8"转"}, {u8"傳", u8"传"},
+      {u8"層", u8"层"}, {u8"衝", u8"冲"}, {u8"鍾", u8"钟"}, {u8"鐵", u8"铁"},
+      {u8"鋼", u8"钢"}, {u8"總", u8"总"}, {u8"協", u8"协"}, {u8"聯", u8"联"},
+      {u8"軍", u8"军"}, {u8"禦", u8"御"}, {u8"隊", u8"队"}, {u8"點", u8"点"},
+      {u8"門", u8"门"}, {u8"開", u8"开"}, {u8"關", u8"关"}, {u8"東", u8"东"},
+      {u8"馬", u8"马"}, {u8"鳥", u8"鸟"}, {u8"魚", u8"鱼"}, {u8"龍", u8"龙"},
+      {u8"發", u8"发"}, {u8"對", u8"对"}, {u8"時", u8"时"}, {u8"間", u8"间"},
+      {u8"長", u8"长"}, {u8"雲", u8"云"}, {u8"電", u8"电"}, {u8"網", u8"网"},
+      {u8"線", u8"线"}, {u8"擊", u8"击"}, {u8"亞", u8"亚"}, {u8"爾", u8"尔"},
+      {u8"個", u8"个"}, {u8"這", u8"这"}, {u8"還", u8"还"}, {u8"後", u8"后"},
+      {u8"從", u8"从"}, {u8"將", u8"将"}, {u8"經", u8"经"}, {u8"過", u8"过"},
+      {u8"進", u8"进"}, {u8"遠", u8"远"}, {u8"運", u8"运"}, {u8"選", u8"选"},
+      {u8"達", u8"达"}, {u8"戰", u8"战"}, {u8"護", u8"护"}, {u8"衛", u8"卫"},
+      {u8"寶", u8"宝"}, {u8"實", u8"实"}, {u8"業", u8"业"}, {u8"產", u8"产"},
+      {u8"強", u8"强"}, {u8"彈", u8"弹"}, {u8"擊", u8"击"}, {u8"砲", u8"炮"},
+      {u8"槍", u8"枪"}, {u8"艦", u8"舰"}, {u8"艇", u8"艇"}, {u8"潛", u8"潜"},
+      {u8"島", u8"岛"}, {u8"灣", u8"湾"}, {u8"區", u8"区"}, {u8"廳", u8"厅"},
+      {u8"廣", u8"广"}, {u8"庫", u8"库"}, {u8"倉", u8"仓"}, {u8"樓", u8"楼"},
+      {u8"橋", u8"桥"}, {u8"燈", u8"灯"}, {u8"礦", u8"矿"}, {u8"煉", u8"炼"},
+      {u8"廠", u8"厂"}, {u8"機", u8"机"}, {u8"構", u8"构"}, {u8"築", u8"筑"},
+      {u8"師", u8"师"}, {u8"團", u8"团"}, {u8"軍", u8"军"}, {u8"陣", u8"阵"},
+      {u8"隱", u8"隐"}, {u8"顯", u8"显"}, {u8"驚", u8"惊"}, {u8"嚇", u8"吓"},
+      {u8"擊", u8"击"}, {u8"滅", u8"灭"}, {u8"毀", u8"毁"}, {u8"壞", u8"坏"},
+      {u8"裝", u8"装"}, {u8"備", u8"备"}, {u8"補", u8"补"}, {u8"給", u8"给"},
+      {u8"統", u8"统"}, {u8"計", u8"计"}, {u8"設", u8"设"}, {u8"備", u8"备"},
+      {u8"醫", u8"医"}, {u8"療", u8"疗"}, {u8"藥", u8"药"}, {u8"傷", u8"伤"},
+      {u8"殘", u8"残"}, {u8"獨", u8"独"}, {u8"特", u8"特"}, {u8"種", u8"种"},
+      {u8"類", u8"类"}, {u8"別", u8"别"}, {u8"複", u8"复"}, {u8"雜", u8"杂"},
+      {u8"簡", u8"简"}, {u8"單", u8"单"}, {u8"雙", u8"双"}, {u8"隻", u8"只"},
+      {u8"條", u8"条"}, {u8"萬", u8"万"}, {u8"億", u8"亿"}, {u8"與", u8"与"},
+      {u8"為", u8"为"}, {u8"無", u8"无"}, {u8"開", u8"开"}, {u8"關", u8"关"},
+      {u8"門", u8"门"}, {u8"間", u8"间"}, {u8"問", u8"问"}, {u8"題", u8"题"},
+      {u8"頭", u8"头"}, {u8"顏", u8"颜"}, {u8"體", u8"体"}, {u8"動", u8"动"},
+      {u8"員", u8"员"}, {u8"帥", u8"帅"}, {u8"師", u8"师"}, {u8"隊", u8"队"},
+      {u8"戰", u8"战"}, {u8"鬥", u8"斗"}, {u8"爭", u8"争"}, {u8"勝", u8"胜"},
+      {u8"敗", u8"败"}, {u8"敵", u8"敌"}, {u8"擊", u8"击"}, {u8"殺", u8"杀"},
+      {u8"斬", u8"斩"}, {u8"首", u8"首"}, {u8"級", u8"级"}, {u8"階", u8"阶"},
+      {u8"層", u8"层"}, {u8"級", u8"级"}, {u8"極", u8"极"}, {u8"端", u8"端"},
+      {u8"終", u8"终"}, {u8"結", u8"结"}, {u8"構", u8"构"}, {u8"築", u8"筑"},
+      {u8"牆", u8"墙"}, {u8"圍", u8"围"}, {u8"欄", u8"栏"}, {u8"桿", u8"杆"},
+      {u8"標", u8"标"}, {u8"槍", u8"枪"}, {u8"彈", u8"弹"}, {u8"藥", u8"药"},
+      {u8"炸", u8"炸"}, {u8"彈", u8"弹"}, {u8"轟", u8"轰"}, {u8"爆", u8"爆"},
+      {u8"雷", u8"雷"}, {u8"達", u8"达"}, {u8"碟", u8"碟"}, {u8"氣", u8"气"},
+      {u8"球", u8"球"}, {u8"飛", u8"飞"}, {u8"機", u8"机"}, {u8"無", u8"无"},
+      {u8"人", u8"人"}, {u8"防", u8"防"}, {u8"禦", u8"御"}, {u8"點", u8"点"},
+  };
+  for (const auto& p : kFold) {
+    if (std::strcmp(p.from, p.to) == 0) continue;
+    const size_t from_n = std::strlen(p.from);
+    const size_t to_n = std::strlen(p.to);
+    for (;;) {
+      const size_t pos = s->find(p.from);
+      if (pos == std::string::npos) break;
+      s->replace(pos, from_n, p.to, to_n);
+    }
+  }
+}
+
+static std::string simplify_zh_display(const char* u8) {
+  if (!u8 || !u8[0]) return {};
+  bool wide = false;
+  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(u8); *p; ++p) {
+    if (*p >= 0x80) {
+      wide = true;
+      break;
+    }
+  }
+  std::string out = u8;
+  if (wide) {
+    const int wn = MultiByteToWideChar(CP_UTF8, 0, u8, -1, nullptr, 0);
+    if (wn > 1) {
+      std::wstring w((size_t)wn, L'\0');
+      MultiByteToWideChar(CP_UTF8, 0, u8, -1, &w[0], wn);
+      const int sn = LCMapStringW(0x0804, LCMAP_SIMPLIFIED_CHINESE, w.c_str(), -1, nullptr, 0);
+      if (sn > 1) {
+        std::wstring sim((size_t)sn, L'\0');
+        LCMapStringW(0x0804, LCMAP_SIMPLIFIED_CHINESE, w.c_str(), -1, &sim[0], sn);
+        const int un = WideCharToMultiByte(CP_UTF8, 0, sim.c_str(), -1, nullptr, 0, nullptr,
+                                            nullptr);
+        if (un > 1) {
+          out.assign((size_t)un, '\0');
+          WideCharToMultiByte(CP_UTF8, 0, sim.c_str(), -1, &out[0], un, nullptr, nullptr);
+          if (!out.empty() && out.back() == '\0') out.pop_back();
+        }
+      }
+    }
+    fold_trad_glyphs(&out);
+  }
+  return out;
+}
+
 const char* lookup_zh_name(const char* type_id) {
   if (!type_id || !type_id[0]) return nullptr;
   ensure_unit_names_cs();
@@ -385,7 +489,7 @@ const char* lookup_zh_name(const char* type_id) {
     LeaveCriticalSection(&g_unit_names_cs);
     return nullptr;
   }
-  tls = it->second;
+  tls = simplify_zh_display(it->second.c_str());
   LeaveCriticalSection(&g_unit_names_cs);
   return tls.c_str();
 }
@@ -1477,6 +1581,18 @@ static std::map<uint32_t, EntIdent> g_ent_ident;
 
 // Stable TypeId per template pointer (resolver can otherwise jitter).
 static std::map<uint32_t, std::string> g_tpl_type_cache;
+static CRITICAL_SECTION g_tpl_cs;
+static volatile LONG g_tpl_cs_state = 0;  // 0 uninit, 1 initializing, 2 ready
+
+static void ensure_tpl_cs() {
+  const LONG s = InterlockedCompareExchange(&g_tpl_cs_state, 1, 0);
+  if (s == 0) {
+    InitializeCriticalSection(&g_tpl_cs);
+    InterlockedExchange(&g_tpl_cs_state, 2);
+    return;
+  }
+  while (g_tpl_cs_state != 2) Sleep(0);
+}
 
 struct LiveEnt {
   uint32_t owner = 0;
@@ -1498,6 +1614,15 @@ struct FacCache {
 static FacCache g_fac_cache[16] = {};
 static int g_fac_cache_n = 0;
 
+// Players who have actually fought this match. Kept after defeat, when the
+// game drops them from the active count or flags them as observers.
+struct SeenSeat {
+  uint32_t player = 0;
+  PlayerEconomy last{};
+};
+static SeenSeat g_seen[kMaxEconPlayers] = {};
+static int g_seen_n = 0;
+
 static void clear_live_ents() {
   if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
   g_live.clear();
@@ -1515,10 +1640,15 @@ static void clear_roster_caches() {
   g_logic_list_off = 0;
   g_logic_off_n = 0;
   g_logic_refresh = 0;
+  ensure_tpl_cs();
+  EnterCriticalSection(&g_tpl_cs);
   g_tpl_type_cache.clear();
+  LeaveCriticalSection(&g_tpl_cs);
   g_ent_ident.clear();
   g_fac_cache_n = 0;
+  g_seen_n = 0;
   std::memset(g_fac_cache, 0, sizeof(g_fac_cache));
+  std::memset(g_seen, 0, sizeof(g_seen));
   std::memset(g_ent_vec_offs, 0, sizeof(g_ent_vec_offs));
   std::memset(g_player_vec_cache, 0, sizeof(g_player_vec_cache));
   std::memset(g_roster_order, 0, sizeof(g_roster_order));
@@ -1771,7 +1901,10 @@ static bool catalog_id_at(uint32_t addr, char* out, size_t out_len) {
   while (n < (int)sizeof(tmp) - 1 && tmp[n]) ++n;
   if (n < 4 || n > 80) return false;
   tmp[n] = 0;
-  if (!lookup_zh_name(tmp)) return false;
+  const bool naval_miner = _strnicmp(tmp, "JapanMiner", 10) == 0 ||
+                           _strnicmp(tmp, "SovietMiner", 11) == 0;
+  if (naval_miner && has_bad_typeid_token(tmp)) return false;
+  if (!lookup_zh_name(tmp) && !naval_miner) return false;
   std::snprintf(out, out_len, "%s", tmp);
   return true;
 }
@@ -1779,14 +1912,30 @@ static bool catalog_id_at(uint32_t addr, char* out, size_t out_len) {
 // The template's own GameObject id is the nearest catalog string.
 // Nested weapon / spawn names sit further out and were being picked before,
 // which labeled a unit as another faction.
+static bool tpl_cached_reject(uint32_t unit_data) {
+  if (!is_ptr(unit_data) || g_tpl_cs_state != 2) return false;
+  EnterCriticalSection(&g_tpl_cs);
+  auto it = g_tpl_type_cache.find(unit_data);
+  const bool reject = it != g_tpl_type_cache.end() && (it->second.empty() || it->second == "-");
+  LeaveCriticalSection(&g_tpl_cs);
+  return reject;
+}
+
 static bool resolve_primary_catalog_id(uint32_t unit_data, char* out, size_t out_len) {
   if (!is_ptr(unit_data) || !out || out_len < 2) return false;
+  ensure_tpl_cs();
+  EnterCriticalSection(&g_tpl_cs);
   auto it = g_tpl_type_cache.find(unit_data);
   if (it != g_tpl_type_cache.end()) {
-    if (it->second.empty() || it->second == "-") return false;
+    if (it->second.empty() || it->second == "-") {
+      LeaveCriticalSection(&g_tpl_cs);
+      return false;
+    }
     std::snprintf(out, out_len, "%s", it->second.c_str());
+    LeaveCriticalSection(&g_tpl_cs);
     return lookup_zh_name(out) != nullptr;
   }
+  LeaveCriticalSection(&g_tpl_cs);
   char best[96] = {};
   for (uint32_t off = 0; off <= 0x180 && !best[0]; off += 4) {
     if (catalog_id_at(unit_data + off, best, sizeof(best))) break;
@@ -1796,11 +1945,15 @@ static bool resolve_primary_catalog_id(uint32_t unit_data, char* out, size_t out
     uint32_t p2 = 0;
     if (safe_read_u32(p, &p2) && is_ptr(p2)) catalog_id_at(p2, best, sizeof(best));
   }
+  ensure_tpl_cs();
+  EnterCriticalSection(&g_tpl_cs);
   if (!best[0] || should_hide_roster_type(best)) {
     if (best[0]) g_tpl_type_cache[unit_data] = "-";
+    LeaveCriticalSection(&g_tpl_cs);
     return false;
   }
   g_tpl_type_cache[unit_data] = best;
+  LeaveCriticalSection(&g_tpl_cs);
   std::snprintf(out, out_len, "%s", best);
   return true;
 }
@@ -1993,14 +2146,31 @@ static void publish_live_roster(MatchEconomy* out) {
   if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
   pending.swap(g_pending);
   if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
+  // A 6-player battle spawns far more projectiles than units. Classify a
+  // bounded batch per refresh so the render thread cannot stall the match.
+  constexpr size_t kBatch = 64;
+  std::vector<uint32_t> later;
+  if (pending.size() > kBatch) {
+    later.assign(pending.begin() + kBatch, pending.end());
+    pending.resize(kBatch);
+  }
   std::vector<uint32_t> again;
   for (uint32_t ent : pending) {
-    if (note_live_ent(ent, 0) == LiveNote::kRetry && again.size() < 8192) again.push_back(ent);
+    if (note_live_ent(ent, 0) == LiveNote::kRetry && again.size() < 24) again.push_back(ent);
   }
-  if (!again.empty()) {
+  if (!later.empty() || !again.empty()) {
     if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
-    if (g_pending.size() < 8192) {
-      g_pending.insert(g_pending.end(), again.begin(), again.end());
+    if (g_pending.size() < 512) {
+      const size_t room = 512 - g_pending.size();
+      size_t n = later.size();
+      if (n > room) n = room;
+      g_pending.insert(g_pending.end(), later.begin(), later.begin() + n);
+    }
+    if (g_pending.size() < 512) {
+      const size_t room = 512 - g_pending.size();
+      size_t n = again.size();
+      if (n > room) n = room;
+      g_pending.insert(g_pending.end(), again.begin(), again.begin() + n);
     }
     if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
   }
@@ -2049,8 +2219,11 @@ static uint32_t __cdecl hk_create_unit(uint32_t a0, uint32_t tmpl, uint32_t pos,
 static uint32_t __cdecl hk_spawn_object(void* req) {
   uint32_t ent = g_orig_spawn ? g_orig_spawn(req) : 0;
   if (is_ptr(ent)) {
+    uint32_t unit_data = 0;
+    safe_read_u32(ent + 4, &unit_data);
+    if (tpl_cached_reject(unit_data)) return ent;
     if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
-    if (g_pending.size() < 8192) g_pending.push_back(ent);
+    if (g_pending.size() < 512) g_pending.push_back(ent);
     if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
   }
   return ent;
@@ -2123,6 +2296,10 @@ static void fill_all_rosters(MatchEconomy* out) {
   // One scan when the match starts (units already on the field never hit the
   // create hook). After that, only CreateUnit / Destroy change the roster.
   if (!g_live_seeded) {
+  if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
+  g_live.clear();
+  g_pending.clear();
+  if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
   g_live_scan_tick = 0;
 
   constexpr uint32_t kGameLogicRva = 0x8DDE84;  // VA 0xCDDE84
@@ -2210,19 +2387,44 @@ static void fill_all_rosters(MatchEconomy* out) {
   publish_live_roster(out);
 }
 
-// +0x106 / +0x123C are set for observer and replay-observer seats.
-// A combat seat that has not spawned yet also has no units and no score.
-static bool seat_entered_battle(const PlayerEconomy& pe) {
-  uint8_t observer = 0, replay = 0;
-  if (!is_ptr(pe.player) || !safe_read_bytes(pe.player + 0x106, &observer, 1) ||
-      !safe_read_bytes(pe.player + 0x123C, &replay, 1)) {
-    return false;
-  }
-  if (observer != 0 || replay != 0) return false;
+static bool seat_has_record(const PlayerEconomy& pe) {
   if (pe.unit_total > 0 || pe.building_total > 0) return true;
   if (pe.units_built || pe.units_lost || pe.units_destroyed) return true;
   if (pe.buildings_built || pe.buildings_lost || pe.buildings_destroyed) return true;
+  if (pe.money_earned || pe.money_spent) return true;
   return false;
+}
+
+static int find_seen_seat(uint32_t player) {
+  if (!player) return -1;
+  for (int i = 0; i < g_seen_n; ++i) {
+    if (g_seen[i].player == player) return i;
+  }
+  return -1;
+}
+
+// +0x106 / +0x123C are set for spectators. Defeat uses the same bytes, so a
+// seat that already has a score stays visible instead of disappearing.
+static bool seat_entered_battle(const PlayerEconomy& pe) {
+  if (!is_ptr(pe.player)) return false;
+  const bool record = seat_has_record(pe);
+  uint8_t observer = 0, replay = 0;
+  if (!safe_read_bytes(pe.player + 0x106, &observer, 1) ||
+      !safe_read_bytes(pe.player + 0x123C, &replay, 1)) {
+    return false;
+  }
+  if ((observer != 0 || replay != 0) && !record) return false;
+  return record;
+}
+
+static void mark_defeated_flag(PlayerEconomy* pe) {
+  if (!pe || !is_ptr(pe->player)) return;
+  uint8_t observer = 0, replay = 0;
+  if (!safe_read_bytes(pe->player + 0x106, &observer, 1) ||
+      !safe_read_bytes(pe->player + 0x123C, &replay, 1)) {
+    return;
+  }
+  if (observer != 0 || replay != 0) pe->defeated = true;
 }
 
 static int faction_of_key(const char* key) {
@@ -2268,12 +2470,31 @@ static int detect_faction(const PlayerEconomy& pe) {
   return best;
 }
 
-static int remember_faction(uint32_t player, int detected) {
+static int anchor_count_for(const PlayerEconomy& pe, int faction) {
+  int n = 0;
+  if (faction <= 0) return 0;
+  for (int i = 0; i < pe.roster_count; ++i) {
+    if (faction_of_key(pe.roster[i].key) != faction) continue;
+    if (!faction_anchor_key(pe.roster[i].key)) continue;
+    if (pe.roster[i].count > 0) n += pe.roster[i].count;
+  }
+  return n;
+}
+
+static int remember_faction(uint32_t player, const PlayerEconomy& pe, int detected) {
   for (int i = 0; i < g_fac_cache_n; ++i) {
     if (g_fac_cache[i].player != player) continue;
-    if (g_fac_cache[i].faction) return g_fac_cache[i].faction;
-    g_fac_cache[i].faction = detected;
-    return detected;
+    if (!g_fac_cache[i].faction) {
+      g_fac_cache[i].faction = detected;
+      return detected;
+    }
+    // A new match reuses the same Player*. Replace the label when this
+    // seat's own anchors (MCV / yard / barracks) now belong to another side.
+    if (detected && detected != g_fac_cache[i].faction &&
+        anchor_count_for(pe, detected) > anchor_count_for(pe, g_fac_cache[i].faction)) {
+      g_fac_cache[i].faction = detected;
+    }
+    return g_fac_cache[i].faction ? g_fac_cache[i].faction : detected;
   }
   if (g_fac_cache_n < 16) {
     g_fac_cache[g_fac_cache_n].player = player;
@@ -2287,10 +2508,34 @@ static void apply_seat_labels(MatchEconomy* out) {
   if (!out) return;
   for (int i = 0; i < out->player_count; ++i) {
     PlayerEconomy& pe = out->players[i];
-    const int faction = remember_faction(pe.player, detect_faction(pe));
+    const int faction = remember_faction(pe.player, pe, detect_faction(pe));
     const char* fac = faction == 1 ? u8"盟军" : faction == 2 ? u8"苏联" : faction == 3 ? u8"帝国" : u8"玩家";
     std::snprintf(pe.name, sizeof(pe.name), "%s", fac);
   }
+}
+
+// GameLogic+0x148. 1/2/4 are live matches; 6/7 are replay variants of those.
+// 9 is the freshly constructed / shell value. Anything else is not a battle.
+static uint32_t g_battle_logic = 0;
+static float g_battle_seconds = -1.f;
+
+static bool read_battle_clock(uint32_t* logic_out, float* seconds_out) {
+  if (logic_out) *logic_out = 0;
+  if (seconds_out) *seconds_out = 0.f;
+  uint32_t logic = 0;
+  if (!safe_read_u32(module_base() + 0x8DDE84, &logic) || !is_ptr(logic)) return false;
+  uint32_t mode = 0;
+  if (!safe_read_u32(logic + 0x148, &mode)) return false;
+  const bool active = mode == 1 || mode == 2 || mode == 4 || mode == 6 || mode == 7;
+  if (!active) return false;
+  uint32_t ticks = 0;
+  float secs = 0.f;
+  if (safe_read_u32(logic + 0x50, &ticks) && ticks < 15u * 6u * 3600u) {
+    secs = (float)ticks / 15.f;
+  }
+  if (logic_out) *logic_out = logic;
+  if (seconds_out) *seconds_out = secs;
+  return true;
 }
 
 bool collect_match_economy_impl(MatchEconomy* out) {
@@ -2303,11 +2548,22 @@ bool collect_match_economy_impl(MatchEconomy* out) {
 
   out->spectator = is_spectator();
 
-  uint32_t logic = 0, ticks = 0;
-  if (safe_read_u32(module_base() + 0x8DDE84, &logic) && is_ptr(logic) &&
-      safe_read_u32(logic + 0x50, &ticks)) {
-    out->match_seconds = (float)ticks / 15.f;
+  uint32_t battle_logic = 0;
+  float battle_seconds = 0.f;
+  if (!read_battle_clock(&battle_logic, &battle_seconds)) {
+    clear_roster_caches();
+    g_battle_logic = 0;
+    g_battle_seconds = -1.f;
+    std::snprintf(out->note, sizeof(out->note), u8"未进入对局");
+    return false;
   }
+  if (battle_logic != g_battle_logic ||
+      (g_battle_seconds >= 0.f && battle_seconds + 2.f < g_battle_seconds)) {
+    clear_roster_caches();
+  }
+  g_battle_logic = battle_logic;
+  g_battle_seconds = battle_seconds;
+  out->match_seconds = battle_seconds;
 
   uint32_t list = 0;
   if (!safe_read_u32(module_base() + kLocalPlayerRva, &list) || !is_ptr(list)) {
@@ -2320,24 +2576,27 @@ bool collect_match_economy_impl(MatchEconomy* out) {
   safe_read_u32(list + kPlayerListLocalOff, &local);
   if (!is_ptr(local)) local = local_owner_for_ops();
 
-  int count = (int)kPlayerListSlots;
-  uint32_t listed = 0;
-  if (safe_read_u32(list + kPlayerListCountOff, &listed) && listed > 0 &&
-      listed <= kPlayerListSlots) {
-    count = (int)listed;
-  }
-
-  for (int i = 0; i < count && out->player_count < kMaxEconPlayers; ++i) {
+  // Walk every slot. The active count shrinks when someone is defeated, but
+  // that player's object is still in the array and should stay on the board.
+  for (int i = 0; i < (int)kPlayerListSlots && out->player_count < kMaxEconPlayers; ++i) {
     uint32_t player = 0;
     if (!safe_read_u32(list + kPlayerListArrayOff + (uint32_t)i * 4u, &player)) continue;
     if (!is_ptr(player)) continue;
+    bool dup = false;
+    for (int j = 0; j < out->player_count; ++j) {
+      if (out->players[j].player == player) {
+        dup = true;
+        break;
+      }
+    }
+    if (dup) continue;
     PlayerEconomy pe{};
     fill_player_economy_basic(&pe, player, local);
     // Player index 0 is the neutral/civilian seat (oil derricks, map props).
     // It has a money object, so it would otherwise show up as “玩家 #0”.
     if (!pe.is_local && pe.player_id == 0) continue;
-    // Keep seats with readable economy (roster filled in a second pass).
-    if (!pe.has_money && !pe.has_power && !pe.is_local) continue;
+    const bool seen = find_seen_seat(player) >= 0;
+    if (!pe.has_money && !pe.has_power && !pe.has_score && !pe.is_local && !seen) continue;
     out->players[out->player_count++] = pe;
   }
 
@@ -2350,18 +2609,63 @@ bool collect_match_economy_impl(MatchEconomy* out) {
   // Unit/building tallies for every seat (incl. other players).
   fill_all_rosters(out);
 
-  // Drop observers and seats that have not actually entered the battle.
+  // Drop spectators and seats that have not entered. Keep anyone already
+  // shown this match, including after defeat.
   {
     int kept = 0;
     for (int i = 0; i < out->player_count; ++i) {
-      if (!seat_entered_battle(out->players[i])) continue;
-      if (kept != i) out->players[kept] = out->players[i];
+      PlayerEconomy& pe = out->players[i];
+      const int seen_i = find_seen_seat(pe.player);
+      if (!seat_entered_battle(pe) && seen_i < 0) continue;
+      mark_defeated_flag(&pe);
+      if (seen_i >= 0 && !seat_has_record(pe) && seat_has_record(g_seen[seen_i].last)) {
+        PlayerEconomy snap = g_seen[seen_i].last;
+        snap.defeated = true;
+        snap.is_local = pe.is_local;
+        if (pe.has_color) {
+          snap.has_color = true;
+          snap.color_r = pe.color_r;
+          snap.color_g = pe.color_g;
+          snap.color_b = pe.color_b;
+        }
+        snap.roster_count = 0;
+        snap.unit_total = 0;
+        snap.building_total = 0;
+        pe = snap;
+      }
+      if (kept != i) out->players[kept] = pe;
       ++kept;
     }
     out->player_count = kept;
   }
 
   apply_seat_labels(out);
+
+  {
+    bool present[kMaxEconPlayers] = {};
+    for (int i = 0; i < out->player_count; ++i) {
+      PlayerEconomy& pe = out->players[i];
+      int seen_i = find_seen_seat(pe.player);
+      if (seen_i < 0 && g_seen_n < kMaxEconPlayers &&
+          (seat_entered_battle(pe) || pe.defeated)) {
+        seen_i = g_seen_n++;
+        g_seen[seen_i].player = pe.player;
+      }
+      if (seen_i >= 0) {
+        present[seen_i] = true;
+        g_seen[seen_i].last = pe;
+      }
+    }
+    for (int s = 0; s < g_seen_n && out->player_count < kMaxEconPlayers; ++s) {
+      if (present[s]) continue;
+      PlayerEconomy snap = g_seen[s].last;
+      snap.defeated = true;
+      snap.roster_count = 0;
+      snap.unit_total = 0;
+      snap.building_total = 0;
+      out->players[out->player_count++] = snap;
+    }
+  }
 
   // Stable order: local first, then player_id, then pointer. Never sort by money.
   auto seat_less = [](const PlayerEconomy& a, const PlayerEconomy& b) {
@@ -2431,11 +2735,720 @@ static bool apply_money_delta(uint32_t player, int delta, std::string* out_msg) 
   return true;
 }
 
+// Player production lock. Script "player cannot build from an object type"
+// inserts the template into the disabled-type list at player+0x200
+// (0x883AA0) and removes it again (0x87FF80). Both refresh the command bar.
+constexpr uint32_t kFnBuildEnable = 0x0087FF80;
+constexpr uint32_t kFnBuildDisable = 0x00883AA0;
+constexpr uint32_t kThingFactoryRva = 0x008EBDE8;
+
+struct BuildTpl {
+  uint32_t ptrs[6] = {};
+  int ptr_n = 0;
+  char id[96] = {};
+  char name[64] = {};
+  bool building = false;
+};
+
+struct BuildBan {
+  char id[96] = {};
+  char name[64] = {};
+  bool building = false;
+  uint32_t tmpls[6] = {};
+  int tmpl_n = 0;
+  uint32_t applied[kMaxEconPlayers] = {};
+  int applied_n = 0;
+};
+
+static std::vector<BuildTpl> g_build_catalog;
+static std::vector<BuildBan> g_build_bans;
+static DWORD g_build_lock_tick = 0;
+static bool g_build_catalog_ready = false;
+static uint32_t g_lock_battle_logic = 0;
+static float g_lock_battle_seconds = -1.f;
+static bool g_sw_toggle_latched = false;
+static int g_lock_tick_depth = 0;
+static bool g_lock_syncing = false;
+static void sync_disable_superweapon_toggle();
+
+static bool thiscall_build_lock(uint32_t player, uint32_t tmpl, bool locked) {
+  if (!is_ptr(player) || !is_ptr(tmpl) || !module_base()) return false;
+  const uint32_t fn =
+      module_base() + ((locked ? kFnBuildDisable : kFnBuildEnable) - kModBase);
+  __try {
+    __asm {
+      mov ecx, player
+      push tmpl
+      mov eax, fn
+      call eax
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+  return true;
+}
+
+static bool contains_ic(const char* hay, const char* needle) {
+  if (!hay || !needle || !needle[0]) return false;
+  const size_t n = std::strlen(needle);
+  for (const char* p = hay; *p; ++p) {
+    if (_strnicmp(p, needle, n) == 0) return true;
+  }
+  return false;
+}
+
+static bool build_lock_skip_name(const char* name) {
+  if (!name || !name[0]) return false;
+  static const char* kNames[] = {
+      u8"磁暴坦克", u8"磁爆坦克", u8"雷达碟", u8"斩首中队",
+      u8"气球炸弹", u8"点防御无人机", u8"建造工厂", u8"建造场", u8"建筑工厂",
+      u8"前哨战", u8"战斗碉堡"};
+  for (const char* s : kNames) {
+    if (std::strcmp(name, s) == 0) return true;
+  }
+  return false;
+}
+
+static bool build_lock_skip_id(const char* id) {
+  if (!id || !id[0]) return true;
+  if (should_hide_roster_type(id)) return true;
+  if (contains_ic(id, "RadarDish") || contains_ic(id, "BalloonBomb") ||
+      contains_ic(id, "FinalSquadron") || contains_ic(id, "PointDefense") ||
+      contains_ic(id, "AntiVehicleVehicleTech2") || contains_ic(id, "ConYard") ||
+      contains_ic(id, "ConstructionYard") || contains_ic(id, "EconomicStructure") ||
+      _strnicmp(id, "AlliedOutpost", 12) == 0 || _strnicmp(id, "SovietBunker", 12) == 0) {
+    return true;
+  }
+  static const char* kSkip[] = {
+      "Projectile", "Missile", "Husk", "Debris", "Dummy", "OCL",
+      "Parachute", "Revealer", "Indicator", "Wreck", "Fragment",
+      "Decal", "Cinematic", "Splash", "Pilot", "Eject", "Crate",
+      "Create", "Hole", "Nugget", "Locomotor", "Behavior", "Unpacked",
+      "Packing", "Scaffold", "Rubble", "UnderConstruction"};
+  for (const char* s : kSkip) {
+    if (contains_ic(id, s)) return true;
+  }
+  if (const char* zh = lookup_zh_name(id)) {
+    if (build_lock_skip_name(zh)) return true;
+  }
+  const bool faction = _strnicmp(id, "Allied", 6) == 0 ||
+                       _strnicmp(id, "Soviet", 6) == 0 ||
+                       _strnicmp(id, "Japan", 5) == 0;
+  return !faction && !type_id_is_building(id);
+}
+
+static void build_tpl_add_ptr(BuildTpl* row, uint32_t tmpl) {
+  if (!row || !is_ptr(tmpl) || row->ptr_n >= 6) return;
+  for (int i = 0; i < row->ptr_n; ++i) {
+    if (row->ptrs[i] == tmpl) return;
+  }
+  row->ptrs[row->ptr_n++] = tmpl;
+}
+
+static void copy_tpl_ptrs(BuildBan* ban, const BuildTpl& row) {
+  if (!ban) return;
+  for (int i = 0; i < row.ptr_n && ban->tmpl_n < 6; ++i) {
+    bool dup = false;
+    for (int k = 0; k < ban->tmpl_n; ++k) {
+      if (ban->tmpls[k] == row.ptrs[i]) dup = true;
+    }
+    if (!dup) ban->tmpls[ban->tmpl_n++] = row.ptrs[i];
+  }
+}
+
+static bool template_name_hint(uint32_t tmpl) {
+  char tmp[72] = {};
+  auto hit = [](const char* s) {
+    if (!s || std::strlen(s) < 4) return false;
+    static const char* kHint[] = {
+        "Allied", "Soviet", "Japan", "Tech", "Yard", "Factory", "Barracks",
+        "Plant", "Defense", "Wall", "Crane", "Hospital", "Garage", "Airport",
+        "Ore", "Oil", "Bunker", "Super", "Nano", "Chrono", "Proton", "Iron",
+        "Vacuum", "Psionic", "MCV", "Radar", "Balloon"};
+    for (const char* h : kHint) {
+      if (contains_ic(s, h)) return true;
+    }
+    return false;
+  };
+  for (uint32_t off = 0; off <= 0x90; off += 4) {
+    if (safe_read_bytes(tmpl + off, tmp, 64)) {
+      tmp[63] = 0;
+      if (hit(tmp)) return true;
+    }
+    uint32_t p = 0;
+    if (safe_read_u32(tmpl + off, &p) && is_ptr(p) && safe_read_bytes(p, tmp, 48)) {
+      tmp[47] = 0;
+      if (hit(tmp)) return true;
+    }
+  }
+  return false;
+}
+
+static int build_faction_rank(const char* id) {
+  if (!id) return 9;
+  if (_strnicmp(id, "Allied", 6) == 0) return 0;
+  if (_strnicmp(id, "Soviet", 6) == 0) return 1;
+  if (_strnicmp(id, "Japan", 5) == 0) return 2;
+  return 3;
+}
+
+static void rebuild_build_catalog() {
+  g_build_catalog.clear();
+  g_build_catalog_ready = false;
+  if (!module_base()) return;
+  uint32_t factory = 0;
+  if (!safe_read_u32(module_base() + kThingFactoryRva, &factory) || !is_ptr(factory)) {
+    return;
+  }
+  uint32_t tmpl = 0;
+  if (!safe_read_u32(factory + 0x24, &tmpl) || !is_ptr(tmpl)) return;
+  g_build_catalog_ready = true;
+  for (int n = 0; n < 4096 && is_ptr(tmpl); ++n) {
+    uint32_t vt = 0;
+    if (!safe_read_u32(tmpl, &vt) || !is_ptr(vt)) break;
+    char id[96] = {};
+    if (template_name_hint(tmpl) &&
+        resolve_primary_catalog_id(tmpl, id, sizeof(id)) && !build_lock_skip_id(id)) {
+      int found = -1;
+      for (int i = 0; i < (int)g_build_catalog.size(); ++i) {
+        if (std::strcmp(g_build_catalog[i].id, id) == 0) {
+          found = i;
+          break;
+        }
+      }
+      if (found < 0) {
+        BuildTpl row{};
+        std::snprintf(row.id, sizeof(row.id), "%s", id);
+        if (const char* zh = lookup_zh_name(id)) {
+          std::snprintf(row.name, sizeof(row.name), "%s", zh);
+        } else {
+          std::snprintf(row.name, sizeof(row.name), "%s", id);
+        }
+        row.building = type_id_is_building(id);
+        build_tpl_add_ptr(&row, tmpl);
+        g_build_catalog.push_back(row);
+      } else {
+        build_tpl_add_ptr(&g_build_catalog[found], tmpl);
+      }
+    }
+    uint32_t next = 0;
+    if (!safe_read_u32(tmpl + 0xC, &next) || next == tmpl) break;
+    tmpl = next;
+  }
+  std::sort(g_build_catalog.begin(), g_build_catalog.end(),
+            [](const BuildTpl& a, const BuildTpl& b) {
+              const int fa = build_faction_rank(a.id);
+              const int fb = build_faction_rank(b.id);
+              if (fa != fb) return fa < fb;
+              if (a.building != b.building) return !a.building;
+              return std::strcmp(a.name, b.name) < 0;
+            });
+  for (BuildBan& ban : g_build_bans) {
+    ban.tmpl_n = 0;
+    for (const BuildTpl& row : g_build_catalog) {
+      if (std::strcmp(row.id, ban.id) != 0) continue;
+      copy_tpl_ptrs(&ban, row);
+      if (!ban.name[0]) std::snprintf(ban.name, sizeof(ban.name), "%s", row.name);
+      ban.building = row.building;
+    }
+  }
+}
+
+static void ensure_build_catalog() {
+  if (!g_build_catalog_ready) rebuild_build_catalog();
+}
+
+static void collect_lock_players(uint32_t* out, int* n) {
+  *n = 0;
+  if (!read_battle_clock(nullptr, nullptr)) return;
+  uint32_t list = 0;
+  if (!safe_read_u32(module_base() + kLocalPlayerRva, &list) || !is_ptr(list)) return;
+  for (int i = 0; i < (int)kPlayerListSlots && *n < kMaxEconPlayers; ++i) {
+    uint32_t player = 0;
+    if (!safe_read_u32(list + kPlayerListArrayOff + (uint32_t)i * 4u, &player) ||
+        !is_ptr(player)) {
+      continue;
+    }
+    uint32_t pid = 0;
+    safe_read_u32(player + 0x20, &pid);
+    if (pid == 0) continue;
+    bool dup = false;
+    for (int k = 0; k < *n; ++k) {
+      if (out[k] == player) dup = true;
+    }
+    if (!dup) out[(*n)++] = player;
+  }
+}
+
+static BuildBan* find_build_ban(const char* id) {
+  if (!id || !id[0]) return nullptr;
+  for (BuildBan& ban : g_build_bans) {
+    if (std::strcmp(ban.id, id) == 0) return &ban;
+  }
+  return nullptr;
+}
+
+static void apply_ban_to_players(BuildBan* ban, const uint32_t* players, int pn) {
+  if (!ban || ban->tmpl_n <= 0 || pn <= 0) return;
+  int kept = 0;
+  for (int i = 0; i < ban->applied_n; ++i) {
+    bool live = false;
+    for (int p = 0; p < pn; ++p) {
+      if (players[p] == ban->applied[i]) live = true;
+    }
+    if (live) ban->applied[kept++] = ban->applied[i];
+  }
+  ban->applied_n = kept;
+  for (int p = 0; p < pn; ++p) {
+    bool done = false;
+    for (int i = 0; i < ban->applied_n; ++i) {
+      if (ban->applied[i] == players[p]) done = true;
+    }
+    if (done) continue;
+    bool any = false;
+    for (int t = 0; t < ban->tmpl_n; ++t) {
+      if (thiscall_build_lock(players[p], ban->tmpls[t], true)) any = true;
+    }
+    if (any && ban->applied_n < kMaxEconPlayers) {
+      ban->applied[ban->applied_n++] = players[p];
+    }
+  }
+}
+
+static void forget_lock_targets() {
+  g_build_catalog_ready = false;
+  for (BuildBan& ban : g_build_bans) {
+    ban.applied_n = 0;
+    ban.tmpl_n = 0;
+  }
+  ensure_tpl_cs();
+  EnterCriticalSection(&g_tpl_cs);
+  g_tpl_type_cache.clear();
+  LeaveCriticalSection(&g_tpl_cs);
+}
+
+static void build_lock_tick_impl() {
+  if (g_lock_tick_depth) return;
+  const DWORD now = GetTickCount();
+  if (g_build_lock_tick != 0 && now - g_build_lock_tick < 400) return;
+  g_build_lock_tick = now;
+  ++g_lock_tick_depth;
+  uint32_t battle_logic = 0;
+  float battle_seconds = 0.f;
+  const bool in_battle = read_battle_clock(&battle_logic, &battle_seconds);
+  if (!in_battle) {
+    if (g_lock_battle_logic != 0 || g_lock_battle_seconds >= 0.f) {
+      for (BuildBan& ban : g_build_bans) {
+        ban.applied_n = 0;
+        ban.tmpl_n = 0;
+      }
+      g_build_catalog_ready = false;
+    }
+    g_lock_battle_logic = 0;
+    g_lock_battle_seconds = -1.f;
+  } else {
+    const bool restarted = battle_logic != g_lock_battle_logic ||
+                           (g_lock_battle_seconds >= 0.f &&
+                            battle_seconds + 2.f < g_lock_battle_seconds);
+    if (restarted && (g_lock_battle_logic != 0 || g_lock_battle_seconds >= 0.f)) {
+      forget_lock_targets();
+    }
+    g_lock_battle_logic = battle_logic;
+    g_lock_battle_seconds = battle_seconds;
+  }
+  sync_disable_superweapon_toggle();
+  if (!g_build_bans.empty() && module_base() && in_battle) {
+    uint32_t players[kMaxEconPlayers] = {};
+    int pn = 0;
+    collect_lock_players(players, &pn);
+    if (pn == 0) {
+      for (BuildBan& ban : g_build_bans) ban.applied_n = 0;
+    } else {
+      ensure_build_catalog();
+      for (BuildBan& ban : g_build_bans) {
+        if (ban.tmpl_n <= 0) {
+          for (const BuildTpl& row : g_build_catalog) {
+            if (std::strcmp(row.id, ban.id) != 0) continue;
+            copy_tpl_ptrs(&ban, row);
+          }
+        }
+        apply_ban_to_players(&ban, players, pn);
+      }
+    }
+  }
+  --g_lock_tick_depth;
+}
+
+static bool starts_ic(const char* s, const char* prefix) {
+  return s && prefix && prefix[0] && _strnicmp(s, prefix, std::strlen(prefix)) == 0;
+}
+
+struct LockFace {
+  char group[96] = {};
+  char name[64] = {};
+  char icon_id[96] = {};
+  char icon_name[64] = {};
+  int pref = 0;
+  bool superweapon = false;
+  bool paired = false;
+};
+
+static void face_set(LockFace* o, const char* group, const char* name, const char* icon_id,
+                     const char* icon_name, int pref, bool sw, bool paired) {
+  if (!o) return;
+  std::snprintf(o->group, sizeof(o->group), "%s", group ? group : "");
+  std::snprintf(o->name, sizeof(o->name), "%s", name ? name : "");
+  std::snprintf(o->icon_id, sizeof(o->icon_id), "%s", icon_id ? icon_id : "");
+  std::snprintf(o->icon_name, sizeof(o->icon_name), "%s", icon_name ? icon_name : "");
+  o->pref = pref;
+  o->superweapon = sw;
+  o->paired = paired;
+}
+
+static bool is_superweapon_lock_id(const char* id) {
+  if (!id || !id[0]) return false;
+  if (contains_ic(id, "Timer")) return false;
+  return contains_ic(id, "Chronosphere") || contains_ic(id, "IronCurtain") ||
+         contains_ic(id, "ProtonCollider") || contains_ic(id, "VacuumImploder") ||
+         contains_ic(id, "PsionicDecimator") || contains_ic(id, "SuperWeapon");
+}
+
+static int dual_pref(const char* id) {
+  if (contains_ic(id, "Naval")) return 2;
+  if (contains_ic(id, "_Ground")) return 1;
+  return 0;
+}
+
+// Build-lock presentation only. Stats keep the raw lookup name.
+static void lock_face_of(const char* id, const char* fallback_name, LockFace* out) {
+  if (!out) return;
+  *out = LockFace{};
+  const char* fb = fallback_name && fallback_name[0] ? fallback_name : (id ? id : "");
+  face_set(out, id ? id : "", fb, id ? id : "", fb, 0, false, false);
+  if (!id || !id[0]) return;
+  const int fac = build_faction_rank(id);
+  const bool egg = contains_ic(id, "Egg");
+
+  if (is_superweapon_lock_id(id) && fac <= 2) {
+    const bool adv = contains_ic(id, "Advanced") || contains_ic(id, "ProtonCollider") ||
+                     contains_ic(id, "VacuumImploder") || contains_ic(id, "PsionicDecimator");
+    if (fac == 0) {
+      if (adv) {
+        face_set(out, "sw_al_proton", u8"质子撞击炮", "AlliedProtonCollider", u8"质子撞击炮",
+                 egg ? 1 : 0, true, false);
+      } else {
+        face_set(out, "sw_al_chrono", u8"超时空传送仪", "AlliedChronosphere", u8"超时空传送仪", 0,
+                 true, false);
+      }
+      return;
+    }
+    if (fac == 1) {
+      if (adv) {
+        face_set(out, "sw_sv_vacuum", u8"真空内爆弹", "SovietVacuumImploder", u8"真空内爆弹",
+                 egg ? 1 : 0, true, false);
+      } else {
+        face_set(out, "sw_sv_iron", u8"铁幕装置", "SovietIronCurtain", u8"铁幕装置", 0, true, false);
+      }
+      return;
+    }
+    if (adv) {
+      face_set(out, "sw_jp_psi", u8"超能波毁灭装置", "JapanPsionicDecimator", u8"超能波毁灭装置",
+               egg ? 1 : 0, true, false);
+    } else {
+      // The hive itself stays in the lock, but the icon is the nanocore.
+      face_set(out, "sw_jp_nano", u8"纳米虫群核心", "JapanSuperWeapon", u8"纳米虫群", egg ? 0 : 1,
+               true, false);
+    }
+    return;
+  }
+  if (is_superweapon_lock_id(id)) {
+    face_set(out, "sw_all", u8"超级武器", "SuperWeapon", u8"超级武器", 0, true, false);
+    return;
+  }
+
+  if (contains_ic(id, "MCV") && fac <= 2) {
+    const char* g = fac == 0 ? "dual_al_mcv" : fac == 1 ? "dual_sv_mcv" : "dual_jp_mcv";
+    face_set(out, g, "MCV", id, "MCV", dual_pref(id), false, true);
+    return;
+  }
+  if (fac == 0 && (starts_ic(id, "AlliedMiner") || starts_ic(id, "AlliedSurveyor"))) {
+    const int pref = dual_pref(id) + (starts_ic(id, "AlliedMiner") ? 1 : 0);
+    face_set(out, "dual_al_prospect", u8"勘探者", "AlliedSurveyor", u8"勘探者", pref, false, true);
+    return;
+  }
+  if (fac == 0 && starts_ic(id, "AlliedAntiInfantryVehicle")) {
+    face_set(out, "dual_al_acv", u8"激流ACV", "AlliedAntiInfantryVehicle", u8"激流ACV",
+             dual_pref(id), false, true);
+    return;
+  }
+  if (fac == 1 && starts_ic(id, "SovietSurveyor")) {
+    face_set(out, "dual_sv_sputnik", u8"史普尼克勘察车", "SovietSurveyor", u8"史普尼克勘察车",
+             dual_pref(id), false, true);
+    return;
+  }
+  if (fac == 1 &&
+      (starts_ic(id, "SovietAntiAirShip") || starts_ic(id, "SovietAntiAirVehicleTech1"))) {
+    int pref = 2;
+    if (starts_ic(id, "SovietAntiAirShip") && !contains_ic(id, "Ground")) pref = 0;
+    else if (contains_ic(id, "Ground")) pref = 1;
+    face_set(out, "dual_sv_frog", u8"牛蛙载具", "SovietAntiAirShip", u8"牛蛙载具", pref, false,
+             true);
+    return;
+  }
+  if (fac == 2 && starts_ic(id, "JapanAntiVehicleVehicleTech1")) {
+    face_set(out, "dual_jp_tsunami", u8"海啸坦克", "JapanAntiVehicleVehicleTech1", u8"海啸坦克",
+             dual_pref(id), false, true);
+    return;
+  }
+  if (fac == 2 && starts_ic(id, "JapanMiner")) {
+    face_set(out, "dual_jp_miner", u8"采矿车", "JapanMiner", u8"采矿车", dual_pref(id), false, true);
+    return;
+  }
+  if (fac == 1 && starts_ic(id, "SovietMiner")) {
+    face_set(out, "dual_sv_miner", u8"苏联矿车", "SovietMiner", u8"苏联矿车", dual_pref(id), false,
+             true);
+    return;
+  }
+
+  if (fac != 2) return;
+  struct CoreRow {
+    const char* prefix;
+    const char* group;
+    const char* name;
+    const char* icon;
+  };
+  static const CoreRow kCore[] = {
+      {"JapanBaseDefenseAdv", "jp_tower", u8"波能塔", "JapanBaseDefenseAdv"},
+      {"JapanBaseDefense", "jp_vx", u8"防卫者-VX", "JapanBaseDefense"},
+      {"JapanBarracks", "jp_dojo", u8"瞬息道场", "JapanBarracks"},
+      {"JapanNavalYard", "jp_dock", u8"帝国码头", "JapanNavalYard"},
+      {"JapanPowerPlant", "jp_power", u8"瞬息发电厂", "JapanPowerPlant"},
+      {"JapanRefinery", "jp_refinery", u8"矿石精炼厂", "JapanRefinery"},
+      {"JapanWarFactory", "jp_mech", u8"机甲工厂", "JapanWarFactory"},
+      {"JapanTechStructure", "jp_host", u8"纳米主机", "JapanNanotechMainframe"},
+      {"JapanNanotechMainframe", "jp_host", u8"纳米主机", "JapanNanotechMainframe"},
+  };
+  for (const CoreRow& r : kCore) {
+    if (!starts_ic(id, r.prefix)) continue;
+    if (contains_ic(id, "Repair")) continue;
+    face_set(out, r.group, r.name, r.icon, r.name, egg ? 1 : 0, false, false);
+    return;
+  }
+}
+
+// 1 = changed, 0 = already in the requested state, -1 = template missing.
+static int build_lock_apply_one(const char* type_id, bool locked) {
+  if (!locked) {
+    BuildBan* ban = find_build_ban(type_id);
+    if (!ban) return 0;
+    uint32_t players[kMaxEconPlayers] = {};
+    int pn = 0;
+    collect_lock_players(players, &pn);
+    for (int p = 0; p < pn; ++p) {
+      for (int t = 0; t < ban->tmpl_n; ++t) {
+        thiscall_build_lock(players[p], ban->tmpls[t], false);
+      }
+    }
+    g_build_bans.erase(
+        std::remove_if(g_build_bans.begin(), g_build_bans.end(),
+                       [&](const BuildBan& b) { return std::strcmp(b.id, type_id) == 0; }),
+        g_build_bans.end());
+    return 1;
+  }
+  if (find_build_ban(type_id)) return 0;
+  BuildBan ban{};
+  std::snprintf(ban.id, sizeof(ban.id), "%s", type_id);
+  for (const BuildTpl& row : g_build_catalog) {
+    if (std::strcmp(row.id, type_id) != 0) continue;
+    if (!ban.name[0]) std::snprintf(ban.name, sizeof(ban.name), "%s", row.name);
+    ban.building = row.building;
+    copy_tpl_ptrs(&ban, row);
+  }
+  if (ban.tmpl_n <= 0) return -1;
+  if (!ban.name[0]) {
+    if (const char* zh = lookup_zh_name(type_id)) {
+      std::snprintf(ban.name, sizeof(ban.name), "%s", zh);
+    } else {
+      std::snprintf(ban.name, sizeof(ban.name), "%s", type_id);
+    }
+  }
+  g_build_bans.push_back(ban);
+  return 1;
+}
+
+static bool build_lock_set_impl(const char* type_id, bool locked, std::string* out_msg) {
+  if (!type_id || !type_id[0]) {
+    if (out_msg) *out_msg = u8"没有种类代号";
+    return false;
+  }
+  ensure_build_catalog();
+  LockFace face{};
+  lock_face_of(type_id, nullptr, &face);
+  const bool ban_all_sw = std::strcmp(face.group, "sw_all") == 0;
+  const bool grouped = ban_all_sw || std::strcmp(face.group, type_id) != 0;
+  if (grouped) {
+    int changed = 0;
+    int known = 0;
+    for (const BuildTpl& row : g_build_catalog) {
+      LockFace rf{};
+      lock_face_of(row.id, row.name, &rf);
+      if (ban_all_sw) {
+        if (!rf.superweapon) continue;
+      } else if (std::strcmp(rf.group, face.group) != 0) {
+        continue;
+      }
+      ++known;
+      const int st = build_lock_apply_one(row.id, locked);
+      if (st > 0) ++changed;
+    }
+    if (known == 0) {
+      if (out_msg) *out_msg = u8"单位表里没有这个种类，进对局后再试";
+      return false;
+    }
+    if (changed > 0 && locked) {
+      g_build_lock_tick = 0;
+      build_lock_tick_impl();
+    }
+    if (out_msg) {
+      if (ban_all_sw) {
+        *out_msg = locked ? u8"已禁止超级武器：超时空传送仪、质子撞击炮、铁幕装置、真空内爆弹、纳米虫群核心、超能波毁灭装置"
+                          : u8"已解禁超级武器：超时空传送仪、质子撞击炮、铁幕装置、真空内爆弹、纳米虫群核心、超能波毁灭装置";
+      } else if (face.paired) {
+        *out_msg = std::string(face.name) +
+                   (locked ? u8" 已禁止（车厂和船厂都不能建造）"
+                           : u8" 已解禁（车厂和船厂都可以建造）");
+      } else if (!locked) {
+        *out_msg = std::string(face.name) + u8" 已解禁";
+      } else if (read_battle_clock(nullptr, nullptr)) {
+        *out_msg = std::string(face.name) + u8" 已禁止建造";
+      } else {
+        *out_msg = std::string(face.name) + u8" 已加入禁止列表，进入对局后生效";
+      }
+    }
+    return true;
+  }
+  const int st = build_lock_apply_one(type_id, locked);
+  if (st < 0) {
+    if (out_msg) *out_msg = u8"单位表里没有这个种类，进对局后再试";
+    return false;
+  }
+  if (st > 0 && locked) {
+    g_build_lock_tick = 0;
+    build_lock_tick_impl();
+  }
+  if (out_msg) {
+    const char* zh = lookup_zh_name(type_id);
+    const char* name = zh && zh[0] ? zh : type_id;
+    if (!locked) {
+      *out_msg = std::string(name) + u8" 已解禁";
+    } else if (read_battle_clock(nullptr, nullptr)) {
+      *out_msg = std::string(name) + u8" 已禁止建造";
+    } else {
+      *out_msg = std::string(name) + u8" 已加入禁止列表，进入对局后生效";
+    }
+  }
+  return true;
+}
+
+static void sync_disable_superweapon_toggle() {
+  if (g_lock_syncing) return;
+  g_lock_syncing = true;
+  const bool on = feature_enabled("disableallsp");
+  if (on) {
+    if (!g_sw_toggle_latched) {
+      if (build_lock_set_impl("SuperWeapon", true, nullptr)) g_sw_toggle_latched = true;
+    }
+  } else if (g_sw_toggle_latched) {
+    build_lock_set_impl("SuperWeapon", false, nullptr);
+    g_sw_toggle_latched = false;
+  }
+  g_lock_syncing = false;
+}
+
+static bool build_lock_selected_impl(bool locked, std::string* out_msg) {
+  auto ents = selected_entities_stable();
+  if (ents.empty()) {
+    if (out_msg) *out_msg = u8"请先在游戏里选中一个单位或建筑";
+    return false;
+  }
+  uint32_t unit_data = 0;
+  if (!safe_read_u32(ents[0] + 4, &unit_data) || !is_ptr(unit_data)) {
+    if (out_msg) *out_msg = u8"读不到选中单位的种类";
+    return false;
+  }
+  char id[96] = {};
+  if (!resolve_primary_catalog_id(unit_data, id, sizeof(id))) {
+    char sig[32] = {};
+    if (!resolve_type_id_from_template(unit_data, id, sizeof(id), sig, sizeof(sig)) ||
+        !id[0]) {
+      if (out_msg) *out_msg = u8"这个种类还不能加入建造限制";
+      return false;
+    }
+  }
+  ensure_build_catalog();
+  bool known = false;
+  for (const BuildTpl& row : g_build_catalog) {
+    if (std::strcmp(row.id, id) == 0) known = true;
+  }
+  if (!known) {
+    BuildTpl row{};
+    build_tpl_add_ptr(&row, unit_data);
+    std::snprintf(row.id, sizeof(row.id), "%s", id);
+    if (const char* zh = lookup_zh_name(id)) {
+      std::snprintf(row.name, sizeof(row.name), "%s", zh);
+    } else {
+      std::snprintf(row.name, sizeof(row.name), "%s", id);
+    }
+    row.building = type_id_is_building(id);
+    g_build_catalog.push_back(row);
+  }
+  return build_lock_set_impl(id, locked, out_msg);
+}
+
+static const BuildLockEntry* build_lock_catalog_impl(int* count) {
+  ensure_build_catalog();
+  static std::vector<BuildLockEntry> view;
+  view.clear();
+  view.reserve(g_build_catalog.size());
+  for (const BuildTpl& row : g_build_catalog) {
+    LockFace face{};
+    lock_face_of(row.id, row.name, &face);
+    BuildLockEntry e{};
+    std::snprintf(e.type_id, sizeof(e.type_id), "%s", row.id);
+    std::snprintf(e.name, sizeof(e.name), "%s", face.name[0] ? face.name : row.name);
+    std::snprintf(e.group, sizeof(e.group), "%s", face.group);
+    std::snprintf(e.icon_id, sizeof(e.icon_id), "%s", face.icon_id);
+    std::snprintf(e.icon_name, sizeof(e.icon_name), "%s", face.icon_name);
+    e.group_pref = face.pref;
+    e.building = row.building;
+    e.banned = find_build_ban(row.id) != nullptr;
+    e.superweapon = face.superweapon;
+    e.paired = face.paired;
+    view.push_back(e);
+  }
+  if (count) *count = (int)view.size();
+  return view.empty() ? nullptr : view.data();
+}
+
 }  // namespace
 
 void install_roster_hooks() { install_roster_hooks_impl(); }
 
 bool collect_match_economy(MatchEconomy* out) { return collect_match_economy_impl(out); }
+
+const BuildLockEntry* build_lock_catalog(int* count) { return build_lock_catalog_impl(count); }
+
+bool build_lock_set(const char* type_id, bool locked, std::string* out_msg) {
+  return build_lock_set_impl(type_id, locked, out_msg);
+}
+
+bool build_lock_selected(bool locked, std::string* out_msg) {
+  return build_lock_selected_impl(locked, out_msg);
+}
+
+void build_lock_tick() { build_lock_tick_impl(); }
+
+void build_lock_sync_disable_superweapon() { sync_disable_superweapon_toggle(); }
 
 bool adjust_local_money(int delta, std::string* out_msg) {
   if (!module_base()) {

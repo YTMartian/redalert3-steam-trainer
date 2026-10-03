@@ -224,7 +224,7 @@ python verify_payload.py  # 构建一致性 + 段内跳转合法性
 
 ## 五、源码与构建
 
-> **另见进程内 ImGui 菜单**：[overlay/](overlay/) — 独立 C++/ImGui DLL，注入 `ra3_1.12.game` 后按 **Home / Insert / F8** 呼出菜单，功能与本 Python 修改器对齐（资源/超武/单位操作等），并带战况统计（颜色色块 + 阵营、场上单位图标、本局建造/损失/摧毁折线）。`RA3_Overlay_Inject.exe` 一键注入，弹窗标题直接显示「注入成功」或「注入失败」。与 Python MustCode **不要同时使用**。编译与用法见 [overlay/README.md](overlay/README.md)。
+> **另见进程内 ImGui 菜单**：[overlay/](overlay/) — 独立 C++/ImGui DLL，注入 `ra3_1.12.game` 后按 **Home / Insert / F8** 呼出菜单，功能与本 Python 修改器对齐（资源/超武/单位操作等），并带战况统计（颜色色块 + 阵营、场上单位/建筑图标、本局建造/损失/消灭以及收入/支出折线；被击败的玩家仍留在榜上）和建造限制（按图标禁止单位或建筑，全玩家生效，下一局自动再套用）。图标在仓库根目录 `unit_images/`（盟军、苏联、帝国、中立单位建筑、战役建筑、特殊单位）。`RA3_Overlay_Inject.exe` 一键注入，弹窗标题直接显示「注入成功」或「注入失败」。与 Python MustCode **不要同时使用**。编译与用法见 [overlay/README.md](overlay/README.md)。
 
 ### 5.1 运行依赖
 ```powershell
@@ -400,6 +400,7 @@ redalert3-steam-trainer/
 ├─ build.bat               一键打包
 ├─ make_icon.py            图标生成器（输出 icon.ico / icon.png）
 ├─ icon.ico / icon.png     图标资源
+├─ unit_images/            战况统计用单位/建筑图标（按阵营分子目录）
 ├─ README.md
 │
 ├─ 工具：进程/字段定位
@@ -410,6 +411,8 @@ redalert3-steam-trainer/
 ├─ 工具：星级机制验证
 │   rank_probe.py  + 探测星级字段.bat
 │   rank_probe2.py + 验证星级机制.bat
+│
+├─ overlay/                进程内 ImGui 菜单（见 overlay/README.md）
 │
 └─ 工具：离线静态分析
     dump_module.py + scan_vet_code.py + 定位星级代码.bat

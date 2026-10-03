@@ -81,6 +81,7 @@ struct PlayerEconomy {
   uint32_t player = 0;
   uint32_t player_id = 0;
   bool is_local = false;
+  bool defeated = false;
   char name[64] = {};
   bool has_color = false;
   uint8_t color_r = 210;
@@ -120,6 +121,28 @@ struct MatchEconomy {
 
 bool collect_match_economy(MatchEconomy* out);
 bool inspect_first_selected(UnitInspect* out);
+
+// Per-player production lock. The game keeps a disabled-type list on each
+// Player (script: cannot build this object type). Bans apply to every seat
+// in the current match and are reapplied after a new match starts.
+struct BuildLockEntry {
+  char type_id[96] = {};
+  char name[64] = {};
+  char group[96] = {};
+  char icon_id[96] = {};
+  char icon_name[64] = {};
+  int group_pref = 0;
+  bool building = false;
+  bool banned = false;
+  bool superweapon = false;
+  bool paired = false;
+};
+
+const BuildLockEntry* build_lock_catalog(int* count);
+bool build_lock_set(const char* type_id, bool locked, std::string* out_msg);
+bool build_lock_selected(bool locked, std::string* out_msg);
+void build_lock_tick();
+void build_lock_sync_disable_superweapon();
 
 // Direct money write (no MustCode hook). Works in match / spectator.
 int money_self_step();

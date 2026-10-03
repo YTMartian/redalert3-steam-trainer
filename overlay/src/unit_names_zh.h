@@ -33,6 +33,7 @@ static const UnitNameEntry kUnitNamesZh[] = {
     {"SovietAntiAirShip_Ground", u8"牛蛙载具"},
     {"SovietAntiStructureShip", u8"无畏战舰"},
     {"SovietMiner", u8"苏联矿车"},
+    {"SovietMiner_Naval", u8"苏联矿车"},
     {"SovietMCV", u8"MCV"},
     {"SovietMCV_Naval", u8"MCV"},
     {"SovietSurveyor", u8"史普尼克勘察车"},
@@ -95,6 +96,7 @@ static const UnitNameEntry kUnitNamesZh[] = {
     {"JapanAntiStructureShip", u8"将军战列舰"},
     {"JapanAntiVehicleShip", u8"薙刀巡洋舰"},
     {"JapanMiner", u8"采矿车"},
+    {"JapanMiner_Naval", u8"采矿车"},
     {"JapanMCV", u8"MCV"},
     {"JapanMCV_Naval", u8"MCV"},
     {"JapanSurveyor", u8"勘探者"},
@@ -122,8 +124,9 @@ static const UnitNameEntry kUnitNamesZh[] = {
     {"SovietTeslaWallHub", u8"磁暴墙枢纽"},
     {"SovietTechStructure", u8"战斗研究所"},
     {"SovietIronCurtain", u8"铁幕装置"},
-    {"SovietVacuumImploder", u8"真空内爆器"},
-    {"SovietSuperWeapon", u8"真空内爆器"},
+    {"SovietVacuumImploder", u8"真空内爆弹"},
+    {"SovietSuperWeapon", u8"真空内爆弹"},
+    {"SovietSuperWeaponAdvanced", u8"真空内爆弹"},
 
     // ---- Buildings: Allied ----
     {"AlliedConstructionYard", u8"建筑工厂"},
@@ -160,7 +163,8 @@ static const UnitNameEntry kUnitNamesZh[] = {
     {"JapanBaseDefenseAdv", u8"波力塔"},
     {"JapanWallHub", u8"围墙"},
     {"JapanTechStructure", u8"纳米科技电脑主机"},
-    {"JapanPsionicDecimator", u8"心灵毁灭者"},
+    {"JapanPsionicDecimator", u8"超能波毁灭装置"},
+    {"JapanSuperWeaponAdvanced", u8"超能波毁灭装置"},
     {"JapanNanotechMainframe", u8"纳米主机"},
 
     // ---- Neutral / tech buildings ----
@@ -172,7 +176,7 @@ static const UnitNameEntry kUnitNamesZh[] = {
     {"OilDerrick_OnWater", u8"油井"},
     {"TechBuildingOilDerrick", u8"油井"},
     {"ShipYardTechStructure", u8"干船坞"},
-    {"AirportTechStructure", u8"中立机场"},
+    {"AirportTechStructure", u8"机场"},
     {"VeterancyTechStructure", u8"精兵学院"},
     {"DefensiveStructureTechStructure", u8"中立防御基地"},
     {"OreNode", u8"矿脉"},
@@ -185,4 +189,6 @@ static const UnitNameEntry kUnitNamesZh[] = {
     {"OreNode4b", u8"矿脉"},
     {"OreNode4c", u8"矿脉"},
     {"OreNode4d", u8"矿脉"},
+    {"CreateHealMP", u8"治疗箱"},
+    {"CreateMoneyMP", u8"资金箱"},
 };
