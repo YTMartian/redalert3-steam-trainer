@@ -81,7 +81,7 @@ def align_pair(lines, raw, base, targets, seg):
 
     lines 与 raw 逐行一一对应：lines 是已替换符号、可直接汇编的形式，
     raw 是保留原始符号写法的同一行。nop 会同时插入两者，这样对齐结果
-    可以固化回 mustcode_body.asm（trainer.py 的精简 build 也能复用）。
+    可以固化回 mustcode_body.asm（mustcode_asm.py 的精简 build 也能复用）。
     """
     tag = 'mc2_' if seg == 'mc2' else 'mc_'
     for t in sorted(targets):
@@ -218,7 +218,7 @@ def aligned_body_text(asm_text, symbols, mc_base, mc2_base, flags_base, idb_base
     """返回把 nop 对齐固化进去后的 body 文本（仍是原始符号写法）。
 
     gen_payload.py 用它把对齐结果写回 mustcode_body.asm，
-    这样 trainer.py 运行时那个不含 capstone、不做对齐的精简 build
+    这样 mustcode_asm.py 运行时那个不含 capstone、不做对齐的精简 build
     也能得到与 LABELS 完全一致的布局。
     """
     mc_lines, mc2_lines, mc_raw, mc2_raw = split_asm(

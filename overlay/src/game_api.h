@@ -12,6 +12,10 @@ void shutdown();
 const char* status_text();
 void set_status(const char* text);
 void log(const char* fmt, ...);
+// Writes the faulting address and call stack to ra3_overlay.log beside the DLL. exception_pointers
+// is EXCEPTION_POINTERS*; pass nullptr only to note a site with no context.
+void log_exception(void* exception_pointers, const char* where);
+void install_crash_filter();
 
 void beep(const char* kind);  // on / off / click / error
 
@@ -20,7 +24,7 @@ bool hooks_armed();
 bool is_spectator();
 const char* mode_label();
 
-// Allocate MustCode + arm hooks (trainer.build) in one step.
+// Allocate MustCode + arm hooks in one step.
 bool inject(bool spectate_mode);
 bool arm_hooks();
 bool inject_full(bool spectate_mode);  // inject + arm_hooks
@@ -149,6 +153,9 @@ int money_self_step();
 int money_sel_step();
 void set_money_self_step(int v);
 void set_money_sel_step(int v);
+// 0 盟军 / 1 苏联 / 2 帝国。召唤基地车每次只生成这一家的一辆。
+int mcv_faction();
+void set_mcv_faction(int faction);
 bool adjust_local_money(int delta, std::string* out_msg);
 bool adjust_selected_player_money(int delta, std::string* out_msg);
 
@@ -160,6 +167,25 @@ const char* unit_names_store_path();  // UTF-8 path, valid until next call
 bool toggle_feature(const char* key, bool enabled, std::string* out_msg);
 bool pulse_feature(const char* key, std::string* out_msg);
 bool set_danger(int level, std::string* out_msg);
+struct BattlePlayer {
+  uint32_t player = 0;
+  uint32_t player_id = 0;
+  bool is_local = false;
+  bool defeated = false;
+  bool has_color = false;
+  uint8_t color_r = 180;
+  uint8_t color_g = 190;
+  uint8_t color_b = 200;
+  char name[64] = {};
+};
+
+int list_battle_players(BattlePlayer* out, int max_out);
+void set_rank_player(uint32_t player);
+void set_mcv_player(uint32_t player);
+void set_money_player(uint32_t player);
+// 该玩家的出场等级。-1 没有这个玩家，-2 还没读到升级数据。0..3 为等级。
+int player_spawn_rank(uint32_t player);
+bool set_spawn_rank(int level, std::string* out_msg);
 bool run_engine(const char* key, std::string* out_msg);
 // Hotkey entry: toggles/pulses/engines by feature key (incl. danger_max/min/norm).
 bool trigger_hotkey(const char* key, std::string* out_msg);
@@ -184,6 +210,18 @@ const FeatureInfo* features(int* count);
 const FeatureInfo* find_feature(const char* key);
 const GroupInfo* groups(int* count);
 bool feature_enabled(const char* key);
-const char* hotkey_hint(const char* key);  // e.g. "Ctrl+F1", may be null
+const char* hotkey_hint(const char* key);  // live binding, e.g. "Ctrl+F1"; null if none
+
+int hotkey_slot_count();
+const char* hotkey_slot_id(int index);
+const char* hotkey_slot_feature(int index);
+void hotkey_slot_mods(int index, int* vk, bool* ctrl, bool* alt, bool* shift);
+bool set_hotkey_slot(int index, int vk, bool ctrl, bool alt, bool shift, std::string* err);
+bool reset_hotkey_slot(int index);
+void format_hotkey_slot(int index, char* buf, size_t buf_len);
+int hotkey_slots_for_feature(const char* feature, int* indices, int cap);
+bool apply_hotkey_text(const char* slot_id, const char* text);
+bool hotkey_capture_active();
+void set_hotkey_capture(bool on);
 
 }  // namespace game_api

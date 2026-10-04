@@ -34,7 +34,7 @@ echo [2/3] packaging RA3_Overlay_Inject.exe ...
 if errorlevel 1 goto :err
 
 echo [3/3] packaging arm_mustcode.exe ...
-"%PY%" -m PyInstaller --noconfirm --onefile --noconsole --name arm_mustcode --icon "%ICON%" --distpath "%REPO%\overlay\bin" --workpath "%REPO%\overlay\build\pyi_arm" --specpath "%REPO%\overlay\build" --hidden-import keystone --hidden-import keystone.keystone --hidden-import keystone.keystone_const --hidden-import payload --hidden-import trainer --collect-submodules keystone --add-binary "%KS_DLL%;keystone" --add-data "%REPO%\payload.py;." --add-data "%REPO%\trainer.py;." "%REPO%\overlay\tools\arm_mustcode.py"
+"%PY%" -m PyInstaller --noconfirm --onefile --noconsole --name arm_mustcode --icon "%ICON%" --distpath "%REPO%\overlay\bin" --workpath "%REPO%\overlay\build\pyi_arm" --specpath "%REPO%\overlay\build" --hidden-import keystone --hidden-import keystone.keystone --hidden-import keystone.keystone_const --hidden-import payload --hidden-import mustcode_asm --collect-submodules keystone --add-binary "%KS_DLL%;keystone" --add-data "%REPO%\payload.py;." --add-data "%REPO%\mustcode_asm.py;." "%REPO%\overlay\tools\arm_mustcode.py"
 if errorlevel 1 goto :err
 
 echo.

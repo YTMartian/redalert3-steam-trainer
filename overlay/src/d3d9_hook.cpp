@@ -224,6 +224,25 @@ void ensure_ui(IDirect3DDevice9* device) {
                 IsWindowUnicode(hwnd) ? 1 : 0);
 }
 
+static volatile LONG g_draw_faults = 0;
+
+void render_overlay(IDirect3DDevice9* device);
+
+static int draw_exception_filter(EXCEPTION_POINTERS* ep) {
+  const LONG n = InterlockedIncrement(&g_draw_faults);
+  if (n <= 3) game_api::log_exception(ep, "overlay draw");
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+void render_overlay_seh(IDirect3DDevice9* device) {
+  game_api::install_crash_filter();
+  if (g_draw_faults >= 3) return;
+  __try {
+    render_overlay(device);
+  } __except (draw_exception_filter(GetExceptionInformation())) {
+  }
+}
+
 void render_overlay(IDirect3DDevice9* device) {
   if (!device || g_skip_draw) {
     return;
@@ -260,14 +279,14 @@ void render_overlay(IDirect3DDevice9* device) {
 
 HRESULT APIENTRY hk_end_scene(IDirect3DDevice9* device) {
   InterlockedIncrement(&g_endscene_count);
-  render_overlay(device);
+  // Draw only from Present. Creating the font texture inside EndScene faults d3d9.
   return g_orig_end_scene(device);
 }
 
 HRESULT APIENTRY hk_present(IDirect3DDevice9* device, const RECT* src, const RECT* dst,
                             HWND hwnd, const RGNDATA* dirty) {
   InterlockedIncrement(&g_present_count);
-  render_overlay(device);
+  render_overlay_seh(device);
   const HRESULT hr = g_orig_present(device, src, dst, hwnd, dirty);
   InterlockedExchange(&g_drew_this_frame, 0);
   return hr;
@@ -291,7 +310,7 @@ HRESULT APIENTRY hk_swap_present(IDirect3DSwapChain9* swap, const RECT* src, con
   InterlockedIncrement(&g_swap_present_count);
   IDirect3DDevice9* device = nullptr;
   if (swap && SUCCEEDED(swap->GetDevice(&device)) && device) {
-    render_overlay(device);
+    render_overlay_seh(device);
     device->Release();
   }
   const HRESULT hr = g_orig_swap_present(swap, src, dst, hwnd, dirty, flags);

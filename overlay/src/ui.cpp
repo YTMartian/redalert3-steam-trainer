@@ -9,9 +9,11 @@
 #include "imgui.h"
 #include "imgui_impl_dx9.h"
 #include "imgui_impl_win32.h"
+#include "imgui_plot.h"
 
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -80,11 +82,11 @@ DWORD WINAPI engine_worker(LPVOID param) {
   if (job && job->key[0]) {
     // Clone/spawn needs cursor on terrain; hide menu briefly so GetMouseXyz works.
     const bool need_terrain =
-        std::strcmp(job->key, "spec_gift") == 0 ||
         std::strcmp(job->key, "unit_clone") == 0 ||
         std::strcmp(job->key, "spawn_unit") == 0 ||
         std::strcmp(job->key, "clone_multi") == 0 ||
-        std::strcmp(job->key, "ore_convoy") == 0;
+        std::strcmp(job->key, "ore_convoy") == 0 ||
+        std::strcmp(job->key, "spawn_mcv") == 0;
     if (need_terrain) {
       input::set_menu_visible(false);
       Sleep(280);
@@ -181,6 +183,10 @@ void load_ui_settings() {
       game_api::set_money_self_step((int)std::atoi(val.c_str()));
     } else if (key == "money_sel_step") {
       game_api::set_money_sel_step((int)std::atoi(val.c_str()));
+    } else if (key == "mcv_faction") {
+      game_api::set_mcv_faction((int)std::atoi(val.c_str()));
+    } else if (key.compare(0, 3, "hk.") == 0) {
+      game_api::apply_hotkey_text(key.c_str() + 3, val.c_str());
     }
   }
 }
@@ -199,6 +205,14 @@ void save_ui_settings() {
   f << "stats_pinned=" << (g_stats_pinned ? 1 : 0) << "\n";
   f << "money_self_step=" << game_api::money_self_step() << "\n";
   f << "money_sel_step=" << game_api::money_sel_step() << "\n";
+  f << "mcv_faction=" << game_api::mcv_faction() << "\n";
+  const int hk_n = game_api::hotkey_slot_count();
+  for (int i = 0; i < hk_n; ++i) {
+    char combo[48] = {};
+    game_api::format_hotkey_slot(i, combo, sizeof(combo));
+    if (!combo[0]) continue;
+    f << "hk." << game_api::hotkey_slot_id(i) << "=" << combo << "\n";
+  }
   g_settings_dirty = false;
   g_settings_save_timer = 0.f;
 }
@@ -282,7 +296,7 @@ void mark_settings_dirty() {
 
 void draw_settings_panel() {
   ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"界面设置");
-  ImGui::TextDisabled(u8"调整后自动保存到 overlay_ui.ini");
+  ImGui::TextDisabled(u8"界面和快捷键都会自动保存到修改器目录的 overlay_ui.ini");
   ImGui::Separator();
   ImGui::Spacing();
 
@@ -347,6 +361,9 @@ struct TrendPt {
 };
 struct TrendTrack {
   uint32_t player = 0;
+  // True when the first span is not sampled: t=0 is all zeros, and the next
+  // point is the official running total at the moment we started watching.
+  bool bridged = false;
   std::vector<TrendPt> pts;
 };
 static std::vector<TrendTrack> g_trends;
@@ -402,6 +419,15 @@ static void sample_trends(const game_api::MatchEconomy& st) {
     const uint32_t v[8] = {pe.units_built,     pe.units_lost,        pe.units_destroyed,
                            pe.buildings_built, pe.buildings_lost,    pe.buildings_destroyed,
                            pe.money_earned,    pe.money_spent};
+    // ScoreKeeper only stores match totals, not a per-second history. A loaded
+    // battle already has those totals, so anchor the chart at 0:00 and let the
+    // first segment run from zero up to the official numbers.
+    if (tr->pts.empty() && t > 1.f) {
+      TrendPt origin;
+      origin.t = 0.f;
+      tr->pts.push_back(origin);
+      tr->bridged = true;
+    }
     if (!tr->pts.empty()) {
       TrendPt& last = tr->pts.back();
       bool same = true;
@@ -419,8 +445,13 @@ static void sample_trends(const game_api::MatchEconomy& st) {
     pt.t = t;
     for (int k = 0; k < 8; ++k) pt.v[k] = v[k];
     tr->pts.push_back(pt);
-    if (tr->pts.size() > 2400) {
-      tr->pts.erase(tr->pts.begin(), tr->pts.begin() + 400);
+    if (tr->pts.size() > 1800) {
+      std::vector<TrendPt> kept;
+      kept.reserve(tr->pts.size() / 2 + 2);
+      kept.push_back(tr->pts.front());
+      for (size_t i = 1; i + 1 < tr->pts.size(); i += 2) kept.push_back(tr->pts[i]);
+      kept.push_back(tr->pts.back());
+      tr->pts.swap(kept);
     }
   }
 }
@@ -437,132 +468,112 @@ static uint32_t trend_total(const TrendPt& pt, int series) {
   return pt.v[series + 3];  // 3 → earned, 4 → spent
 }
 
-static void draw_trend_chart(const char* title, const TrendTrack* tr) {
-  const float avail = ImGui::GetContentRegionAvail().x;
-  const float h = 118.f;
-  const ImVec2 origin = ImGui::GetCursorScreenPos();
-  ImDrawList* dl = ImGui::GetWindowDrawList();
-  const ImVec2 box1(origin.x + avail, origin.y + h);
-  dl->AddRectFilled(origin, box1, IM_COL32(10, 14, 22, 215), 6.f);
-  dl->AddRect(origin, box1, IM_COL32(80, 100, 130, 70), 6.f, 0, 1.f);
-  dl->AddText(ImVec2(origin.x + 8.f, origin.y + 4.f), IM_COL32(176, 192, 210, 255), title);
+static void draw_trend_legend(const char* const* names, const ImU32* cols, int count) {
+  for (int s = 0; s < count; ++s) {
+    if (s) ImGui::SameLine(0.f, 12.f);
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float h = ImGui::GetTextLineHeight();
+    ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(p.x, p.y + 3.f), ImVec2(p.x + 10.f, p.y + h - 2.f),
+                                              cols[s], 2.f);
+    ImGui::Dummy(ImVec2(10.f, h));
+    ImGui::SameLine(0.f, 4.f);
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(cols[s]), "%s", names[s]);
+  }
+}
 
+static int trend_hover_index(int count) {
+  if (count <= 0 || !ImGui::IsItemHovered()) return -1;
+  if (count == 1) return 0;
+  const ImVec2 a = ImGui::GetItemRectMin();
+  const ImVec2 b = ImGui::GetItemRectMax();
+  const ImVec2 pad = ImGui::GetStyle().FramePadding;
+  const float inner_w = std::max(1.f, (b.x - a.x) - pad.x * 2.f);
+  float t = (ImGui::GetIO().MousePos.x - (a.x + pad.x)) / inner_w;
+  if (t < 0.f) t = 0.f;
+  if (t > 0.9999f) t = 0.9999f;
+  int idx = (int)(t * (float)(count - 1));
+  if (idx < 0) idx = 0;
+  if (idx >= count) idx = count - 1;
+  return idx;
+}
+
+static void draw_trend_chart(const char* title, const TrendTrack* tr) {
   const char* names[5] = {u8"建造", u8"损失", u8"消灭", u8"收入", u8"支出"};
   const ImU32 cols[5] = {
-      IM_COL32(130, 214, 156, 255),
-      IM_COL32(232, 122, 112, 255),
-      IM_COL32(242, 186, 96, 255),
-      IM_COL32(176, 132, 255, 255),
-      IM_COL32(156, 186, 214, 255),
+      IM_COL32(130, 214, 156, 255), IM_COL32(232, 122, 112, 255), IM_COL32(242, 186, 96, 255),
+      IM_COL32(176, 132, 255, 255), IM_COL32(156, 186, 214, 255),
   };
-  float lx = origin.x + ImGui::CalcTextSize(title).x + 18.f;
+
+  ImGui::TextColored(ImVec4(0.70f, 0.78f, 0.86f, 1.f), "%s", title);
+  ImGui::SameLine(0.f, 14.f);
+  draw_trend_legend(names, cols, 3);
+  draw_trend_legend(names + 3, cols + 3, 2);
+
+  const int src_n = tr ? (int)tr->pts.size() : 0;
+  const int n = src_n == 1 ? 2 : src_n;
+  std::vector<float> xs((size_t)n);
+  std::vector<float> series[5];
+  for (int s = 0; s < 5; ++s) series[s].assign((size_t)n, 0.f);
+  float raw[5] = {};
+  float count_max = 1.f;
+  float money_max = 1.f;
+  for (int i = 0; i < n; ++i) {
+    const TrendPt& pt = tr->pts[src_n == 1 ? 0 : i];
+    xs[(size_t)i] = (src_n == 1 && i == 1) ? pt.t + 1.f : pt.t;
+    for (int s = 0; s < 5; ++s) {
+      raw[s] = (float)trend_total(pt, s);
+      series[s][(size_t)i] = raw[s];
+    }
+    count_max = std::max(count_max, std::max(raw[0], std::max(raw[1], raw[2])));
+    money_max = std::max(money_max, std::max(raw[3], raw[4]));
+  }
+  if (count_max < 4.f) count_max = 4.f;
+  if (money_max < 4.f) money_max = 4.f;
+  // One axis cannot show counts and money together, so each group fills the
+  // chart against its own peak. The tooltip still shows the real numbers.
+  for (int i = 0; i < n; ++i) {
+    for (int s = 0; s < 3; ++s) series[s][(size_t)i] /= count_max;
+    for (int s = 3; s < 5; ++s) series[s][(size_t)i] /= money_max;
+  }
+  const float* ys[5] = {series[0].data(), series[1].data(), series[2].data(), series[3].data(),
+                        series[4].data()};
+
+  ImGui::PlotConfig conf;
+  conf.values.xs = n > 0 ? xs.data() : nullptr;
+  conf.values.ys_list = n > 0 ? ys : nullptr;
+  conf.values.ys_count = 5;
+  conf.values.count = n;
+  conf.values.colors = cols;
+  conf.scale.min = 0.f;
+  conf.scale.max = 1.f;
+  conf.tooltip.show = false;
+  conf.grid_y.show = true;
+  conf.grid_y.size = 0.25f;
+  conf.grid_y.subticks = 1;
+  conf.grid_x.show = false;
+  conf.frame_size = ImVec2(std::max(8.f, ImGui::GetContentRegionAvail().x), 118.f);
+  conf.line_thickness = 2.f;
+  conf.skip_small_lines = true;
+  ImGui::Plot("##trend", conf);
+
+  const int idx = trend_hover_index(src_n);
+  if (idx < 0 || !tr) return;
+  const TrendPt& pt = tr->pts[idx];
+  int sec = (int)(pt.t + 0.5f);
+  if (sec < 0) sec = 0;
+  ImGui::BeginTooltip();
+  ImGui::Text("%d:%02d", sec / 60, sec % 60);
   for (int s = 0; s < 3; ++s) {
-    dl->AddRectFilled(ImVec2(lx, origin.y + 8.f), ImVec2(lx + 10.f, origin.y + 16.f), cols[s], 2.f);
-    lx += 14.f;
-    dl->AddText(ImVec2(lx, origin.y + 3.f), cols[s], names[s]);
-    lx += ImGui::CalcTextSize(names[s]).x + 10.f;
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(cols[s]), u8"%s  %u", names[s],
+                       trend_total(pt, s));
+    ImGui::TextDisabled(u8"    部队 %u    建筑 %u", pt.v[s], pt.v[s + 3]);
   }
-  lx = origin.x + 8.f;
   for (int s = 3; s < 5; ++s) {
-    dl->AddRectFilled(ImVec2(lx, origin.y + 26.f), ImVec2(lx + 10.f, origin.y + 34.f), cols[s], 2.f);
-    lx += 14.f;
-    dl->AddText(ImVec2(lx, origin.y + 21.f), cols[s], names[s]);
-    lx += ImGui::CalcTextSize(names[s]).x + 10.f;
+    char num[32];
+    format_uint_grouped(num, sizeof(num), trend_total(pt, s));
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(cols[s]), u8"%s  %s", names[s], num);
   }
-
-  const float plot_x = origin.x + 8.f;
-  const float plot_y = origin.y + 44.f;
-  const float plot_w = std::max(8.f, avail - 16.f);
-  const float plot_h = h - 52.f;
-  dl->AddLine(ImVec2(plot_x, plot_y + plot_h * 0.5f),
-              ImVec2(plot_x + plot_w, plot_y + plot_h * 0.5f), IM_COL32(255, 255, 255, 22));
-  dl->AddLine(ImVec2(plot_x, plot_y + plot_h), ImVec2(plot_x + plot_w, plot_y + plot_h),
-              IM_COL32(255, 255, 255, 28));
-
-  const int n = tr ? (int)tr->pts.size() : 0;
-  float tmin = 0.f, tmax = 1.f;
-  uint32_t ymax = 4;
-  uint32_t money_ymax = 4;
-  if (n > 0) {
-    tmin = tr->pts.front().t;
-    tmax = tr->pts.back().t;
-    if (tmax <= tmin) tmax = tmin + 1.f;
-    uint32_t peak = 1;
-    uint32_t money_peak = 1;
-    for (const auto& pt : tr->pts) {
-      for (int s = 0; s < 3; ++s) peak = std::max(peak, trend_total(pt, s));
-      for (int s = 3; s < 5; ++s) money_peak = std::max(money_peak, trend_total(pt, s));
-    }
-    ymax = peak < 4 ? 4u : (peak + 3u) & ~3u;
-    money_ymax = money_peak < 4 ? 4u : money_peak;
-  }
-
-  auto at_axis = [&](float t, uint32_t val, uint32_t axis_max) {
-    const float u = (t - tmin) / (tmax - tmin);
-    const float vv = (float)val / (float)axis_max;
-    return ImVec2(plot_x + u * plot_w, plot_y + plot_h * (1.f - vv));
-  };
-  auto at = [&](float t, uint32_t val, int series) {
-    return at_axis(t, val, series < 3 ? ymax : money_ymax);
-  };
-
-  if (n >= 1) {
-    for (int s = 0; s < 5; ++s) {
-      dl->PathClear();
-      if (n == 1) {
-        const uint32_t val = trend_total(tr->pts[0], s);
-        dl->PathLineTo(at(tmin, val, s));
-        dl->PathLineTo(at(tmax, val, s));
-      } else {
-        for (const auto& pt : tr->pts) dl->PathLineTo(at(pt.t, trend_total(pt, s), s));
-      }
-      dl->PathStroke(cols[s], 0, 2.f);
-    }
-  }
-
-  const ImVec2 plot0(plot_x, plot_y);
-  const ImVec2 plot1(plot_x + plot_w, plot_y + plot_h);
-  if (n > 0 && ImGui::IsMouseHoveringRect(plot0, plot1)) {
-    const float mx = ImGui::GetIO().MousePos.x;
-    float u = (mx - plot_x) / plot_w;
-    if (u < 0.f) u = 0.f;
-    if (u > 1.f) u = 1.f;
-    const float th = tmin + u * (tmax - tmin);
-    int best = 0;
-    float best_d = 1.0e9f;
-    for (int i = 0; i < n; ++i) {
-      float d = tr->pts[i].t - th;
-      if (d < 0.f) d = -d;
-      if (d < best_d) {
-        best_d = d;
-        best = i;
-      }
-    }
-    const TrendPt& pt = tr->pts[best];
-    const float x = at(pt.t, 0, 0).x;
-    dl->AddLine(ImVec2(x, plot_y), ImVec2(x, plot_y + plot_h), IM_COL32(255, 255, 255, 110), 1.f);
-    for (int s = 0; s < 5; ++s) {
-      const ImVec2 p = at(pt.t, trend_total(pt, s), s);
-      dl->AddCircleFilled(p, 3.f, cols[s]);
-    }
-    int sec = (int)(pt.t + 0.5f);
-    if (sec < 0) sec = 0;
-    ImGui::BeginTooltip();
-    ImGui::Text("%d:%02d", sec / 60, sec % 60);
-    for (int s = 0; s < 3; ++s) {
-      ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(cols[s]), u8"%s  %u", names[s],
-                         trend_total(pt, s));
-      ImGui::TextDisabled(u8"    部队 %u    建筑 %u", pt.v[s], pt.v[s + 3]);
-    }
-    for (int s = 3; s < 5; ++s) {
-      char num[32];
-      format_uint_grouped(num, sizeof(num), trend_total(pt, s));
-      ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(cols[s]), u8"%s  %s", names[s], num);
-    }
-    ImGui::EndTooltip();
-  }
-
-  ImGui::Dummy(ImVec2(avail, h));
+  ImGui::EndTooltip();
 }
 
 void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
@@ -934,30 +945,797 @@ void begin_frame() {
   ImGui::NewFrame();
 }
 
+static int g_tile_col = 0;
+static int g_tile_cols = 3;
+static float g_tile_w = 0.f;
+
+static void end_chip_flow() { g_tile_col = 0; }
+
+// HUD card. Consecutive cards fill a 2- or 3-column grid.
+// active lights the card (toggles and the selected danger level).
+static bool draw_hud_tile(const char* id, const char* title, const char* hotkey, bool active,
+                          bool enabled) {
+  const float gap = 8.f;
+  if (g_tile_col == 0) {
+    const float avail = ImGui::GetContentRegionAvail().x;
+    g_tile_cols = avail >= 480.f ? 3 : 2;
+    g_tile_w = (avail - gap * (float)(g_tile_cols - 1)) / (float)g_tile_cols;
+    if (g_tile_w < 48.f) g_tile_w = avail;
+  } else {
+    ImGui::SameLine(0.f, gap);
+  }
+  const float h = ImGui::GetFrameHeight() * 2.15f;
+  ImGui::PushID(id);
+  const ImVec2 p0 = ImGui::GetCursorScreenPos();
+  const ImVec2 sz(g_tile_w, h);
+  const bool pressed = ImGui::InvisibleButton("##hud", sz);
+  const bool hov = enabled && ImGui::IsItemHovered();
+  const bool held = enabled && ImGui::IsItemActive();
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const ImVec2 p1(p0.x + sz.x, p0.y + sz.y);
+  const float rnd = 10.f;
+
+  ImU32 bg;
+  ImU32 edge;
+  ImU32 bar;
+  if (!enabled) {
+    bg = IM_COL32(24, 28, 36, 150);
+    edge = IM_COL32(70, 80, 96, 110);
+    bar = IM_COL32(80, 90, 110, 80);
+  } else if (active) {
+    bg = held ? IM_COL32(10, 72, 124, 250) : hov ? IM_COL32(16, 92, 154, 248)
+                                                 : IM_COL32(12, 58, 112, 240);
+    edge = IM_COL32(110, 220, 255, 240);
+    bar = IM_COL32(80, 230, 255, 255);
+  } else {
+    bg = held ? IM_COL32(26, 46, 74, 245) : hov ? IM_COL32(30, 50, 82, 240)
+                                                : IM_COL32(16, 22, 34, 230);
+    edge = hov ? IM_COL32(96, 168, 236, 220) : IM_COL32(64, 92, 128, 170);
+    bar = hov ? IM_COL32(90, 170, 240, 220) : IM_COL32(52, 96, 150, 140);
+  }
+
+  dl->AddRectFilled(ImVec2(p0.x + 2.f, p0.y + 3.f), ImVec2(p1.x + 2.f, p1.y + 3.f),
+                    IM_COL32(0, 0, 0, 80), rnd);
+  dl->AddRectFilled(p0, p1, bg, rnd);
+  dl->PushClipRect(p0, p1, true);
+  dl->AddRectFilledMultiColor(p0, p1, IM_COL32(255, 255, 255, active ? 28 : 16),
+                              IM_COL32(255, 255, 255, active ? 28 : 16), IM_COL32(0, 0, 0, 0),
+                              IM_COL32(0, 0, 0, 0));
+  dl->PopClipRect();
+  dl->AddRect(p0, p1, edge, rnd, 0, (hov || active) ? 1.7f : 1.0f);
+  dl->AddRectFilled(ImVec2(p0.x + 2.f, p0.y + 9.f), ImVec2(p0.x + 5.f, p1.y - 9.f), bar, 2.f);
+
+  dl->PushClipRect(ImVec2(p0.x + 12.f, p0.y + 3.f), ImVec2(p1.x - 8.f, p1.y - 3.f), true);
+  const ImVec2 ts = ImGui::CalcTextSize(title ? title : "");
+  const bool has_key = hotkey && hotkey[0];
+  const float ty = p0.y + (has_key ? 7.f : (sz.y - ts.y) * 0.5f);
+  dl->AddText(ImVec2(p0.x + 14.f, ty),
+              enabled ? IM_COL32(236, 244, 252, 255) : IM_COL32(150, 158, 170, 180),
+              title ? title : "");
+  if (has_key) {
+    const ImVec2 bs = ImGui::CalcTextSize(hotkey);
+    const ImVec2 b0(p1.x - bs.x - 14.f, p1.y - bs.y - 7.f);
+    dl->AddRectFilled(ImVec2(b0.x - 6.f, b0.y - 2.f), ImVec2(p1.x - 8.f, b0.y + bs.y + 2.f),
+                      IM_COL32(6, 14, 26, 200), 4.f);
+    dl->AddText(b0, enabled ? IM_COL32(150, 206, 255, 240) : IM_COL32(120, 140, 160, 140),
+                hotkey);
+  }
+  if (active) {
+    dl->AddCircleFilled(ImVec2(p1.x - 12.f, p0.y + 12.f), 3.5f, IM_COL32(140, 255, 220, 245));
+  }
+  dl->PopClipRect();
+
+  g_tile_col = (g_tile_col + 1) % g_tile_cols;
+  ImGui::PopID();
+  return enabled && pressed;
+}
+
+static bool draw_nav_item(const char* id, const char* label, bool selected) {
+  ImGui::PushID(id);
+  const float w = ImGui::GetContentRegionAvail().x;
+  const float h = ImGui::GetFrameHeight() + 2.f;
+  const ImVec2 p0 = ImGui::GetCursorScreenPos();
+  const bool pressed = ImGui::InvisibleButton("##nav", ImVec2(w, h));
+  const bool hov = ImGui::IsItemHovered();
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const ImVec2 p1(p0.x + w, p0.y + h);
+  if (selected || hov) {
+    const ImU32 bg = selected ? IM_COL32(14, 52, 98, 235) : IM_COL32(26, 36, 52, 190);
+    dl->AddRectFilled(p0, p1, bg, 7.f);
+    dl->AddRect(p0, p1, selected ? IM_COL32(90, 196, 255, 200) : IM_COL32(70, 100, 140, 120),
+                7.f, 0, 1.f);
+  }
+  if (selected) {
+    dl->AddRectFilled(ImVec2(p0.x + 1.f, p0.y + 5.f), ImVec2(p0.x + 4.f, p1.y - 5.f),
+                      IM_COL32(110, 220, 255, 255), 2.f);
+  }
+  const ImVec2 ts = ImGui::CalcTextSize(label ? label : "");
+  dl->AddText(ImVec2(p0.x + 12.f, p0.y + (h - ts.y) * 0.5f),
+              selected ? IM_COL32(220, 242, 255, 255) : IM_COL32(186, 198, 214, 235),
+              label ? label : "");
+  ImGui::PopID();
+  return pressed;
+}
+
+static int g_capture_slot = -1;
+static bool g_capture_ready = false;
+
+static const char* danger_slot_label(const char* id) {
+  if (!id) return "";
+  if (std::strcmp(id, "danger_max") == 0) return u8"高";
+  if (std::strcmp(id, "danger_min") == 0) return u8"最高";
+  if (std::strcmp(id, "danger_norm") == 0) return u8"正常";
+  return id;
+}
+
+static void begin_hotkey_capture(int slot) {
+  g_capture_slot = slot;
+  g_capture_ready = false;
+  game_api::set_hotkey_capture(true);
+  g_last_msg = u8"请按下新的快捷键，Esc 取消";
+}
+
+static void poll_hotkey_capture() {
+  if (g_capture_slot < 0) {
+    game_api::set_hotkey_capture(false);
+    return;
+  }
+  game_api::set_hotkey_capture(true);
+  bool any = false;
+  int found = 0;
+  for (int vk = 8; vk < 256; ++vk) {
+    if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON || vk == VK_XBUTTON1 ||
+        vk == VK_XBUTTON2) {
+      continue;
+    }
+    if ((GetAsyncKeyState(vk) & 0x8000) == 0) continue;
+    any = true;
+    if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || vk == VK_LSHIFT ||
+        vk == VK_RSHIFT || vk == VK_LCONTROL || vk == VK_RCONTROL || vk == VK_LMENU ||
+        vk == VK_RMENU) {
+      continue;
+    }
+    found = vk;
+    break;
+  }
+  if (!g_capture_ready) {
+    if (!any) g_capture_ready = true;
+    return;
+  }
+  if (!found) return;
+  const int slot = g_capture_slot;
+  g_capture_slot = -1;
+  g_capture_ready = false;
+  game_api::set_hotkey_capture(false);
+  if (found == VK_ESCAPE) {
+    g_last_msg = u8"已取消修改快捷键";
+    return;
+  }
+  std::string err;
+  if (!game_api::set_hotkey_slot(slot, found, (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0,
+                                 (GetAsyncKeyState(VK_MENU) & 0x8000) != 0,
+                                 (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0, &err)) {
+    g_last_msg = err.empty() ? std::string(u8"快捷键没有改成") : err;
+    game_api::beep("error");
+    return;
+  }
+  char shown[48] = {};
+  game_api::format_hotkey_slot(slot, shown, sizeof(shown));
+  g_last_msg = std::string(u8"快捷键已保存 ") + shown;
+  mark_settings_dirty();
+  game_api::beep("click");
+}
+
+static bool draw_gear_button(const char* id, const char* tip, bool* right_click) {
+  ImGui::PushID(id);
+  const float s = ImGui::GetFrameHeight();
+  const ImVec2 p0 = ImGui::GetCursorScreenPos();
+  const bool pressed = ImGui::InvisibleButton("##gear", ImVec2(s, s));
+  if (right_click) *right_click = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+  const bool hov = ImGui::IsItemHovered();
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const ImVec2 c(p0.x + s * 0.5f, p0.y + s * 0.5f);
+  const float r = s * 0.22f;
+  const ImU32 col = hov ? IM_COL32(150, 214, 255, 255) : IM_COL32(168, 184, 204, 230);
+  if (hov) dl->AddCircleFilled(c, s * 0.40f, IM_COL32(36, 64, 102, 200), 18);
+  dl->AddCircle(c, r, col, 16, 1.7f);
+  dl->AddCircleFilled(c, r * 0.42f, col, 12);
+  for (int i = 0; i < 8; ++i) {
+    const float a = (float)i * 0.78539816f;
+    const float cs = std::cos(a);
+    const float sn = std::sin(a);
+    dl->AddLine(ImVec2(c.x + cs * (r * 0.72f), c.y + sn * (r * 0.72f)),
+                ImVec2(c.x + cs * (r + s * 0.16f), c.y + sn * (r + s * 0.16f)), col, 2.2f);
+  }
+  if (hov && tip && tip[0]) ImGui::SetTooltip("%s", tip);
+  ImGui::PopID();
+  return pressed;
+}
+
+static bool draw_switch(const char* id, bool on, bool enabled) {
+  ImGui::PushID(id);
+  const float h = ImGui::GetFrameHeight() * 0.86f;
+  const float w = h * 1.9f;
+  const ImVec2 p0 = ImGui::GetCursorScreenPos();
+  const bool pressed = ImGui::InvisibleButton("##sw", ImVec2(w, h));
+  const bool hov = ImGui::IsItemHovered();
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const ImU32 track = !enabled ? IM_COL32(46, 52, 62, 150)
+                               : on ? IM_COL32(22, 118, 176, 245) : IM_COL32(46, 54, 68, 235);
+  const ImU32 knob = !enabled ? IM_COL32(140, 148, 158, 170)
+                              : on ? IM_COL32(236, 250, 255, 255) : IM_COL32(176, 188, 204, 235);
+  dl->AddRectFilled(p0, ImVec2(p0.x + w, p0.y + h), track, h * 0.5f);
+  dl->AddRect(p0, ImVec2(p0.x + w, p0.y + h),
+              on && enabled ? IM_COL32(120, 214, 255, 220) : IM_COL32(86, 100, 120, 150), h * 0.5f,
+              0, 1.3f);
+  const float pad = 3.f;
+  const float kr = (h - pad * 2.f) * 0.5f;
+  const float kx = on ? (p0.x + w - pad - kr) : (p0.x + pad + kr);
+  dl->AddCircleFilled(ImVec2(kx, p0.y + h * 0.5f), kr, knob, 18);
+  if (hov) ImGui::SetTooltip("%s", !enabled ? u8"请先注入" : on ? u8"点击关闭" : u8"点击开启");
+  ImGui::PopID();
+  return enabled && pressed;
+}
+
+static void draw_feature_gear(const char* feature) {
+  int slots[4] = {};
+  const int n = game_api::hotkey_slots_for_feature(feature, slots, 4);
+  if (n <= 0) return;
+  char tip[160] = {};
+  if (n == 1 && g_capture_slot == slots[0]) {
+    std::snprintf(tip, sizeof(tip), u8"请按下新的快捷键，Esc 取消");
+  } else if (n == 1) {
+    char combo[48] = {};
+    game_api::format_hotkey_slot(slots[0], combo, sizeof(combo));
+    std::snprintf(tip, sizeof(tip), u8"修改快捷键\n当前 %s\n右键恢复默认",
+                  combo[0] ? combo : u8"未设置");
+  } else {
+    std::snprintf(tip, sizeof(tip), u8"修改快捷键");
+  }
+  bool right = false;
+  if (draw_gear_button(feature, tip, &right)) {
+    if (n == 1) begin_hotkey_capture(slots[0]);
+    else ImGui::OpenPopup("##hkpop");
+  }
+  if (n == 1 && right) {
+    if (game_api::reset_hotkey_slot(slots[0])) {
+      char combo[48] = {};
+      game_api::format_hotkey_slot(slots[0], combo, sizeof(combo));
+      g_last_msg = std::string(u8"已恢复默认快捷键 ") + combo;
+      mark_settings_dirty();
+    }
+  }
+  if (ImGui::BeginPopup("##hkpop")) {
+    ImGui::TextUnformatted(u8"修改快捷键");
+    for (int i = 0; i < n; ++i) {
+      const char* id = game_api::hotkey_slot_id(slots[i]);
+      char combo[48] = {};
+      game_api::format_hotkey_slot(slots[i], combo, sizeof(combo));
+      char line[96] = {};
+      std::snprintf(line, sizeof(line), "%s    %s", danger_slot_label(id),
+                    combo[0] ? combo : u8"未设置");
+      if (ImGui::Button(line, ImVec2(180, 0))) {
+        begin_hotkey_capture(slots[i]);
+        ImGui::CloseCurrentPopup();
+      }
+    }
+    ImGui::EndPopup();
+  }
+}
+
+static void run_feature_action(const game_api::FeatureInfo* f) {
+  if (!f) return;
+  if (std::strcmp(f->type, "pulse") == 0) {
+    std::string msg;
+    const bool ok = game_api::pulse_feature(f->key, &msg);
+    g_last_msg = msg;
+    game_api::beep(ok ? "click" : "error");
+    return;
+  }
+  if (std::strcmp(f->type, "engine") == 0) {
+    if (start_engine_async(f->key)) {
+      g_last_msg = u8"正在执行…（请把鼠标移到地形上）";
+    } else {
+      g_last_msg = u8"上一次操作仍在进行中";
+      game_api::beep("error");
+    }
+    return;
+  }
+  if (std::strcmp(f->type, "money") == 0) {
+    std::string msg;
+    const bool ok = game_api::adjust_local_money(game_api::money_self_step(), &msg);
+    g_last_msg = msg;
+    game_api::beep(ok ? "click" : "error");
+  }
+}
+
+static void draw_hotkey_row(const game_api::FeatureInfo* f, bool armed, bool as_switch,
+                            bool action_enabled) {
+  end_chip_flow();
+  ImGui::PushID(f->key);
+  const float gear = ImGui::GetFrameHeight();
+  const float gap = 8.f;
+  const float avail = ImGui::GetContentRegionAvail().x;
+  const float action_w = as_switch ? gear * 1.64f : 72.f;
+  const float name_w = std::max(24.f, avail - gear - action_w - gap * 2.f);
+  const ImVec2 origin = ImGui::GetCursorScreenPos();
+  const float row_h = gear;
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  dl->AddRectFilled(origin, ImVec2(origin.x + avail, origin.y + row_h), IM_COL32(16, 22, 34, 215),
+                    8.f);
+  dl->AddRect(origin, ImVec2(origin.x + avail, origin.y + row_h), IM_COL32(58, 84, 116, 150), 8.f,
+              0, 1.f);
+
+  const ImVec2 ts = ImGui::CalcTextSize(f->label);
+  dl->PushClipRect(ImVec2(origin.x + 4.f, origin.y), ImVec2(origin.x + name_w - 4.f, origin.y + row_h),
+                   true);
+  dl->AddText(ImVec2(origin.x + 12.f, origin.y + (row_h - ts.y) * 0.5f), IM_COL32(232, 240, 248, 255),
+              f->label);
+  dl->PopClipRect();
+  ImGui::Dummy(ImVec2(name_w, row_h));
+  ImGui::SameLine(0.f, gap);
+  draw_feature_gear(f->key);
+  ImGui::SameLine(0.f, gap);
+  if (as_switch) {
+    const bool on = game_api::feature_enabled(f->key);
+    if (draw_switch("sw", on, armed)) {
+      std::string msg;
+      const bool ok = game_api::toggle_feature(f->key, !on, &msg);
+      g_last_msg = msg;
+      game_api::beep(ok ? (!on ? "on" : "off") : "error");
+    }
+  } else {
+    if (!action_enabled) ImGui::BeginDisabled();
+    if (ImGui::Button(u8"执行", ImVec2(action_w, 0))) run_feature_action(f);
+    if (!action_enabled) ImGui::EndDisabled();
+  }
+  ImGui::PopID();
+}
+
+static bool feature_needs_hooks(const char* key) {
+  if (!key) return false;
+  return std::strcmp(key, "protocol_ready") == 0 || std::strcmp(key, "unit_skill_ready") == 0 ||
+         std::strcmp(key, "disable_protocol") == 0 || std::strcmp(key, "unit_clone") == 0 ||
+         std::strcmp(key, "spawn_unit") == 0 || std::strcmp(key, "clone_multi") == 0 ||
+         std::strcmp(key, "ore_convoy") == 0 ||
+         std::strcmp(key, "full_buff") == 0 || std::strcmp(key, "spawn_mcv") == 0;
+}
+
+static int g_pair_col = 0;
+static int g_pair_cols = 2;
+static float g_pair_w = 0.f;
+
+static void end_pair_flow() { g_pair_col = 0; }
+
+static void begin_grid_cell(int cols) {
+  const float gap = 6.f;
+  if (g_pair_col == 0) {
+    const float avail = ImGui::GetContentRegionAvail().x;
+    int use = cols < 1 ? 1 : cols;
+    if (use > 2 && avail < 460.f) use = 2;
+    if (avail < 260.f) use = 1;
+    g_pair_cols = use;
+    g_pair_w = use <= 1 ? avail : (avail - gap * (float)(use - 1)) / (float)use;
+  } else {
+    ImGui::SameLine(0.f, gap);
+  }
+}
+
+static void end_grid_cell() {
+  g_pair_col = g_pair_cols <= 1 ? 0 : (g_pair_col + 1) % g_pair_cols;
+}
+
+static void draw_compact_cell(const game_api::FeatureInfo* f, int cols) {
+  if (!f) return;
+  const bool as_switch = std::strcmp(f->type, "toggle") == 0;
+  begin_grid_cell(cols);
+
+  const bool armed = game_api::hooks_armed();
+  const bool busy = InterlockedCompareExchange(&g_engine_busy, 0, 0) != 0;
+  const bool action_ok = as_switch ? armed
+                                   : ((!(feature_needs_hooks(f->key) && !armed)) && !busy);
+  int slots[1] = {};
+  const bool has_hk = game_api::hotkey_slots_for_feature(f->key, slots, 1) > 0;
+  const float row_h = ImGui::GetFrameHeight();
+  const float sw_h = row_h * 0.86f;
+  const float action_w = as_switch ? sw_h * 1.9f : 52.f;
+  const float gear_w = has_hk ? row_h : 0.f;
+  const float inner = 4.f;
+  const float name_w =
+      std::max(20.f, g_pair_w - gear_w - action_w - inner * (has_hk ? 2.f : 1.f));
+
+  ImGui::PushID(f->key);
+  const ImVec2 origin = ImGui::GetCursorScreenPos();
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const bool on = as_switch && game_api::feature_enabled(f->key);
+  dl->AddRectFilled(origin, ImVec2(origin.x + g_pair_w, origin.y + row_h),
+                    on ? IM_COL32(12, 40, 72, 230) : IM_COL32(16, 22, 34, 215), 6.f);
+  dl->AddRect(origin, ImVec2(origin.x + g_pair_w, origin.y + row_h),
+              on ? IM_COL32(90, 190, 240, 200) : IM_COL32(58, 84, 116, 150), 6.f, 0, 1.f);
+
+  const bool name_click = ImGui::InvisibleButton("##name", ImVec2(name_w, row_h));
+  if (ImGui::IsItemHovered()) {
+    const char* hk = game_api::hotkey_hint(f->key);
+    if (hk && hk[0]) ImGui::SetTooltip("%s\n%s", f->label, hk);
+    else ImGui::SetTooltip("%s", f->label);
+  }
+  const ImVec2 ts = ImGui::CalcTextSize(f->label);
+  dl->PushClipRect(ImVec2(origin.x + 2.f, origin.y), ImVec2(origin.x + name_w - 2.f, origin.y + row_h),
+                   true);
+  dl->AddText(ImVec2(origin.x + 8.f, origin.y + (row_h - ts.y) * 0.5f),
+              action_ok ? IM_COL32(232, 240, 248, 255) : IM_COL32(150, 158, 170, 180), f->label);
+  dl->PopClipRect();
+  if (has_hk) {
+    ImGui::SameLine(0.f, inner);
+    draw_feature_gear(f->key);
+  }
+  ImGui::SameLine(0.f, inner);
+  if (as_switch) {
+    if (draw_switch("sw", on, armed) || (name_click && armed)) {
+      std::string msg;
+      const bool ok = game_api::toggle_feature(f->key, !on, &msg);
+      g_last_msg = msg;
+      game_api::beep(ok ? (!on ? "on" : "off") : "error");
+    }
+  } else {
+    if (!action_ok) ImGui::BeginDisabled();
+    const bool run = ImGui::Button(u8"执行", ImVec2(action_w, row_h)) || (name_click && action_ok);
+    if (!action_ok) ImGui::EndDisabled();
+    if (run) run_feature_action(f);
+  }
+  ImGui::PopID();
+
+  end_grid_cell();
+}
+
+static void draw_money_cell(const game_api::FeatureInfo* f, int cols) {
+  if (!f) return;
+  const bool sel = std::strcmp(f->type, "money_sel") == 0;
+  begin_grid_cell(cols);
+  int step = sel ? game_api::money_sel_step() : game_api::money_self_step();
+  int slots[1] = {};
+  const bool has_hk = game_api::hotkey_slots_for_feature(f->key, slots, 1) > 0;
+  const float row_h = ImGui::GetFrameHeight();
+  const float btn_w = 30.f;
+  const float gear_w = has_hk ? row_h : 0.f;
+  const float inner = 4.f;
+  const float name_w =
+      std::max(20.f, g_pair_w - gear_w - btn_w * 2.f - 2.f - inner * (has_hk ? 2.f : 1.f));
+
+  ImGui::PushID(f->key);
+  const ImVec2 origin = ImGui::GetCursorScreenPos();
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  dl->AddRectFilled(origin, ImVec2(origin.x + g_pair_w, origin.y + row_h), IM_COL32(16, 22, 34, 215),
+                    6.f);
+  dl->AddRect(origin, ImVec2(origin.x + g_pair_w, origin.y + row_h), IM_COL32(58, 84, 116, 150), 6.f,
+              0, 1.f);
+
+  const bool name_click = ImGui::InvisibleButton("##name", ImVec2(name_w, row_h));
+  const bool name_right = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+  if (ImGui::IsItemHovered()) {
+    const char* hk = game_api::hotkey_hint(f->key);
+    if (sel) {
+      if (hk && hk[0]) {
+        ImGui::SetTooltip(u8"%s\n每次 %d\n%s\n点击名称修改每次金额", f->label, step, hk);
+      } else {
+        ImGui::SetTooltip(u8"%s\n每次 %d\n点击名称修改每次金额", f->label, step);
+      }
+    } else if (hk && hk[0]) {
+      ImGui::SetTooltip(u8"%s\n每次 %d\n%s\n点击名称修改每次金额", f->label, step, hk);
+    } else {
+      ImGui::SetTooltip(u8"%s\n每次 %d\n点击名称修改每次金额", f->label, step);
+    }
+  }
+  if (name_click || name_right) ImGui::OpenPopup("##step");
+  const ImVec2 ts = ImGui::CalcTextSize(f->label);
+  dl->PushClipRect(ImVec2(origin.x + 2.f, origin.y), ImVec2(origin.x + name_w - 2.f, origin.y + row_h),
+                   true);
+  dl->AddText(ImVec2(origin.x + 8.f, origin.y + (row_h - ts.y) * 0.5f), IM_COL32(232, 240, 248, 255),
+              f->label);
+  dl->PopClipRect();
+  if (ImGui::BeginPopup("##step")) {
+    ImGui::TextUnformatted(u8"每次金额");
+    ImGui::SetNextItemWidth(150.f);
+    if (ImGui::InputInt("##amt", &step, 10000, 100000)) {
+      if (sel) game_api::set_money_sel_step(step);
+      else game_api::set_money_self_step(step);
+      mark_settings_dirty();
+    }
+    ImGui::EndPopup();
+  }
+  if (has_hk) {
+    ImGui::SameLine(0.f, inner);
+    draw_feature_gear(f->key);
+  }
+  ImGui::SameLine(0.f, inner);
+  if (ImGui::Button("+", ImVec2(btn_w, row_h))) {
+    std::string msg;
+    const bool ok = sel ? game_api::adjust_selected_player_money(game_api::money_sel_step(), &msg)
+                        : game_api::adjust_local_money(game_api::money_self_step(), &msg);
+    g_last_msg = msg;
+    game_api::beep(ok ? "click" : "error");
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(u8"+ %d", sel ? game_api::money_sel_step() : game_api::money_self_step());
+  }
+  ImGui::SameLine(0.f, 2.f);
+  if (ImGui::Button("-", ImVec2(btn_w, row_h))) {
+    std::string msg;
+    const int d = sel ? game_api::money_sel_step() : game_api::money_self_step();
+    const bool ok = sel ? game_api::adjust_selected_player_money(-d, &msg)
+                        : game_api::adjust_local_money(-d, &msg);
+    g_last_msg = msg;
+    game_api::beep(ok ? "click" : "error");
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(u8"- %d", sel ? game_api::money_sel_step() : game_api::money_self_step());
+  }
+  ImGui::PopID();
+  end_grid_cell();
+}
+
+static bool draw_mcv_choice(const char* id, const char* type_id, const char* tip, bool selected) {
+  const float s = 56.f;
+  ImGui::PushID(id);
+  const ImVec2 p0 = ImGui::GetCursorScreenPos();
+  const bool pressed = ImGui::InvisibleButton("##mcv", ImVec2(s, s));
+  const bool hov = ImGui::IsItemHovered();
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const ImU32 bg = selected ? IM_COL32(12, 48, 88, 245) : IM_COL32(16, 22, 34, 235);
+  const ImU32 edge = selected ? IM_COL32(110, 220, 255, 255)
+                              : hov ? IM_COL32(96, 168, 236, 230) : IM_COL32(64, 92, 128, 180);
+  dl->AddRectFilled(p0, ImVec2(p0.x + s, p0.y + s), bg, 8.f);
+  dl->AddRect(p0, ImVec2(p0.x + s, p0.y + s), edge, 8.f, 0, selected ? 2.2f : 1.2f);
+  IDirect3DTexture9* tex = unit_icons::get(type_id, "MCV", false);
+  if (tex) {
+    dl->AddImage((ImTextureID)tex, ImVec2(p0.x + 4.f, p0.y + 4.f), ImVec2(p0.x + s - 4.f, p0.y + s - 4.f));
+  }
+  if (selected) {
+    dl->AddCircleFilled(ImVec2(p0.x + s - 10.f, p0.y + 10.f), 3.5f, IM_COL32(140, 255, 220, 245));
+  }
+  if (hov) ImGui::SetTooltip("%s", tip);
+  ImGui::PopID();
+  return pressed;
+}
+
+static int draw_danger_slider(int level, bool enabled, float width) {
+  if (level < 0 || level > 2) level = 0;
+  static const char* names[3] = {u8"正常", u8"高", u8"最高"};
+  const float h = ImGui::GetFrameHeight();
+  const float w = std::max(48.f, width);
+
+  ImGui::PushID("danger_slider");
+  const ImVec2 origin = ImGui::GetCursorScreenPos();
+  ImGui::InvisibleButton("##sl", ImVec2(w, h));
+  const bool hot = enabled && (ImGui::IsItemActive() || ImGui::IsItemClicked());
+  int picked = level;
+  if (hot && w > 8.f) {
+    float t = (ImGui::GetIO().MousePos.x - origin.x) / w;
+    if (t < 0.f) t = 0.f;
+    if (t > 0.999f) t = 0.999f;
+    picked = (int)(t * 3.f);
+    if (picked < 0) picked = 0;
+    if (picked > 2) picked = 2;
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(u8"拖动选择：正常 / 高 / 最高");
+  }
+
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const float rnd = h * 0.45f;
+  const float seg = w / 3.f;
+  ImU32 accent = IM_COL32(90, 100, 116, 160);
+  if (enabled) {
+    accent = picked == 2 ? IM_COL32(255, 96, 88, 255)
+                          : picked == 1 ? IM_COL32(255, 186, 72, 255)
+                                        : IM_COL32(90, 210, 255, 255);
+  }
+  dl->AddRectFilled(origin, ImVec2(origin.x + w, origin.y + h), IM_COL32(10, 16, 26, 235), rnd);
+  const float xL = origin.x + seg * (float)picked;
+  const float xR = xL + seg;
+  ImDrawFlags corners = ImDrawFlags_RoundCornersNone;
+  if (picked == 0) corners = ImDrawFlags_RoundCornersLeft;
+  else if (picked == 2) corners = ImDrawFlags_RoundCornersRight;
+  const ImU32 fill = enabled ? (accent & 0x00FFFFFFu) | 0x55000000u : IM_COL32(70, 80, 96, 80);
+  dl->AddRectFilled(ImVec2(xL, origin.y), ImVec2(xR, origin.y + h), fill, rnd, corners);
+  dl->AddRect(origin, ImVec2(origin.x + w, origin.y + h),
+              enabled ? accent : IM_COL32(80, 90, 108, 140), rnd, 0, 1.2f);
+  for (int i = 0; i < 3; ++i) {
+    const ImVec2 ts = ImGui::CalcTextSize(names[i]);
+    const float tx = origin.x + seg * ((float)i + 0.5f) - ts.x * 0.5f;
+    const ImU32 tc = (enabled && i == picked) ? IM_COL32(244, 250, 255, 255)
+                                               : IM_COL32(150, 164, 182, 210);
+    dl->AddText(ImVec2(tx, origin.y + (h - ts.y) * 0.5f), tc, names[i]);
+  }
+  ImGui::PopID();
+  return picked;
+}
+
+static int draw_rank_slider(int level, bool* dragging) {
+  if (level < 0 || level > 3) level = 0;
+  static const char* names[4] = {u8"不设置", u8"一级", u8"二级", u8"三级"};
+  const float w = std::max(48.f, ImGui::GetContentRegionAvail().x);
+  const float text_h = ImGui::GetTextLineHeight();
+  const float grab_r = 9.f;
+  const float track_y = grab_r + 2.f;
+  const float h = track_y + grab_r + 6.f + text_h;
+  const float pad = grab_r + 4.f;
+
+  ImGui::PushID("spawn_rank_slider");
+  const ImVec2 origin = ImGui::GetCursorScreenPos();
+  ImGui::InvisibleButton("##sl", ImVec2(w, h));
+  const bool hot = ImGui::IsItemActive() || ImGui::IsItemClicked();
+  if (dragging) *dragging = ImGui::IsItemActive();
+  int picked = level;
+  if (hot && w > pad * 2.f) {
+    const float t = (ImGui::GetIO().MousePos.x - (origin.x + pad)) / (w - pad * 2.f);
+    const float clamped = t < 0.f ? 0.f : (t > 1.f ? 1.f : t);
+    picked = (int)(clamped * 3.f + 0.5f);
+    if (picked < 0) picked = 0;
+    if (picked > 3) picked = 3;
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(u8"拖动选择出场等级：不设置 / 一级 / 二级 / 三级");
+  }
+
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const float cy = origin.y + track_y;
+  const float x0 = origin.x + pad;
+  const float x1 = origin.x + w - pad;
+  const float span = std::max(1.f, x1 - x0);
+  const float gx = x0 + span * ((float)picked / 3.f);
+  ImU32 accent = IM_COL32(150, 160, 172, 220);
+  if (picked == 1) accent = IM_COL32(90, 210, 255, 255);
+  else if (picked == 2) accent = IM_COL32(255, 186, 72, 255);
+  else if (picked == 3) accent = IM_COL32(255, 120, 72, 255);
+  const float track_h = 6.f;
+  dl->AddRectFilled(ImVec2(x0, cy - track_h * 0.5f), ImVec2(x1, cy + track_h * 0.5f),
+                    IM_COL32(16, 22, 34, 235), track_h);
+  dl->AddRectFilled(ImVec2(x0, cy - track_h * 0.5f), ImVec2(gx, cy + track_h * 0.5f), accent,
+                    track_h);
+  for (int i = 0; i < 4; ++i) {
+    const float tx = x0 + span * ((float)i / 3.f);
+    const bool lit = i <= picked;
+    dl->AddCircleFilled(ImVec2(tx, cy), i == picked ? 3.2f : 2.2f,
+                        lit ? accent : IM_COL32(70, 86, 108, 210));
+    const ImVec2 ts = ImGui::CalcTextSize(names[i]);
+    const ImU32 tc = i == picked ? accent : IM_COL32(160, 172, 188, 210);
+    dl->AddText(ImVec2(tx - ts.x * 0.5f, origin.y + track_y + grab_r + 4.f), tc, names[i]);
+  }
+  dl->AddCircleFilled(ImVec2(gx, cy), grab_r, IM_COL32(10, 16, 26, 255));
+  dl->AddCircleFilled(ImVec2(gx, cy), grab_r - 3.2f, accent);
+  dl->AddCircle(ImVec2(gx, cy), grab_r, IM_COL32(230, 244, 255, 230), 0, 1.4f);
+  ImGui::PopID();
+  return picked;
+}
+
+static uint32_t g_rank_player_ui = 0;
+static uint32_t g_mcv_player_ui = 0;
+static uint32_t g_money_player_ui = 0;
+
+static uint32_t draw_player_picker(const char* scope, uint32_t* selected) {
+  static int cached_frame = -1;
+  static int cached_n = 0;
+  static game_api::BattlePlayer cached_seats[16];
+  const int frame = ImGui::GetFrameCount();
+  if (frame != cached_frame) {
+    cached_frame = frame;
+    cached_n = game_api::list_battle_players(cached_seats, 16);
+  }
+  game_api::BattlePlayer* seats = cached_seats;
+  const int n = cached_n;
+  if (n <= 0) {
+    ImGui::TextDisabled(u8"尚未进入战局，没有可选玩家");
+    if (selected) *selected = 0;
+    return 0;
+  }
+  if (!selected) return 0;
+  bool still = false;
+  for (int i = 0; i < n; ++i) {
+    if (seats[i].player == *selected) still = true;
+  }
+  if (!still) {
+    *selected = seats[0].player;
+    for (int i = 0; i < n; ++i) {
+      if (seats[i].is_local) *selected = seats[i].player;
+    }
+  }
+  for (int i = 0; i < n; ++i) {
+    const auto& s = seats[i];
+    char label[96];
+    if (s.is_local && s.defeated) {
+      std::snprintf(label, sizeof(label), u8"%s 己方 已击败", s.name[0] ? s.name : u8"玩家");
+    } else if (s.is_local) {
+      std::snprintf(label, sizeof(label), u8"%s 己方", s.name[0] ? s.name : u8"玩家");
+    } else if (s.defeated) {
+      std::snprintf(label, sizeof(label), u8"%s 已击败", s.name[0] ? s.name : u8"玩家");
+    } else {
+      std::snprintf(label, sizeof(label), "%s", s.name[0] ? s.name : u8"玩家");
+    }
+    const ImVec2 ts = ImGui::CalcTextSize(label);
+    const float w = ts.x + 28.f;
+    if (i > 0 && ImGui::GetContentRegionAvail().x > w + 8.f) ImGui::SameLine(0.f, 6.f);
+    ImGui::PushID(scope);
+    ImGui::PushID(i);
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const float h = ImGui::GetFrameHeight();
+    const bool pressed = ImGui::InvisibleButton("##seat", ImVec2(w, h));
+    const bool on = s.player == *selected;
+    const bool hov = ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 bg = on ? IM_COL32(12, 48, 88, 245) : IM_COL32(16, 22, 34, 230);
+    const ImU32 edge = on ? IM_COL32(110, 220, 255, 255)
+                          : hov ? IM_COL32(96, 168, 236, 220) : IM_COL32(64, 92, 128, 170);
+    dl->AddRectFilled(p0, ImVec2(p0.x + w, p0.y + h), bg, 6.f);
+    dl->AddRect(p0, ImVec2(p0.x + w, p0.y + h), edge, 6.f, 0, on ? 1.6f : 1.f);
+    const ImU32 dot = s.has_color ? IM_COL32(s.color_r, s.color_g, s.color_b, 255)
+                                  : (s.is_local ? IM_COL32(240, 200, 80, 255) : IM_COL32(140, 170, 210, 255));
+    dl->AddRectFilled(ImVec2(p0.x + 6.f, p0.y + (h - 12.f) * 0.5f),
+                      ImVec2(p0.x + 18.f, p0.y + (h + 12.f) * 0.5f), dot, 2.f);
+    dl->AddText(ImVec2(p0.x + 22.f, p0.y + (h - ts.y) * 0.5f), IM_COL32(232, 240, 248, 255), label);
+    ImGui::PopID();
+    ImGui::PopID();
+    if (pressed) *selected = s.player;
+  }
+  return *selected;
+}
+
 static void draw_feature_row(const game_api::FeatureInfo* f) {
   if (!f) return;
   const bool armed = game_api::hooks_armed();
   const char* hk = game_api::hotkey_hint(f->key);
-  char label[160];
-  if (hk) {
-    std::snprintf(label, sizeof(label), "%s   (%s)", f->label, hk);
-  } else {
-    std::snprintf(label, sizeof(label), "%s", f->label);
+
+  if (std::strcmp(f->type, "money_sel") == 0) {
+    end_chip_flow();
+    ImGui::PushID(f->key);
+    ImGui::TextUnformatted(f->label);
+    {
+      int slots[1] = {};
+      if (game_api::hotkey_slots_for_feature(f->key, slots, 1) > 0) {
+        ImGui::SameLine();
+        draw_feature_gear(f->key);
+      }
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped(u8"选择玩家后加减该玩家的资金。");
+    ImGui::PopStyleColor();
+    const uint32_t who = draw_player_picker("money", &g_money_player_ui);
+    game_api::set_money_player(who);
+    int step = game_api::money_sel_step();
+    ImGui::SetNextItemWidth(160.f);
+    if (ImGui::InputInt(u8"每次##step", &step, 10000, 100000)) {
+      game_api::set_money_sel_step(step);
+      mark_settings_dirty();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("+", ImVec2(36.f, 0))) {
+      std::string msg;
+      const bool ok = game_api::adjust_selected_player_money(game_api::money_sel_step(), &msg);
+      g_last_msg = msg;
+      game_api::beep(ok ? "click" : "error");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("-", ImVec2(36.f, 0))) {
+      std::string msg;
+      const bool ok = game_api::adjust_selected_player_money(-game_api::money_sel_step(), &msg);
+      g_last_msg = msg;
+      game_api::beep(ok ? "click" : "error");
+    }
+    ImGui::PopID();
+    return;
   }
 
-  if (std::strcmp(f->type, "money") == 0 || std::strcmp(f->type, "money_sel") == 0) {
-    const bool sel = (std::strcmp(f->type, "money_sel") == 0);
+  if (std::strcmp(f->type, "money") == 0) {
+    end_chip_flow();
+    const bool sel = false;
     ImGui::PushID(f->key);
     int step = sel ? game_api::money_sel_step() : game_api::money_self_step();
     ImGui::TextUnformatted(f->label);
-    if (sel) {
-      ImGui::SameLine();
-      ImGui::TextDisabled(u8"（先选中该玩家的单位）");
-    } else {
-      const char* hk = game_api::hotkey_hint(f->key);
-      if (hk) {
+    {
+      int slots[1] = {};
+      if (game_api::hotkey_slots_for_feature(f->key, slots, 1) > 0) {
         ImGui::SameLine();
-        ImGui::TextDisabled("(%s)", hk);
+        draw_feature_gear(f->key);
       }
     }
     ImGui::SetNextItemWidth(160.f);
@@ -992,9 +1770,15 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
   }
 
   if (std::strcmp(f->type, "toggle") == 0) {
+    int slots[1] = {};
+    if (game_api::hotkey_slots_for_feature(f->key, slots, 1) > 0) {
+      draw_hotkey_row(f, armed, true, armed);
+      return;
+    }
     bool on = game_api::feature_enabled(f->key);
     if (!armed) ImGui::BeginDisabled();
-    if (ImGui::Checkbox(label, &on)) {
+    if (draw_hud_tile(f->key, f->label, hk, on, armed)) {
+      on = !on;
       std::string msg;
       bool ok = game_api::toggle_feature(f->key, on, &msg);
       g_last_msg = msg;
@@ -1005,52 +1789,140 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
   }
 
   if (std::strcmp(f->type, "pulse") == 0) {
+    int slots[1] = {};
+    if (game_api::hotkey_slots_for_feature(f->key, slots, 1) > 0) {
+      draw_hotkey_row(f, armed, false, armed);
+      return;
+    }
     if (!armed) ImGui::BeginDisabled();
-    if (ImGui::Button(label, ImVec2(-1, 0))) {
-      std::string msg;
-      bool ok = game_api::pulse_feature(f->key, &msg);
-      g_last_msg = msg;
-      game_api::beep(ok ? "click" : "error");
+    if (draw_hud_tile(f->key, f->label, hk, false, armed)) {
+      run_feature_action(f);
     }
     if (!armed) ImGui::EndDisabled();
     return;
   }
 
   if (std::strcmp(f->type, "danger") == 0) {
-    ImGui::TextUnformatted(label);
+    end_chip_flow();
+    ImGui::PushID(f->key);
+    const float row_h = ImGui::GetFrameHeight();
+    const float gap = 8.f;
+    const float avail = ImGui::GetContentRegionAvail().x;
+    const ImVec2 ts = ImGui::CalcTextSize(f->label);
+    const float name_w = ts.x + 20.f;
+    const float gear_w = row_h;
+    const float slider_w = std::max(120.f, avail - name_w - gear_w - gap * 2.f - 8.f);
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(origin, ImVec2(origin.x + avail, origin.y + row_h), IM_COL32(16, 22, 34, 215),
+                      8.f);
+    dl->AddRect(origin, ImVec2(origin.x + avail, origin.y + row_h), IM_COL32(58, 84, 116, 150), 8.f,
+                0, 1.f);
+    dl->AddText(ImVec2(origin.x + 12.f, origin.y + (row_h - ts.y) * 0.5f),
+                IM_COL32(232, 240, 248, 255), f->label);
+    ImGui::Dummy(ImVec2(name_w, row_h));
+    ImGui::SameLine(0.f, gap);
+    draw_feature_gear(f->key);
+    ImGui::SameLine(0.f, gap);
     int level = (int)game_api::get_flag(0x13);
     if (level < 0 || level > 2) level = 0;
-    if (!armed) ImGui::BeginDisabled();
-    bool changed = false;
-    if (ImGui::RadioButton(u8"正常", &level, 0)) changed = true;
-    ImGui::SameLine();
-    if (ImGui::RadioButton(u8"高", &level, 1)) changed = true;
-    ImGui::SameLine();
-    if (ImGui::RadioButton(u8"最高", &level, 2)) changed = true;
-    if (changed) {
+    const int picked = draw_danger_slider(level, armed, slider_w);
+    ImGui::PopID();
+    if (armed && picked != level) {
       std::string msg;
-      bool ok = game_api::set_danger(level, &msg);
+      bool ok = game_api::set_danger(picked, &msg);
       g_last_msg = msg;
       game_api::beep(ok ? "click" : "error");
     }
-    if (!armed) ImGui::EndDisabled();
+    return;
+  }
+
+  if (std::strcmp(f->type, "spawn_rank") == 0) {
+    end_chip_flow();
+    ImGui::TextUnformatted(f->label);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped(u8"选择玩家后拖动滑条，设置该玩家之后生产单位的出场等级。0 为不设置，最高 3 级。");
+    ImGui::PopStyleColor();
+    const uint32_t who = draw_player_picker("rank", &g_rank_player_ui);
+    game_api::set_rank_player(who);
+    const int live = who ? game_api::player_spawn_rank(who) : -1;
+    static int shown = 0;
+    static uint32_t shown_for = 0;
+    static bool was_drag = false;
+    if (!was_drag && who != shown_for) {
+      shown_for = who;
+      if (live >= 0) shown = live;
+    } else if (!was_drag && live >= 0) {
+      shown = live;
+    }
+    bool dragging = false;
+    const int picked = draw_rank_slider(who ? shown : 0, &dragging);
+    was_drag = dragging;
+    if (!who) {
+      ImGui::TextDisabled(u8"进入战局后会列出全部玩家");
+    } else if (live == -2) {
+      ImGui::TextDisabled(u8"还没读到出场等级数据");
+    }
+    if (picked != shown) {
+      if (!who || live < 0) {
+        g_last_msg = !who ? u8"请先进入战局" : u8"找不到出场等级数据（请先进入战局）";
+        game_api::beep("error");
+      } else {
+        std::string msg;
+        const bool ok = game_api::set_spawn_rank(picked, &msg);
+        g_last_msg = msg;
+        game_api::beep(ok ? "click" : "error");
+        if (ok) shown = picked;
+      }
+    }
+    return;
+  }
+
+  if (std::strcmp(f->type, "engine") == 0 && std::strcmp(f->key, "spawn_mcv") == 0) {
+    end_chip_flow();
+    const bool busy = InterlockedCompareExchange(&g_engine_busy, 0, 0) != 0;
+    const bool action_ok = armed && !busy;
+    ImGui::PushID(f->key);
+    ImGui::TextUnformatted(f->label);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped(u8"选择玩家和基地车阵营后召唤一辆，归该玩家。鼠标要放在地形上。");
+    ImGui::PopStyleColor();
+    const uint32_t who = draw_player_picker("mcv", &g_mcv_player_ui);
+    game_api::set_mcv_player(who);
+    const int fac = game_api::mcv_faction();
+    const char* type_ids[3] = {"AlliedMCV", "SovietMCV", "JapanMCV"};
+    const char* tips[3] = {u8"盟军基地车", u8"苏联基地车", u8"帝国基地车"};
+    int picked = fac;
+    for (int i = 0; i < 3; ++i) {
+      if (i) ImGui::SameLine(0.f, 8.f);
+      char id[16];
+      std::snprintf(id, sizeof(id), "fac%d", i);
+      if (draw_mcv_choice(id, type_ids[i], tips[i], fac == i)) picked = i;
+    }
+    if (picked != fac) {
+      game_api::set_mcv_faction(picked);
+      mark_settings_dirty();
+    }
+    ImGui::SameLine(0.f, 12.f);
+    const float summon_y = ImGui::GetFrameHeight();
+    if (!action_ok) ImGui::BeginDisabled();
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (56.f - summon_y) * 0.5f);
+    if (ImGui::Button(u8"召唤", ImVec2(72.f, summon_y))) run_feature_action(f);
+    if (!action_ok) ImGui::EndDisabled();
+    ImGui::PopID();
     return;
   }
 
   if (std::strcmp(f->type, "engine") == 0) {
-    const bool need_hooks =
-        std::strcmp(f->key, "protocol_ready") == 0 ||
-        std::strcmp(f->key, "unit_skill_ready") == 0 ||
-        std::strcmp(f->key, "disable_protocol") == 0 ||
-        std::strcmp(f->key, "unit_clone") == 0 ||
-        std::strcmp(f->key, "spawn_unit") == 0 ||
-        std::strcmp(f->key, "clone_multi") == 0 ||
-        std::strcmp(f->key, "ore_convoy") == 0 ||
-        std::strcmp(f->key, "spec_gift") == 0 ||
-        std::strcmp(f->key, "full_buff") == 0;
     const bool busy = InterlockedCompareExchange(&g_engine_busy, 0, 0) != 0;
-    if ((need_hooks && !armed) || busy) ImGui::BeginDisabled();
-    if (ImGui::Button(label, ImVec2(-1, 0))) {
+    const bool action_ok = (!(feature_needs_hooks(f->key) && !armed)) && !busy;
+    int slots[1] = {};
+    if (game_api::hotkey_slots_for_feature(f->key, slots, 1) > 0) {
+      draw_hotkey_row(f, armed, false, action_ok);
+      return;
+    }
+    if (!action_ok) ImGui::BeginDisabled();
+    if (draw_hud_tile(f->key, f->label, hk, false, action_ok)) {
       // Must not call CreateUnit while blocked inside Present — run async.
       if (start_engine_async(f->key)) {
         g_last_msg = u8"正在执行…（请把鼠标移到地形上）";
@@ -1059,7 +1931,7 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
         game_api::beep("error");
       }
     }
-    if ((need_hooks && !armed) || busy) ImGui::EndDisabled();
+    if (!action_ok) ImGui::EndDisabled();
   }
 }
 
@@ -1415,6 +2287,14 @@ void draw() {
   }
 
   if (input::menu_visible()) {
+    poll_hotkey_capture();
+  } else if (g_capture_slot >= 0) {
+    g_capture_slot = -1;
+    g_capture_ready = false;
+    game_api::set_hotkey_capture(false);
+  }
+
+  if (input::menu_visible()) {
     // Collapsed inspector frees ~220px; allow a shorter window in that state.
     const float kInspectBodyH = 220.f;
     const float win_min_h = g_unit_inspect_open ? 620.f : 400.f;
@@ -1485,70 +2365,38 @@ void draw() {
     const float inspect_header_h = ImGui::GetFrameHeightWithSpacing() + 6.f;
     const float inspect_reserve =
         g_unit_inspect_open ? (inspect_header_h + kInspectBodyH) : inspect_header_h;
-    const float side_w = 168.f;
-    const float row_h = 30.f;
+    const float side_w = 156.f;
 
     ImGui::BeginChild("##side", ImVec2(side_w, -inspect_reserve), true);
     for (int i = 0; i < group_count; ++i) {
       const bool sel = (!g_show_settings && !g_show_build_lock && g_group == i);
-      if (sel) {
-        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.22f, 0.42f, 0.78f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.30f, 0.52f, 0.90f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.36f, 0.60f, 1.0f, 1.f));
-      }
-      if (ImGui::Selectable(groups[i].name, sel, 0, ImVec2(0, row_h))) {
+      ImGui::PushID(i);
+      if (draw_nav_item(groups[i].name, groups[i].name, sel)) {
         g_group = i;
         g_show_settings = false;
         g_show_build_lock = false;
       }
-      if (sel) ImGui::PopStyleColor(3);
+      ImGui::PopID();
     }
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
-    {
-      const bool sel = g_stats_open;
-      if (sel) {
-        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.22f, 0.42f, 0.78f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.30f, 0.52f, 0.90f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.36f, 0.60f, 1.0f, 1.f));
+    if (draw_nav_item("stats", u8"战况统计", g_stats_open)) {
+      if (!g_stats_open) {
+        g_stats_open = true;
+      } else if (!g_stats_pinned) {
+        g_stats_open = false;
       }
-      if (ImGui::Selectable(u8"战况统计", sel, 0, ImVec2(0, row_h))) {
-        if (!g_stats_open) {
-          g_stats_open = true;
-        } else if (!g_stats_pinned) {
-          g_stats_open = false;
-        }
-        g_show_settings = false;
-        g_show_build_lock = false;
-      }
-      if (sel) ImGui::PopStyleColor(3);
+      g_show_settings = false;
+      g_show_build_lock = false;
     }
-    {
-      const bool sel = g_show_build_lock;
-      if (sel) {
-        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.22f, 0.42f, 0.78f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.30f, 0.52f, 0.90f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.36f, 0.60f, 1.0f, 1.f));
-      }
-      if (ImGui::Selectable(u8"建造限制", sel, 0, ImVec2(0, row_h))) {
-        g_show_build_lock = true;
-        g_show_settings = false;
-      }
-      if (sel) ImGui::PopStyleColor(3);
+    if (draw_nav_item("lock", u8"建造限制", g_show_build_lock)) {
+      g_show_build_lock = true;
+      g_show_settings = false;
     }
-    {
-      const bool sel = g_show_settings;
-      if (sel) {
-        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.22f, 0.42f, 0.78f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.30f, 0.52f, 0.90f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.36f, 0.60f, 1.0f, 1.f));
-      }
-      if (ImGui::Selectable(u8"界面设置", sel, 0, ImVec2(0, row_h))) {
-        g_show_settings = true;
-        g_show_build_lock = false;
-      }
-      if (sel) ImGui::PopStyleColor(3);
+    if (draw_nav_item("ui", u8"界面设置", g_show_settings)) {
+      g_show_settings = true;
+      g_show_build_lock = false;
     }
     ImGui::EndChild();
 
@@ -1564,8 +2412,29 @@ void draw() {
       if (g.subtitle) ImGui::TextDisabled("%s", g.subtitle);
       ImGui::Separator();
       ImGui::Spacing();
+      end_chip_flow();
+      end_pair_flow();
+      const bool unit_page = std::strcmp(g.name, u8"单位操作") == 0;
+      const bool sw_page = std::strcmp(g.name, u8"超武 / 地图") == 0;
+      const bool res_page = std::strcmp(g.name, u8"资源") == 0;
       for (int i = 0; i < g.key_count; ++i) {
-        draw_feature_row(game_api::find_feature(g.keys[i]));
+        const game_api::FeatureInfo* feat = game_api::find_feature(g.keys[i]);
+        const bool unit_full = feat && (std::strcmp(feat->key, "spawn_mcv") == 0 ||
+                                        std::strcmp(feat->key, "spawn_rank") == 0);
+        const bool money_cell = feat && std::strcmp(feat->type, "money") == 0;
+        const bool money_pick = feat && std::strcmp(feat->key, "money_sel") == 0;
+        if (unit_page && feat && !unit_full) {
+          draw_compact_cell(feat, 3);
+        } else if (sw_page && feat) {
+          draw_compact_cell(feat, 3);
+        } else if (res_page && money_cell) {
+          draw_money_cell(feat, 3);
+        } else if (res_page && feat && !money_pick) {
+          draw_compact_cell(feat, 3);
+        } else {
+          if (unit_page || sw_page || res_page) end_pair_flow();
+          draw_feature_row(feat);
+        }
       }
     }
     ImGui::EndChild();

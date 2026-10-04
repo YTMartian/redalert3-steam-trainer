@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Generate overlay/src/embedded_payload.h from trainer build() + CORE_HOOKS.
+"""Generate overlay/src/embedded_payload.h from mustcode_asm.build() + CORE_HOOKS.
 
 Assembles MustCode at two base sets and emits a reloc table so the DLL can
 VirtualAlloc anywhere and patch absolute addresses at runtime.
@@ -14,7 +14,7 @@ ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path.insert(0, ROOT)
 
 from payload import ASM_TEXT, SYMBOLS, LABELS, CORE_HOOKS  # noqa: E402
-from trainer import build  # noqa: E402
+from mustcode_asm import build  # noqa: E402
 
 OUT = os.path.join(os.path.dirname(__file__), '..', 'src', 'embedded_payload.h')
 

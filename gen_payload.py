@@ -7,7 +7,7 @@
   CE 脚本约定工作，但块长度并不整齐，跨段绝对引用（MC 段 je MC2+0x100、
   MC2 段 call MC+0x1120）会跳到错误指令上导致游戏闪退。
   这里先用 nop 把各块起始标签填充到其名字所指定的偏移，把结果固化回
-  mustcode_body.asm，再据此生成 LABELS，保证 trainer.py 运行时那个
+  mustcode_body.asm，再据此生成 LABELS，保证 mustcode_asm.py 运行时那个
   不含 capstone、不做对齐的精简 build 也能得到完全一致的布局。
 
 运行条件：需先完成 compile_mustcode.py（生成 mustcode_body.asm / symbols.json）。

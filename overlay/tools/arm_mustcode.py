@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Arm MustCode into ra3_1.12.game using the SAME build() path as trainer.py.
+"""Arm MustCode into ra3_1.12.game.
 
 Called by the overlay DLL after it VirtualAlloc's the four segments.
 This avoids the broken relocatable embedded blob (which differed from live
@@ -29,9 +29,7 @@ else:
 sys.path.insert(0, ROOT)
 
 from payload import ASM_TEXT, SYMBOLS, LABELS, CORE_HOOKS  # noqa: E402
-from trainer import (  # noqa: E402
-    build, MOD_BASE, PLAYER_HOOK_NAMES, SPECTATE_HOOK_NAMES,
-)
+from mustcode_asm import build, MOD_BASE, PLAYER_HOOK_NAMES  # noqa: E402
 
 import ctypes
 from ctypes import wintypes
@@ -149,7 +147,7 @@ def main():
                 return result(False, 'patch %s failed' % name)
             installed += 1
 
-        return result(True, 'armed %d hooks via trainer.build() mc=0x%X' % (
+        return result(True, 'armed %d hooks mc=0x%X' % (
             installed, mc))
     except Exception as exc:
         return result(False, 'exception: %s' % exc)

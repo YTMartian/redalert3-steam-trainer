@@ -968,7 +968,7 @@ bool clone_selected(bool as_mine, int copies, std::string* out_msg) {
     if (as_mine) {
       owner = local_owner();
       if (!is_ptr(owner)) {
-        if (out_msg) *out_msg = u8"读不到本地玩家归属（观战请用观战赠送）";
+        if (out_msg) *out_msg = u8"读不到本地玩家归属";
         return false;
       }
     } else {
@@ -1350,7 +1350,7 @@ static uint32_t g_ent_vec_offs[kMaxEntVecOffs] = {};
 static int g_ent_vec_off_count = 0;
 static uint32_t g_roster_local_id = 0;
 static uint32_t g_logic_list_off = 0;
-constexpr int kMaxLogicLists = 8;
+constexpr int kMaxLogicLists = 16;
 static uint32_t g_logic_offs[kMaxLogicLists] = {};
 static int g_logic_off_n = 0;
 static int g_logic_refresh = 0;
@@ -1360,7 +1360,7 @@ static bool valid_ent_vector_range(uint32_t begin, uint32_t end, uint32_t* out_n
   const uint32_t bytes = end - begin;
   if (bytes & 3u) return false;
   const uint32_t n = bytes / 4u;
-  if (n < 1 || n > 4096) return false;
+  if (n < 1 || n > 65536) return false;
   if (out_n) *out_n = n;
   return true;
 }
@@ -1596,20 +1596,66 @@ static void ensure_tpl_cs() {
 
 struct LiveEnt {
   uint32_t owner = 0;
+  uint32_t pending_owner = 0;
+  int pending_hits = 0;
   char key[96] = {};
   char name[64] = {};
   bool building = false;
 };
 static std::map<uint32_t, LiveEnt> g_live;
-static std::vector<uint32_t> g_pending;
+// Fixed queues so Create/Spawn/Destroy never allocate on the game thread.
+// A save load allocates tens of thousands of objects; a std::vector growth
+// there can exhaust the 32-bit heap and the game then crashes on a null alloc.
+constexpr int kLiveQueueCap = 8192;
+static uint32_t g_add_q[kLiveQueueCap] = {};
+static uint32_t g_add_hint[kLiveQueueCap] = {};
+static int g_add_n = 0;
+static uint32_t g_forget_q[kLiveQueueCap] = {};
+static int g_forget_n = 0;
 static CRITICAL_SECTION g_live_cs;
 static bool g_live_cs_ready = false;
 static bool g_live_seeded = false;
 static int g_live_scan_tick = 0;
+// After a match change or save load, keep rescanning. A long battle's object
+// list is rebuilt in one burst and is easy to sample before it is complete.
+static DWORD g_rescan_began = 0;
+static DWORD g_roster_rescan_until = 0;
+static DWORD g_roster_next_scan = 0;
+static int g_rescan_last_n = -1;
+static int g_rescan_stable = 0;
+static void queue_live_add(uint32_t ent, uint32_t hint) {
+  if (!is_ptr(ent) || !g_live_cs_ready) return;
+  EnterCriticalSection(&g_live_cs);
+  if (g_add_n < kLiveQueueCap) {
+    g_add_q[g_add_n] = ent;
+    g_add_hint[g_add_n] = hint;
+    ++g_add_n;
+  }
+  LeaveCriticalSection(&g_live_cs);
+}
+
+static void queue_live_forget(uint32_t ent) {
+  if (!is_ptr(ent) || !g_live_cs_ready) return;
+  EnterCriticalSection(&g_live_cs);
+  for (int i = 0; i < g_add_n;) {
+    if (g_add_q[i] != ent) {
+      ++i;
+      continue;
+    }
+    const int last = g_add_n - 1;
+    g_add_q[i] = g_add_q[last];
+    g_add_hint[i] = g_add_hint[last];
+    g_add_n = last;
+  }
+  if (g_forget_n < kLiveQueueCap) g_forget_q[g_forget_n++] = ent;
+  LeaveCriticalSection(&g_live_cs);
+}
 
 struct FacCache {
   uint32_t player = 0;
   int faction = 0;  // 1 allied, 2 soviet, 3 empire
+  int pending = 0;
+  int pending_hits = 0;
 };
 static FacCache g_fac_cache[16] = {};
 static int g_fac_cache_n = 0;
@@ -1626,9 +1672,15 @@ static int g_seen_n = 0;
 static void clear_live_ents() {
   if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
   g_live.clear();
-  g_pending.clear();
+  g_add_n = 0;
+  g_forget_n = 0;
   g_live_seeded = false;
   g_live_scan_tick = 0;
+  g_rescan_began = GetTickCount();
+  g_roster_rescan_until = g_rescan_began + 8000;
+  g_roster_next_scan = 0;
+  g_rescan_last_n = -1;
+  g_rescan_stable = 0;
   if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
 }
 
@@ -1682,15 +1734,20 @@ static bool roster_type_live(const char* key, const char* name) {
   return false;
 }
 
+static int faction_of_key(const char* key);
+
 static void add_roster_count(PlayerEconomy* pe, const char* key, const char* disp,
                              bool building) {
   if (!pe || !key || !key[0] || !disp || !disp[0]) return;
   // Prefer merging by display name so TypeId jitter doesn't split one unit type.
   for (int i = 0; i < pe->roster_count; ++i) {
     const bool key_hit = (std::strcmp(pe->roster[i].key, key) == 0);
+    const int fac_key = faction_of_key(key);
+    const int fac_row = faction_of_key(pe->roster[i].key);
+    const bool same_fac = fac_key == 0 || fac_row == 0 || fac_key == fac_row;
     const bool name_hit =
-        pe->roster[i].name[0] && disp[0] && std::strcmp(pe->roster[i].name, disp) == 0 &&
-        pe->roster[i].is_building == building;
+        same_fac && pe->roster[i].name[0] && disp[0] &&
+        std::strcmp(pe->roster[i].name, disp) == 0 && pe->roster[i].is_building == building;
     if (!key_hit && !name_hit) continue;
     pe->roster[i].count++;
     if (key_hit) {
@@ -1985,13 +2042,16 @@ static int score_catalog_vector(uint32_t begin, uint32_t end, const MatchEconomy
   uint32_t n = 0;
   if (!valid_ent_vector_range(begin, end, &n)) return 0;
   int catalog = 0;
-  for (uint32_t i = 0; i < n; ++i) {
+  const uint32_t sample = n < 48 ? n : 48;
+  for (uint32_t i = 0; i < sample; ++i) {
+    const uint32_t idx = n <= sample ? i : (i * n / sample);
     uint32_t ent = 0;
-    if (!safe_read_u32(begin + i * 4u, &ent)) continue;
+    if (!safe_read_u32(begin + idx * 4u, &ent)) continue;
     char type_id[96] = {};
     if (entity_catalog_for_roster(ent, out, nullptr, type_id, sizeof(type_id))) ++catalog;
   }
-  return catalog;
+  if (sample == 0 || catalog == 0) return 0;
+  return catalog * (int)((n + sample - 1) / sample);
 }
 
 static int tally_catalog_vector(uint32_t begin, uint32_t end, MatchEconomy* out) {
@@ -2122,13 +2182,21 @@ static LiveNote note_live_ent(uint32_t ent, uint32_t owner_hint) {
   safe_read_u32(ent + 0x418, &ow);
   if (!is_ptr(ow)) ow = owner_hint;
   if (!is_ptr(ow)) return LiveNote::kRetry;
-  LiveEnt rec{};
-  rec.owner = ow;
-  std::snprintf(rec.key, sizeof(rec.key), "%s", type_id);
-  std::snprintf(rec.name, sizeof(rec.name), "%s", zh);
-  rec.building = type_id_is_building(type_id);
   if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
-  g_live[ent] = rec;
+  auto it = g_live.find(ent);
+  if (it == g_live.end()) {
+    LiveEnt rec{};
+    rec.owner = ow;
+    std::snprintf(rec.key, sizeof(rec.key), "%s", type_id);
+    std::snprintf(rec.name, sizeof(rec.name), "%s", zh);
+    rec.building = type_id_is_building(type_id);
+    g_live.emplace(ent, rec);
+  } else {
+    std::snprintf(it->second.key, sizeof(it->second.key), "%s", type_id);
+    std::snprintf(it->second.name, sizeof(it->second.name), "%s", zh);
+    it->second.building = type_id_is_building(type_id);
+    if (!is_ptr(it->second.owner)) it->second.owner = ow;
+  }
   if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
   return LiveNote::kOk;
 }
@@ -2142,37 +2210,38 @@ static void forget_live_ent(uint32_t ent) {
 
 static void publish_live_roster(MatchEconomy* out) {
   if (!out) return;
-  std::vector<uint32_t> pending;
+  uint32_t adds[256];
+  uint32_t hints[256];
+  uint32_t forgets[256];
+  int nadd = 0, nforget = 0;
   if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
-  pending.swap(g_pending);
+  nadd = g_add_n < 256 ? g_add_n : 256;
+  for (int i = 0; i < nadd; ++i) {
+    adds[i] = g_add_q[i];
+    hints[i] = g_add_hint[i];
+  }
+  if (nadd < g_add_n) {
+    const int rest = g_add_n - nadd;
+    std::memmove(g_add_q, g_add_q + nadd, (size_t)rest * sizeof(g_add_q[0]));
+    std::memmove(g_add_hint, g_add_hint + nadd, (size_t)rest * sizeof(g_add_hint[0]));
+    g_add_n = rest;
+  } else {
+    g_add_n = 0;
+  }
+  nforget = g_forget_n < 256 ? g_forget_n : 256;
+  for (int i = 0; i < nforget; ++i) forgets[i] = g_forget_q[i];
+  if (nforget < g_forget_n) {
+    const int rest = g_forget_n - nforget;
+    std::memmove(g_forget_q, g_forget_q + nforget, (size_t)rest * sizeof(g_forget_q[0]));
+    g_forget_n = rest;
+  } else {
+    g_forget_n = 0;
+  }
   if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
-  // A 6-player battle spawns far more projectiles than units. Classify a
-  // bounded batch per refresh so the render thread cannot stall the match.
-  constexpr size_t kBatch = 64;
-  std::vector<uint32_t> later;
-  if (pending.size() > kBatch) {
-    later.assign(pending.begin() + kBatch, pending.end());
-    pending.resize(kBatch);
-  }
-  std::vector<uint32_t> again;
-  for (uint32_t ent : pending) {
-    if (note_live_ent(ent, 0) == LiveNote::kRetry && again.size() < 24) again.push_back(ent);
-  }
-  if (!later.empty() || !again.empty()) {
-    if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
-    if (g_pending.size() < 512) {
-      const size_t room = 512 - g_pending.size();
-      size_t n = later.size();
-      if (n > room) n = room;
-      g_pending.insert(g_pending.end(), later.begin(), later.begin() + n);
-    }
-    if (g_pending.size() < 512) {
-      const size_t room = 512 - g_pending.size();
-      size_t n = again.size();
-      if (n > room) n = room;
-      g_pending.insert(g_pending.end(), again.begin(), again.begin() + n);
-    }
-    if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
+  for (int i = 0; i < nforget; ++i) forget_live_ent(forgets[i]);
+  for (int i = 0; i < nadd; ++i) {
+    if (note_live_ent(adds[i], hints[i]) != LiveNote::kRetry) continue;
+    queue_live_add(adds[i], hints[i]);
   }
 
   std::vector<std::pair<uint32_t, LiveEnt>> copy;
@@ -2183,9 +2252,36 @@ static void publish_live_roster(MatchEconomy* out) {
       it = g_live.erase(it);
       continue;
     }
-    // Capture / ownership change writes +0x418 in place (oil derrick, etc.).
+    // A dying object often has +0x418 rewritten to the killer for a frame or
+    // two. Keep the last owner so that corpse does not flash onto another seat.
+    if (!entity_alive(it->first)) {
+      it->second.pending_owner = 0;
+      it->second.pending_hits = 0;
+      copy.emplace_back(it->first, it->second);
+      ++it;
+      continue;
+    }
     uint32_t ow = 0;
-    if (safe_read_u32(it->first + 0x418, &ow) && is_ptr(ow)) it->second.owner = ow;
+    const bool got = safe_read_u32(it->first + 0x418, &ow) && is_ptr(ow);
+    if (got && ow != it->second.owner && seat_for_owner(out, ow) >= 0) {
+      if (seat_for_owner(out, it->second.owner) < 0) {
+        it->second.owner = ow;
+        it->second.pending_owner = 0;
+        it->second.pending_hits = 0;
+      } else if (it->second.pending_owner == ow) {
+        if (++it->second.pending_hits >= 2) {
+          it->second.owner = ow;
+          it->second.pending_owner = 0;
+          it->second.pending_hits = 0;
+        }
+      } else {
+        it->second.pending_owner = ow;
+        it->second.pending_hits = 1;
+      }
+    } else {
+      it->second.pending_owner = 0;
+      it->second.pending_hits = 0;
+    }
     copy.emplace_back(it->first, it->second);
     ++it;
   }
@@ -2209,7 +2305,10 @@ static uint32_t __cdecl hk_create_unit(uint32_t a0, uint32_t tmpl, uint32_t pos,
                                       uint32_t info) {
   uint32_t ent = 0;
   if (g_orig_create) ent = g_orig_create(a0, tmpl, pos, owner, info);
-  if (is_ptr(ent)) note_live_ent(ent, owner);
+  __try {
+    if (is_ptr(ent)) queue_live_add(ent, owner);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
   return ent;
 }
 
@@ -2218,18 +2317,23 @@ static uint32_t __cdecl hk_create_unit(uint32_t a0, uint32_t tmpl, uint32_t pos,
 // pointer and classify it on the next stats refresh.
 static uint32_t __cdecl hk_spawn_object(void* req) {
   uint32_t ent = g_orig_spawn ? g_orig_spawn(req) : 0;
-  if (is_ptr(ent)) {
-    uint32_t unit_data = 0;
-    safe_read_u32(ent + 4, &unit_data);
-    if (tpl_cached_reject(unit_data)) return ent;
-    if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
-    if (g_pending.size() < 512) g_pending.push_back(ent);
-    if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
+  __try {
+    if (is_ptr(ent)) {
+      uint32_t unit_data = 0;
+      safe_read_u32(ent + 4, &unit_data);
+      if (!tpl_cached_reject(unit_data)) queue_live_add(ent, 0);
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
   }
   return ent;
 }
 
-static void __cdecl forget_live_from_hook(uint32_t ent) { forget_live_ent(ent); }
+static void __cdecl forget_live_from_hook(uint32_t ent) {
+  __try {
+    queue_live_forget(ent);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+}
 
 static void __declspec(naked) hk_destroy_unit() {
   __asm {
@@ -2293,13 +2397,22 @@ static void fill_all_rosters(MatchEconomy* out) {
   }
   if (local_id) g_roster_local_id = local_id;
 
-  // One scan when the match starts (units already on the field never hit the
-  // create hook). After that, only CreateUnit / Destroy change the roster.
-  if (!g_live_seeded) {
-  if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
-  g_live.clear();
-  g_pending.clear();
-  if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
+  // Scan once when the match starts, then again for a few seconds after a save
+  // load. Objects restored from a save often never pass CreateUnit, and the
+  // full object list can still be filling in on the first frame the clock runs.
+  const DWORD now = GetTickCount();
+  const bool rescan = (int)(g_roster_rescan_until - now) > 0;
+  // The first seconds of a save load are the game's own allocation burst.
+  // Walking every object list then allocates our roster map on that same thread.
+  const bool scan_wait = rescan && (int)(now - g_rescan_began) < 2500;
+  const bool scan_due =
+      !scan_wait && (!g_live_seeded || (rescan && (int)(now - g_roster_next_scan) >= 0));
+  if (scan_due) {
+  if (rescan) {
+    g_logic_off_n = 0;
+    g_logic_refresh = 0;
+    g_player_vec_cache_n = 0;
+  }
   g_live_scan_tick = 0;
 
   constexpr uint32_t kGameLogicRva = 0x8DDE84;  // VA 0xCDDE84
@@ -2323,7 +2436,7 @@ static void fill_all_rosters(MatchEconomy* out) {
     };
     Cand cands[80] = {};
     int nc = 0;
-    uint32_t seen_begin[80] = {};
+    uint32_t seen_begin[400] = {};
     int nseen = 0;
     for (uint32_t off = 0x20; off <= 0x600; off += 4) {
       uint32_t begin = 0, end = 0;
@@ -2335,12 +2448,20 @@ static void fill_all_rosters(MatchEconomy* out) {
           break;
         }
       }
-      if (dup) continue;
-      if (nseen >= 80) continue;
+      if (dup || nseen >= 400) continue;
       seen_begin[nseen++] = begin;
       const int n = score_catalog_vector(begin, end, out);
       if (n < 1) continue;
-      cands[nc++] = Cand{off, n};
+      if (nc >= 80) {
+        int worst = 0;
+        for (int i = 1; i < nc; ++i) {
+          if (cands[i].n < cands[worst].n) worst = i;
+        }
+        if (n <= cands[worst].n) continue;
+        cands[worst] = Cand{off, n};
+      } else {
+        cands[nc++] = Cand{off, n};
+      }
     }
     std::sort(cands, cands + nc, [](const Cand& a, const Cand& b) { return a.n > b.n; });
     g_logic_off_n = 0;
@@ -2350,22 +2471,16 @@ static void fill_all_rosters(MatchEconomy* out) {
     }
   }
 
-  std::vector<uint32_t> ents;
-  ents.reserve(512);
-  auto push_vec = [&](uint32_t begin, uint32_t end) {
+  auto note_vec = [&](uint32_t begin, uint32_t end) {
     uint32_t n = 0;
     if (!valid_ent_vector_range(begin, end, &n)) return;
     for (uint32_t i = 0; i < n; ++i) {
       uint32_t ent = 0;
       if (!safe_read_u32(begin + i * 4u, &ent) || !is_ptr(ent)) continue;
-      ents.push_back(ent);
+      note_live_ent(ent, 0);
     }
   };
 
-  for (int i = 0; i < g_logic_off_n; ++i) {
-    uint32_t begin = 0, end = 0;
-    if (read_logic_vec(g_logic_offs[i], &begin, &end)) push_vec(begin, end);
-  }
   for (int i = 0; i < out->player_count; ++i) {
     uint32_t offs[kMaxEntVecOffs] = {};
     const int no =
@@ -2374,14 +2489,29 @@ static void fill_all_rosters(MatchEconomy* out) {
     for (int k = 0; k < no; ++k) {
       uint32_t begin = 0, end = 0;
       if (!resolve_vector_off(out->players[i].player, offs[k], &begin, &end)) continue;
-      push_vec(begin, end);
+      note_vec(begin, end);
     }
   }
-
-  std::sort(ents.begin(), ents.end());
-  ents.erase(std::unique(ents.begin(), ents.end()), ents.end());
-  for (uint32_t ent : ents) note_live_ent(ent, 0);
+  for (int i = 0; i < g_logic_off_n; ++i) {
+    uint32_t begin = 0, end = 0;
+    if (read_logic_vec(g_logic_offs[i], &begin, &end)) note_vec(begin, end);
+  }
+  int live_n = 0;
+  if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
+  live_n = (int)g_live.size();
+  if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
+  if (live_n == g_rescan_last_n) {
+    ++g_rescan_stable;
+  } else {
+    g_rescan_stable = 0;
+    g_rescan_last_n = live_n;
+  }
+  g_roster_next_scan = GetTickCount() + 400;
   g_live_seeded = true;
+  if (g_rescan_stable >= 3 && (int)(GetTickCount() - g_rescan_began) >= 4000) {
+    log("roster rescan settled live=%d", live_n);
+    g_roster_rescan_until = GetTickCount();
+  }
   }
 
   publish_live_roster(out);
@@ -2486,13 +2616,28 @@ static int remember_faction(uint32_t player, const PlayerEconomy& pe, int detect
     if (g_fac_cache[i].player != player) continue;
     if (!g_fac_cache[i].faction) {
       g_fac_cache[i].faction = detected;
+      g_fac_cache[i].pending = 0;
+      g_fac_cache[i].pending_hits = 0;
       return detected;
     }
-    // A new match reuses the same Player*. Replace the label when this
-    // seat's own anchors (MCV / yard / barracks) now belong to another side.
+    // One stray enemy building (or a one-frame mis-count) must not retitle the
+    // seat. Only switch after the new side's anchors lead for several polls.
     if (detected && detected != g_fac_cache[i].faction &&
         anchor_count_for(pe, detected) > anchor_count_for(pe, g_fac_cache[i].faction)) {
-      g_fac_cache[i].faction = detected;
+      if (g_fac_cache[i].pending == detected) {
+        ++g_fac_cache[i].pending_hits;
+      } else {
+        g_fac_cache[i].pending = detected;
+        g_fac_cache[i].pending_hits = 1;
+      }
+      if (g_fac_cache[i].pending_hits >= 4) {
+        g_fac_cache[i].faction = detected;
+        g_fac_cache[i].pending = 0;
+        g_fac_cache[i].pending_hits = 0;
+      }
+    } else {
+      g_fac_cache[i].pending = 0;
+      g_fac_cache[i].pending_hits = 0;
     }
     return g_fac_cache[i].faction ? g_fac_cache[i].faction : detected;
   }
@@ -2551,6 +2696,9 @@ bool collect_match_economy_impl(MatchEconomy* out) {
   uint32_t battle_logic = 0;
   float battle_seconds = 0.f;
   if (!read_battle_clock(&battle_logic, &battle_seconds)) {
+    if (g_battle_logic != 0) {
+      log("battle left logic=%08X clock=%.1f", g_battle_logic, g_battle_seconds);
+    }
     clear_roster_caches();
     g_battle_logic = 0;
     g_battle_seconds = -1.f;
@@ -2559,6 +2707,10 @@ bool collect_match_economy_impl(MatchEconomy* out) {
   }
   if (battle_logic != g_battle_logic ||
       (g_battle_seconds >= 0.f && battle_seconds + 2.f < g_battle_seconds)) {
+    if (g_battle_logic != 0 || g_battle_seconds >= 0.f) {
+      log("battle reset logic %08X -> %08X clock %.1f -> %.1f", g_battle_logic, battle_logic,
+          g_battle_seconds, battle_seconds);
+    }
     clear_roster_caches();
   }
   g_battle_logic = battle_logic;
@@ -2766,6 +2918,8 @@ static DWORD g_build_lock_tick = 0;
 static bool g_build_catalog_ready = false;
 static uint32_t g_lock_battle_logic = 0;
 static float g_lock_battle_seconds = -1.f;
+static bool g_lock_seen_battle = false;
+static DWORD g_lock_enter_tick = 0;
 static bool g_sw_toggle_latched = false;
 static int g_lock_tick_depth = 0;
 static bool g_lock_syncing = false;
@@ -2988,29 +3142,48 @@ static BuildBan* find_build_ban(const char* id) {
   return nullptr;
 }
 
+// Disable list is an EASTL sentinel embedded at Player+0x200.
+// Node is 12 bytes: +0 next, +4 prev, +8 key. Key = [[[template+0x14]]+4].
+// 0x883AA0 always inserts, so a second call would duplicate the node.
+static bool lock_list_ready(uint32_t player) {
+  const uint32_t head = player + 0x200;
+  uint32_t nxt = 0, prv = 0;
+  if (!safe_read_u32(head, &nxt) || !safe_read_u32(head + 4, &prv)) return false;
+  return is_ptr(nxt) && is_ptr(prv);
+}
+
+static bool template_ban_key(uint32_t tmpl, uint32_t* key_out) {
+  uint32_t a = 0, b = 0, key = 0;
+  if (!safe_read_u32(tmpl + 0x14, &a) || !is_ptr(a)) return false;
+  if (!safe_read_u32(a, &b) || !is_ptr(b)) return false;
+  if (!safe_read_u32(b + 4, &key) || key == 0) return false;
+  if (key_out) *key_out = key;
+  return true;
+}
+
+static bool player_has_ban_key(uint32_t player, uint32_t key) {
+  const uint32_t head = player + 0x200;
+  uint32_t node = 0;
+  if (!safe_read_u32(head, &node)) return false;
+  for (int n = 0; n < 512 && is_ptr(node) && node != head; ++n) {
+    uint32_t k = 0;
+    if (safe_read_u32(node + 8, &k) && k == key) return true;
+    uint32_t next = 0;
+    if (!safe_read_u32(node, &next) || next == node) break;
+    node = next;
+  }
+  return false;
+}
+
 static void apply_ban_to_players(BuildBan* ban, const uint32_t* players, int pn) {
   if (!ban || ban->tmpl_n <= 0 || pn <= 0) return;
-  int kept = 0;
-  for (int i = 0; i < ban->applied_n; ++i) {
-    bool live = false;
-    for (int p = 0; p < pn; ++p) {
-      if (players[p] == ban->applied[i]) live = true;
-    }
-    if (live) ban->applied[kept++] = ban->applied[i];
-  }
-  ban->applied_n = kept;
   for (int p = 0; p < pn; ++p) {
-    bool done = false;
-    for (int i = 0; i < ban->applied_n; ++i) {
-      if (ban->applied[i] == players[p]) done = true;
-    }
-    if (done) continue;
-    bool any = false;
+    if (!lock_list_ready(players[p])) continue;
     for (int t = 0; t < ban->tmpl_n; ++t) {
-      if (thiscall_build_lock(players[p], ban->tmpls[t], true)) any = true;
-    }
-    if (any && ban->applied_n < kMaxEconPlayers) {
-      ban->applied[ban->applied_n++] = players[p];
+      uint32_t key = 0;
+      if (!template_ban_key(ban->tmpls[t], &key)) continue;
+      if (player_has_ban_key(players[p], key)) continue;
+      thiscall_build_lock(players[p], ban->tmpls[t], true);
     }
   }
 }
@@ -3037,7 +3210,7 @@ static void build_lock_tick_impl() {
   float battle_seconds = 0.f;
   const bool in_battle = read_battle_clock(&battle_logic, &battle_seconds);
   if (!in_battle) {
-    if (g_lock_battle_logic != 0 || g_lock_battle_seconds >= 0.f) {
+    if (g_lock_seen_battle || g_lock_battle_logic != 0 || g_lock_battle_seconds >= 0.f) {
       for (BuildBan& ban : g_build_bans) {
         ban.applied_n = 0;
         ban.tmpl_n = 0;
@@ -3046,18 +3219,29 @@ static void build_lock_tick_impl() {
     }
     g_lock_battle_logic = 0;
     g_lock_battle_seconds = -1.f;
+    g_lock_seen_battle = false;
+    g_lock_enter_tick = 0;
   } else {
     const bool restarted = battle_logic != g_lock_battle_logic ||
                            (g_lock_battle_seconds >= 0.f &&
                             battle_seconds + 2.f < g_lock_battle_seconds);
-    if (restarted && (g_lock_battle_logic != 0 || g_lock_battle_seconds >= 0.f)) {
-      forget_lock_targets();
-    }
+    const bool entered = !g_lock_seen_battle;
+    const bool new_match =
+        restarted && (g_lock_battle_logic != 0 || g_lock_battle_seconds >= 0.f);
+    // The shell has no previous logic pointer, so a pre-match ban used to keep
+    // stale templates. Rebind for the first few seconds as well: the match
+    // start scripts clear Player+0x200 after the mode flag flips.
+    if (entered || new_match) g_lock_enter_tick = now;
+    const bool opening = g_lock_enter_tick != 0 && now - g_lock_enter_tick < 8000;
+    if (entered || new_match || opening) forget_lock_targets();
+    g_lock_seen_battle = true;
     g_lock_battle_logic = battle_logic;
     g_lock_battle_seconds = battle_seconds;
   }
   sync_disable_superweapon_toggle();
-  if (!g_build_bans.empty() && module_base() && in_battle) {
+  const bool lock_ready =
+      in_battle && g_lock_enter_tick != 0 && now - g_lock_enter_tick >= 3000;
+  if (!g_build_bans.empty() && module_base() && lock_ready) {
     uint32_t players[kMaxEconPlayers] = {};
     int pn = 0;
     collect_lock_players(players, &pn);
@@ -3430,6 +3614,322 @@ static const BuildLockEntry* build_lock_catalog_impl(int* count) {
   return view.empty() ? nullptr : view.data();
 }
 
+static bool template_has_exact_id(uint32_t tmpl, const char* want) {
+  if (!is_ptr(tmpl) || !want || !want[0]) return false;
+  const size_t n = std::strlen(want);
+  if (n < 4 || n > 80) return false;
+  char buf[96] = {};
+  auto exact = [&](uint32_t addr) {
+    if (!safe_read_bytes(addr, buf, n + 1)) return false;
+    return buf[n] == 0 && std::memcmp(buf, want, n) == 0;
+  };
+  for (uint32_t off = 0; off <= 0x180; off += 4) {
+    if (exact(tmpl + off)) return true;
+    uint32_t p = 0;
+    if (!safe_read_u32(tmpl + off, &p) || !is_ptr(p)) continue;
+    if (exact(p)) return true;
+    uint32_t p2 = 0;
+    if (safe_read_u32(p, &p2) && is_ptr(p2) && exact(p2)) return true;
+  }
+  return false;
+}
+
+static uint32_t find_template_by_id(const char* id) {
+  if (!module_base() || !id || !id[0]) return 0;
+  uint32_t factory = 0;
+  if (!safe_read_u32(module_base() + kThingFactoryRva, &factory) || !is_ptr(factory)) return 0;
+  uint32_t tmpl = 0;
+  if (!safe_read_u32(factory + 0x24, &tmpl) || !is_ptr(tmpl)) return 0;
+  for (int n = 0; n < 4096 && is_ptr(tmpl); ++n) {
+    uint32_t vt = 0;
+    if (!safe_read_u32(tmpl, &vt) || !is_ptr(vt)) break;
+    if (template_has_exact_id(tmpl, id)) return tmpl;
+    uint32_t next = 0;
+    if (!safe_read_u32(tmpl + 0xC, &next) || next == tmpl) break;
+    tmpl = next;
+  }
+  return 0;
+}
+
+static const char* mcv_type_id(int faction) {
+  if (faction == 1) return "SovietMCV";
+  if (faction == 2) return "JapanMCV";
+  return "AlliedMCV";
+}
+
+static const char* mcv_faction_name(int faction) {
+  if (faction == 1) return u8"苏联";
+  if (faction == 2) return u8"帝国";
+  return u8"盟军";
+}
+
+static uint32_t g_rank_player = 0;
+static uint32_t g_mcv_player = 0;
+static uint32_t g_money_player = 0;
+static void label_battle_player(uint32_t player, uint32_t player_id, bool is_local, char* out,
+                                size_t out_len);
+
+static bool spawn_one_mcv(std::string* out_msg) {
+  if (!mc_base()) {
+    if (out_msg) *out_msg = u8"请先点「注入」";
+    return false;
+  }
+  const int faction = mcv_faction();
+  uint32_t owner = g_mcv_player;
+  if (!is_ptr(owner)) owner = local_owner_for_ops();
+  if (!is_ptr(owner)) {
+    if (out_msg) *out_msg = u8"请先选择玩家";
+    return false;
+  }
+  char owner_name[64] = {};
+  {
+    uint32_t pid = 0;
+    safe_read_u32(owner + 0x20, &pid);
+    label_battle_player(owner, pid, owner == local_owner_for_ops(), owner_name, sizeof(owner_name));
+  }
+  uint32_t owner_info = 0;
+  safe_read_u32(owner + 0x10, &owner_info);
+
+  float spawn[3];
+  if (!mouse_world_pos(spawn)) {
+    if (out_msg) *out_msg = u8"读不到鼠标地图坐标（请把鼠标移到战场地形上）";
+    return false;
+  }
+  const char* type_id = mcv_type_id(faction);
+  const uint32_t tmpl = find_template_by_id(type_id);
+  if (!is_ptr(tmpl)) {
+    if (out_msg) *out_msg = u8"找不到该阵营的基地车（请先进入战局）";
+    return false;
+  }
+  uint32_t pos_buf = reinterpret_cast<uint32_t>(mc_base() + 0x10A0);
+  write_f32(pos_buf, spawn[0]);
+  write_f32(pos_buf + 4, spawn[1]);
+  write_f32(pos_buf + 8, spawn[2]);
+  CallJob job{};
+  job.kind = CallJob::kCdecl;
+  job.fn = va_of(kFnCreateUnit);
+  job.nargs = 5;
+  job.args[0] = 0;
+  job.args[1] = tmpl;
+  job.args[2] = pos_buf;
+  job.args[3] = owner;
+  job.args[4] = owner_info;
+  if (!run_job(job) || !is_ptr(job.eax_out)) {
+    if (out_msg) *out_msg = u8"召唤失败（请把鼠标放在可通行的地形上）";
+    return false;
+  }
+  if (out_msg) {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), u8"已召唤一辆%s基地车（归属%s）", mcv_faction_name(faction),
+                  owner_name[0] ? owner_name : u8"所选玩家");
+    *out_msg = buf;
+  }
+  return true;
+}
+
+constexpr uint32_t kUpgradeStoreRva = 0x008E0D90;
+constexpr uint32_t kFnPlayerSetUpgrade = 0x0088B800;
+constexpr uint32_t kFnPlayerClearUpgrade = 0x00888510;
+
+static const char* kSpawnRankUpgrade[3] = {
+    "Upgrade_ProductionVeterancy_VETERAN",
+    "Upgrade_ProductionVeterancy_ELITE",
+    "Upgrade_ProductionVeterancy_HEROIC",
+};
+
+static uint32_t g_rank_store = 0;
+static uint32_t g_rank_tmpl[3] = {};
+
+static bool thiscall_set_upgrade(uint32_t player, uint32_t tmpl) {
+  using Fn = void(__thiscall*)(uint32_t, uint32_t, uint32_t, uint32_t);
+  const Fn fn = reinterpret_cast<Fn>(va_of(kFnPlayerSetUpgrade));
+  __try {
+    fn(player, tmpl, 2, 0);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    log("spawn rank grant fault player=%08X tmpl=%08X", player, tmpl);
+    return false;
+  }
+}
+
+static bool thiscall_clear_upgrade(uint32_t player, uint32_t tmpl) {
+  using Fn = void(__thiscall*)(uint32_t, uint32_t, uint32_t);
+  const Fn fn = reinterpret_cast<Fn>(va_of(kFnPlayerClearUpgrade));
+  __try {
+    fn(player, tmpl, 0);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    log("spawn rank clear fault player=%08X tmpl=%08X", player, tmpl);
+    return false;
+  }
+}
+
+static uint32_t find_upgrade_by_name(uint32_t store, const char* name) {
+  if (!is_ptr(store) || !name || !name[0]) return 0;
+  alignas(8) uint32_t key[2] = {};
+  using Make = uint32_t(__cdecl*)(void*, const char*, int);
+  using Find = uint32_t(__thiscall*)(uint32_t, void*);
+  const Make make = reinterpret_cast<Make>(va_of(0x00482BC0));
+  const Find find = reinterpret_cast<Find>(va_of(0x00586CF0));
+  __try {
+    make(key, name, 0);
+    if (!key[0] && !key[1]) return 0;
+    return find(store, key);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    log("spawn rank lookup fault name=%s", name);
+    return 0;
+  }
+}
+
+static bool ensure_spawn_rank_templates() {
+  if (!module_base()) return false;
+  uint32_t store = 0;
+  if (!safe_read_u32(module_base() + kUpgradeStoreRva, &store) || !is_ptr(store)) {
+    g_rank_store = 0;
+    return false;
+  }
+  if (store == g_rank_store && is_ptr(g_rank_tmpl[0]) && is_ptr(g_rank_tmpl[1]) &&
+      is_ptr(g_rank_tmpl[2])) {
+    return true;
+  }
+  g_rank_store = store;
+  g_rank_tmpl[0] = g_rank_tmpl[1] = g_rank_tmpl[2] = 0;
+  for (int i = 0; i < 3; ++i) {
+    g_rank_tmpl[i] = find_upgrade_by_name(store, kSpawnRankUpgrade[i]);
+  }
+  const bool ok = is_ptr(g_rank_tmpl[0]) && is_ptr(g_rank_tmpl[1]) && is_ptr(g_rank_tmpl[2]);
+  if (!ok) {
+    log("spawn rank templates missing store=%08X v=%08X e=%08X h=%08X", store, g_rank_tmpl[0],
+        g_rank_tmpl[1], g_rank_tmpl[2]);
+  }
+  return ok;
+}
+
+static bool player_has_upgrade(uint32_t player, uint32_t tmpl) {
+  uint32_t node = 0;
+  if (!safe_read_u32(player + 0x34, &node)) return false;
+  for (int n = 0; n < 256 && is_ptr(node); ++n) {
+    uint32_t cur = 0;
+    uint32_t status = 0;
+    uint32_t next = 0;
+    if (!safe_read_u32(node + 4, &cur)) break;
+    safe_read_u32(node + 8, &status);
+    if (cur == tmpl && status == 2) return true;
+    if (!safe_read_u32(node + 0xC, &next) || next == node) break;
+    node = next;
+  }
+  return false;
+}
+
+static int rank_of_player(uint32_t player) {
+  if (!is_ptr(player) || !ensure_spawn_rank_templates()) return -2;
+  int level = 0;
+  for (int i = 0; i < 3; ++i) {
+    if (player_has_upgrade(player, g_rank_tmpl[i])) level = i + 1;
+  }
+  return level;
+}
+
+static int cached_faction_of(uint32_t player) {
+  for (int i = 0; i < g_fac_cache_n; ++i) {
+    if (g_fac_cache[i].player == player) return g_fac_cache[i].faction;
+  }
+  return 0;
+}
+
+static void label_battle_player(uint32_t player, uint32_t player_id, bool /*is_local*/, char* out,
+                                size_t out_len) {
+  if (!out || out_len < 2) return;
+  const int fac = cached_faction_of(player);
+  const char* fac_name =
+      fac == 1 ? u8"盟军" : fac == 2 ? u8"苏联" : fac == 3 ? u8"帝国" : nullptr;
+  if (fac_name) {
+    std::snprintf(out, out_len, "%s", fac_name);
+    return;
+  }
+  std::snprintf(out, out_len, u8"玩家%u", player_id);
+}
+
+static int list_battle_players_impl(BattlePlayer* out, int max_out) {
+  if (!out || max_out <= 0) return 0;
+  static MatchEconomy econ;
+  if (!collect_match_economy_impl(&econ) || econ.player_count <= 0) return 0;
+  int n = 0;
+  for (int i = 0; i < econ.player_count && n < max_out; ++i) {
+    const PlayerEconomy& pe = econ.players[i];
+    if (!is_ptr(pe.player)) continue;
+    BattlePlayer& bp = out[n];
+    bp = BattlePlayer{};
+    bp.player = pe.player;
+    bp.player_id = pe.player_id;
+    bp.is_local = pe.is_local;
+    bp.defeated = pe.defeated;
+    bp.has_color = pe.has_color;
+    bp.color_r = pe.color_r;
+    bp.color_g = pe.color_g;
+    bp.color_b = pe.color_b;
+    std::snprintf(bp.name, sizeof(bp.name), "%s", pe.name[0] ? pe.name : u8"玩家");
+    ++n;
+  }
+  return n;
+}
+
+static int player_spawn_rank_impl(uint32_t player) {
+  if (!is_ptr(player)) return -1;
+  return rank_of_player(player);
+}
+
+static bool set_spawn_rank_impl(int level, std::string* out_msg) {
+  if (level < 0) level = 0;
+  if (level > 3) level = 3;
+  if (!module_base()) {
+    if (out_msg) *out_msg = u8"未找到游戏模块";
+    return false;
+  }
+  const uint32_t player = g_rank_player;
+  char name[64] = {};
+  if (!is_ptr(player)) {
+    if (out_msg) *out_msg = u8"请先选择玩家";
+    return false;
+  }
+  {
+    uint32_t pid = 0;
+    safe_read_u32(player + 0x20, &pid);
+    label_battle_player(player, pid, false, name, sizeof(name));
+  }
+  if (!ensure_spawn_rank_templates()) {
+    if (out_msg) *out_msg = u8"找不到出场等级数据（请先进入战局）";
+    return false;
+  }
+  for (int i = 2; i >= 0; --i) {
+    const bool want = i < level;
+    if (want || !player_has_upgrade(player, g_rank_tmpl[i])) continue;
+    if (!thiscall_clear_upgrade(player, g_rank_tmpl[i])) {
+      if (out_msg) *out_msg = u8"取消出场等级失败";
+      return false;
+    }
+  }
+  for (int i = 0; i < 3; ++i) {
+    const bool want = i < level;
+    if (!want || player_has_upgrade(player, g_rank_tmpl[i])) continue;
+    if (!thiscall_set_upgrade(player, g_rank_tmpl[i])) {
+      if (out_msg) *out_msg = u8"设置出场等级失败";
+      return false;
+    }
+  }
+  if (out_msg) {
+    const char* who = name[0] ? name : u8"选中阵营";
+    char buf[160];
+    if (level == 0) {
+      std::snprintf(buf, sizeof(buf), u8"已取消「%s」的出场等级", who);
+    } else {
+      std::snprintf(buf, sizeof(buf), u8"已将「%s」的出场等级设为 %d", who, level);
+    }
+    *out_msg = buf;
+  }
+  return true;
+}
+
 }  // namespace
 
 void install_roster_hooks() { install_roster_hooks_impl(); }
@@ -3450,6 +3950,25 @@ void build_lock_tick() { build_lock_tick_impl(); }
 
 void build_lock_sync_disable_superweapon() { sync_disable_superweapon_toggle(); }
 
+int list_battle_players(BattlePlayer* out, int max_out) {
+  return list_battle_players_impl(out, max_out);
+}
+
+void set_rank_player(uint32_t player) { g_rank_player = player; }
+
+void set_mcv_player(uint32_t player) { g_mcv_player = player; }
+
+void set_money_player(uint32_t player) { g_money_player = player; }
+
+int player_spawn_rank(uint32_t player) {
+  if (!module_base()) return -2;
+  return player_spawn_rank_impl(player);
+}
+
+bool set_spawn_rank(int level, std::string* out_msg) {
+  return set_spawn_rank_impl(level, out_msg);
+}
+
 bool adjust_local_money(int delta, std::string* out_msg) {
   if (!module_base()) {
     if (out_msg) *out_msg = u8"未找到游戏模块";
@@ -3468,17 +3987,21 @@ bool adjust_selected_player_money(int delta, std::string* out_msg) {
     if (out_msg) *out_msg = u8"未找到游戏模块";
     return false;
   }
-  auto ents = selected_entities_stable();
-  if (ents.empty()) {
-    if (out_msg) *out_msg = u8"请先选中该玩家的一个单位或建筑";
+  if (!is_ptr(g_money_player)) {
+    if (out_msg) *out_msg = u8"请先进入战局并选择玩家";
     return false;
   }
-  uint32_t owner = 0;
-  if (!safe_read_u32(ents[0] + 0x418, &owner) || !is_ptr(owner)) {
-    if (out_msg) *out_msg = u8"读不到选中单位的所属玩家";
+  BattlePlayer seats[16] = {};
+  const int n = list_battle_players_impl(seats, 16);
+  bool found = false;
+  for (int i = 0; i < n; ++i) {
+    if (seats[i].player == g_money_player) found = true;
+  }
+  if (!found) {
+    if (out_msg) *out_msg = u8"请先进入战局并选择玩家";
     return false;
   }
-  return apply_money_delta(owner, delta, out_msg);
+  return apply_money_delta(g_money_player, delta, out_msg);
 }
 
 bool inspect_first_selected(UnitInspect* out) {
@@ -3630,7 +4153,6 @@ bool engine_run(const char* key, std::string* out_msg) {
   if (std::strcmp(key, "unit_clone") == 0 || std::strcmp(key, "spawn_unit") == 0) {
     return clone_selected(!is_spectator(), 1, out_msg);
   }
-  if (std::strcmp(key, "spec_gift") == 0) return clone_selected(false, 1, out_msg);
   if (std::strcmp(key, "clone_multi") == 0) return clone_selected(!is_spectator(), 5, out_msg);
   if (std::strcmp(key, "ore_convoy") == 0) return clone_selected(true, 8, out_msg);
   if (std::strcmp(key, "full_buff") == 0) {
@@ -3646,11 +4168,7 @@ bool engine_run(const char* key, std::string* out_msg) {
     if (out_msg) *out_msg = a + u8"；" + b;
     return ok1 || ok2;
   }
-  if (std::strcmp(key, "spawn_mcv") == 0) {
-    if (out_msg)
-      *out_msg = u8"召唤基地车仍不稳定，请暂用 Python 版或选中基地车后「复制到己方」";
-    return false;
-  }
+  if (std::strcmp(key, "spawn_mcv") == 0) return spawn_one_mcv(out_msg);
   if (out_msg) *out_msg = u8"未知 engine 功能";
   return false;
 }

@@ -6,6 +6,7 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -48,6 +49,21 @@ std::mutex g_api_mu;
 
 void ensure_log_path() {
   if (g_log_path[0]) return;
+  HMODULE self = nullptr;
+  if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         reinterpret_cast<LPCSTR>(&ensure_log_path), &self) &&
+      self) {
+    char path[MAX_PATH] = {};
+    if (GetModuleFileNameA(self, path, MAX_PATH)) {
+      char* slash = std::strrchr(path, '\\');
+      if (slash) {
+        slash[1] = 0;
+        std::snprintf(g_log_path, sizeof(g_log_path), "%sra3_overlay.log", path);
+        return;
+      }
+    }
+  }
   char temp[MAX_PATH] = {};
   GetTempPathA(MAX_PATH, temp);
   std::snprintf(g_log_path, sizeof(g_log_path), "%sra3_overlay.log", temp);
@@ -153,6 +169,7 @@ void init() {
   ensure_log_path();
   DeleteFileA(g_log_path);
   log("DLL attached, log=%s", g_log_path);
+  install_crash_filter();
   g_module = reinterpret_cast<uint32_t>(GetModuleHandleW(L"ra3_1.12.game"));
   if (!g_module) {
     g_module = kModBase;
@@ -201,6 +218,168 @@ void log(const char* fmt, ...) {
     std::fclose(f);
   }
   if (g_cs_ready) LeaveCriticalSection(&g_log_cs);
+}
+
+namespace {
+
+volatile LONG g_crash_reports = 0;
+LPTOP_LEVEL_EXCEPTION_FILTER g_prev_crash_filter = nullptr;
+
+bool crash_read_u32(uint32_t addr, uint32_t* out) {
+  if (!out || addr < 0x10000u) return false;
+  __try {
+    *out = *reinterpret_cast<const volatile uint32_t*>(addr);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
+void format_code_addr(uint32_t addr, char* buf, size_t n) {
+  if (!buf || n < 12) return;
+  buf[0] = 0;
+  HMODULE mod = nullptr;
+  if (!addr ||
+      !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          reinterpret_cast<LPCSTR>(static_cast<uintptr_t>(addr)), &mod) ||
+      !mod) {
+    std::snprintf(buf, n, "%08X", addr);
+    return;
+  }
+  char path[MAX_PATH] = {};
+  GetModuleFileNameA(mod, path, MAX_PATH);
+  const char* base = path;
+  for (const char* p = path; *p; ++p) {
+    if (*p == '\\' || *p == '/') base = p + 1;
+  }
+  const auto base_addr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(mod));
+  std::snprintf(buf, n, "%s+%08X", base[0] ? base : "mod", addr - base_addr);
+}
+
+const char* exception_name(DWORD code) {
+  switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:
+      return "ACCESS_VIOLATION";
+    case EXCEPTION_STACK_OVERFLOW:
+      return "STACK_OVERFLOW";
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+      return "ILLEGAL_INSTRUCTION";
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+      return "DIVIDE_BY_ZERO";
+    case 0xC0000374:
+      return "HEAP_CORRUPTION";
+    case 0xE06D7363:
+      return "CXX_EXCEPTION";
+    default:
+      return "EXCEPTION";
+  }
+}
+
+void crash_file_write(const char* text) {
+  if (!text || !text[0]) return;
+  ensure_log_path();
+  HANDLE h = CreateFileA(g_log_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                         OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return;
+  DWORD wrote = 0;
+  WriteFile(h, text, static_cast<DWORD>(std::strlen(text)), &wrote, nullptr);
+  FlushFileBuffers(h);
+  CloseHandle(h);
+}
+
+LONG WINAPI unhandled_crash_filter(EXCEPTION_POINTERS* ep) {
+  log_exception(ep, "unhandled");
+  if (g_prev_crash_filter && g_prev_crash_filter != unhandled_crash_filter) {
+    return g_prev_crash_filter(ep);
+  }
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+}  // namespace
+
+void install_crash_filter() {
+  LPTOP_LEVEL_EXCEPTION_FILTER cur = SetUnhandledExceptionFilter(unhandled_crash_filter);
+  if (cur && cur != unhandled_crash_filter) g_prev_crash_filter = cur;
+}
+
+void log_exception(void* ep_void, const char* where) {
+  if (InterlockedIncrement(&g_crash_reports) > 6) return;
+  SYSTEMTIME st{};
+  GetLocalTime(&st);
+  char block[4096];
+  size_t used = 0;
+  auto add = [&](const char* line) {
+    if (!line || used + 2 >= sizeof(block)) return;
+    const size_t len = std::strlen(line);
+    const size_t room = sizeof(block) - 1 - used;
+    const size_t n = len < room ? len : room;
+    std::memcpy(block + used, line, n);
+    used += n;
+    if (used + 1 < sizeof(block)) block[used++] = '\n';
+    block[used] = 0;
+  };
+  char line[320];
+  std::snprintf(line, sizeof(line), "[%02u:%02u:%02u.%03u] CRASH %s", st.wHour, st.wMinute,
+                st.wSecond, st.wMilliseconds, where && where[0] ? where : "unknown");
+  add(line);
+
+  auto* ep = static_cast<EXCEPTION_POINTERS*>(ep_void);
+  if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) {
+    add("  (no exception context)");
+    crash_file_write(block);
+    return;
+  }
+  const EXCEPTION_RECORD* rec = ep->ExceptionRecord;
+  const CONTEXT* ctx = ep->ContextRecord;
+  char at[160];
+  format_code_addr(static_cast<uint32_t>(ctx->Eip), at, sizeof(at));
+  if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2) {
+    const char* rw = rec->ExceptionInformation[0] ? "write" : "read";
+    char fault[160];
+    format_code_addr(static_cast<uint32_t>(rec->ExceptionInformation[1]), fault, sizeof(fault));
+    std::snprintf(line, sizeof(line), "  code=%08X %s %s addr=%s eip=%s esp=%08X ebp=%08X",
+                  rec->ExceptionCode, exception_name(rec->ExceptionCode), rw, fault, at, ctx->Esp,
+                  ctx->Ebp);
+  } else {
+    std::snprintf(line, sizeof(line), "  code=%08X %s eip=%s esp=%08X ebp=%08X", rec->ExceptionCode,
+                  exception_name(rec->ExceptionCode), at, ctx->Esp, ctx->Ebp);
+  }
+  add(line);
+
+  int frame = 0;
+  uint32_t ebp = ctx->Ebp;
+  uint32_t eip = ctx->Eip;
+  for (int guard = 0; guard < 24 && eip >= 0x10000u; ++guard) {
+    format_code_addr(eip, at, sizeof(at));
+    std::snprintf(line, sizeof(line), "  #%02d %s", frame++, at);
+    add(line);
+    uint32_t next = 0;
+    uint32_t ret = 0;
+    if (!crash_read_u32(ebp, &next) || !crash_read_u32(ebp + 4, &ret)) break;
+    if (next <= ebp || next > ebp + 0x10000u) break;
+    ebp = next;
+    eip = ret;
+  }
+
+  int slots = 0;
+  for (int i = 0; i < 48 && slots < 12; ++i) {
+    uint32_t word = 0;
+    if (!crash_read_u32(ctx->Esp + static_cast<uint32_t>(i) * 4u, &word)) break;
+    HMODULE mod = nullptr;
+    if (!word ||
+        !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(static_cast<uintptr_t>(word)), &mod) ||
+        !mod) {
+      continue;
+    }
+    format_code_addr(word, at, sizeof(at));
+    std::snprintf(line, sizeof(line), "  esp+%02X %s", i * 4, at);
+    add(line);
+    ++slots;
+  }
+  crash_file_write(block);
 }
 
 bool ready() { return g_flags != nullptr && g_mc != nullptr; }
@@ -367,8 +546,8 @@ bool inject(bool spectate_mode) {
     log("alloc MC=%p MC2=%p FLAGS=%p IDB=%p", g_mc, g_mc2, g_flags, g_idb);
   }
 
-  // Do NOT write the broken relocatable embedded blob. trainer.build() will
-  // fill these pages when arm_hooks() runs (same path as trainer.py).
+  // Do NOT write the broken relocatable embedded blob. arm_mustcode fills
+  // these pages when arm_hooks() runs.
   std::memset(g_mc, 0xCC, kMcSize);
   std::memset(g_mc2, 0xCC, kMc2Size);
   std::memset(g_flags, 0, kFlagsSize);
@@ -385,7 +564,7 @@ bool inject(bool spectate_mode) {
 
   g_installed.clear();
   g_hooked = false;
-  log("MustCode pages allocated (empty). Use arm_hooks via trainer.build().");
+  log("MustCode pages allocated (empty). Use arm_hooks.");
   return true;
 }
 
@@ -422,7 +601,7 @@ bool arm_hooks() {
     g_installed.push_back(ih);
   }
   g_hooked = true;
-  log("hooks armed via trainer.build() count=%d", (int)g_installed.size());
+  log("hooks armed count=%d", (int)g_installed.size());
   return true;
 }
 
@@ -588,23 +767,177 @@ bool trigger_hotkey(const char* key, std::string* out_msg) {
   return false;
 }
 
-const char* hotkey_hint(const char* key) {
-  if (!key) return nullptr;
-  struct Hint { const char* key; const char* text; };
-  static const Hint kHints[] = {
-      {"money", "Ctrl+F1"}, {"power", "Ctrl+F2"}, {"scpoint", "Ctrl+F3"},
-      {"haveallsc", "Ctrl+F4"}, {"fastbuild", "Ctrl+F5"}, {"superpower", "Ctrl+F6"},
-      {"disableallsp", "Ctrl+F7"}, {"map", "Ctrl+F9"}, {"nocbuild", "Ctrl+F10"},
-      {"ammo", ";"}, {"oremine", "'"}, {"danger", ", . /"},
-      {"speed_max", "-"}, {"speed_slow", "="}, {"speed_freeze", "PgUp"},
-      {"speed_restore", "PgDn"}, {"hp_max", "["}, {"hp_min", "]"},
-      {"hp_normal", "\\"}, {"unit_rank", "P"}, {"unit_kill", "Del"},
-      {"unit_clone", "I"},
-  };
-  for (auto& h : kHints) {
-    if (std::strcmp(h.key, key) == 0) return h.text;
+struct HotkeySlot {
+  const char* id;
+  const char* feature;
+  int vk;
+  bool ctrl;
+  bool alt;
+  bool shift;
+};
+
+static const HotkeySlot kDefaultHotkeys[] = {
+    {"money", "money", VK_F1, true, false, false},
+    {"power", "power", VK_F2, true, false, false},
+    {"scpoint", "scpoint", VK_F3, true, false, false},
+    {"haveallsc", "haveallsc", VK_F4, true, false, false},
+    {"fastbuild", "fastbuild", VK_F5, true, false, false},
+    {"superpower", "superpower", VK_F6, true, false, false},
+    {"disableallsp", "disableallsp", VK_F7, true, false, false},
+    {"map", "map", VK_F9, true, false, false},
+    {"nocbuild", "nocbuild", VK_F10, true, false, false},
+    {"ammo", "ammo", 0xBA, false, false, false},
+    {"oremine", "oremine", 0xDE, false, false, false},
+    {"danger_max", "danger", 0xBC, false, false, false},
+    {"danger_min", "danger", 0xBE, false, false, false},
+    {"danger_norm", "danger", 0xBF, false, false, false},
+    {"speed_max", "speed_max", 0xBD, false, false, false},
+    {"speed_slow", "speed_slow", 0xBB, false, false, false},
+    {"speed_freeze", "speed_freeze", VK_PRIOR, false, false, false},
+    {"speed_restore", "speed_restore", VK_NEXT, false, false, false},
+    {"hp_max", "hp_max", 0xDB, false, false, false},
+    {"hp_min", "hp_min", 0xDD, false, false, false},
+    {"hp_normal", "hp_normal", 0xDC, false, false, false},
+    {"unit_rank", "unit_rank", 'P', false, false, false},
+    {"unit_kill", "unit_kill", VK_DELETE, false, false, false},
+    {"unit_clone", "unit_clone", 'I', false, false, false},
+};
+
+static HotkeySlot g_hotkeys[32];
+static int g_hotkey_n = 0;
+static bool g_hotkey_capture = false;
+
+static void ensure_hotkeys() {
+  if (g_hotkey_n > 0) return;
+  g_hotkey_n = (int)(sizeof(kDefaultHotkeys) / sizeof(kDefaultHotkeys[0]));
+  if (g_hotkey_n > (int)(sizeof(g_hotkeys) / sizeof(g_hotkeys[0]))) {
+    g_hotkey_n = (int)(sizeof(g_hotkeys) / sizeof(g_hotkeys[0]));
   }
-  return nullptr;
+  for (int i = 0; i < g_hotkey_n; ++i) g_hotkeys[i] = kDefaultHotkeys[i];
+}
+
+static bool vk_name(int vk, char* buf, size_t n) {
+  if (!buf || n < 2) return false;
+  buf[0] = 0;
+  if (vk >= VK_F1 && vk <= VK_F24) {
+    std::snprintf(buf, n, "F%d", vk - VK_F1 + 1);
+    return true;
+  }
+  if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) {
+    std::snprintf(buf, n, "%c", (char)vk);
+    return true;
+  }
+  switch (vk) {
+    case VK_PRIOR: std::snprintf(buf, n, "PgUp"); return true;
+    case VK_NEXT: std::snprintf(buf, n, "PgDn"); return true;
+    case VK_DELETE: std::snprintf(buf, n, "Del"); return true;
+    case VK_INSERT: std::snprintf(buf, n, "Ins"); return true;
+    case VK_HOME: std::snprintf(buf, n, "Home"); return true;
+    case VK_END: std::snprintf(buf, n, "End"); return true;
+    case VK_SPACE: std::snprintf(buf, n, "Space"); return true;
+    case VK_TAB: std::snprintf(buf, n, "Tab"); return true;
+    case VK_UP: std::snprintf(buf, n, "Up"); return true;
+    case VK_DOWN: std::snprintf(buf, n, "Down"); return true;
+    case VK_LEFT: std::snprintf(buf, n, "Left"); return true;
+    case VK_RIGHT: std::snprintf(buf, n, "Right"); return true;
+    case 0xBA: std::snprintf(buf, n, ";"); return true;
+    case 0xBB: std::snprintf(buf, n, "="); return true;
+    case 0xBC: std::snprintf(buf, n, ","); return true;
+    case 0xBD: std::snprintf(buf, n, "-"); return true;
+    case 0xBE: std::snprintf(buf, n, "."); return true;
+    case 0xBF: std::snprintf(buf, n, "/"); return true;
+    case 0xC0: std::snprintf(buf, n, "`"); return true;
+    case 0xDB: std::snprintf(buf, n, "["); return true;
+    case 0xDC: std::snprintf(buf, n, "\\"); return true;
+    case 0xDD: std::snprintf(buf, n, "]"); return true;
+    case 0xDE: std::snprintf(buf, n, "'"); return true;
+    default: break;
+  }
+  if (vk > 0 && vk < 256) {
+    std::snprintf(buf, n, "%d", vk);
+    return true;
+  }
+  return false;
+}
+
+static bool vk_from_name(const char* s, int* vk) {
+  if (!s || !s[0] || !vk) return false;
+  if ((s[0] == 'F' || s[0] == 'f') && s[1] >= '0' && s[1] <= '9') {
+    const int n = std::atoi(s + 1);
+    if (n >= 1 && n <= 24) {
+      *vk = VK_F1 + n - 1;
+      return true;
+    }
+  }
+  if (!s[1]) {
+    const char ch = s[0];
+    if (ch >= 'a' && ch <= 'z') {
+      *vk = ch - 'a' + 'A';
+      return true;
+    }
+    if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
+      *vk = (unsigned char)ch;
+      return true;
+    }
+    switch (ch) {
+      case ';': *vk = 0xBA; return true;
+      case '=': *vk = 0xBB; return true;
+      case ',': *vk = 0xBC; return true;
+      case '-': *vk = 0xBD; return true;
+      case '.': *vk = 0xBE; return true;
+      case '/': *vk = 0xBF; return true;
+      case '`': *vk = 0xC0; return true;
+      case '[': *vk = 0xDB; return true;
+      case '\\': *vk = 0xDC; return true;
+      case ']': *vk = 0xDD; return true;
+      case '\'': *vk = 0xDE; return true;
+      default: break;
+    }
+  }
+  if (_stricmp(s, "PgUp") == 0) { *vk = VK_PRIOR; return true; }
+  if (_stricmp(s, "PgDn") == 0) { *vk = VK_NEXT; return true; }
+  if (_stricmp(s, "Del") == 0 || _stricmp(s, "Delete") == 0) { *vk = VK_DELETE; return true; }
+  if (_stricmp(s, "Ins") == 0) { *vk = VK_INSERT; return true; }
+  if (_stricmp(s, "Home") == 0) { *vk = VK_HOME; return true; }
+  if (_stricmp(s, "End") == 0) { *vk = VK_END; return true; }
+  if (_stricmp(s, "Space") == 0) { *vk = VK_SPACE; return true; }
+  if (_stricmp(s, "Tab") == 0) { *vk = VK_TAB; return true; }
+  if (_stricmp(s, "Up") == 0) { *vk = VK_UP; return true; }
+  if (_stricmp(s, "Down") == 0) { *vk = VK_DOWN; return true; }
+  if (_stricmp(s, "Left") == 0) { *vk = VK_LEFT; return true; }
+  if (_stricmp(s, "Right") == 0) { *vk = VK_RIGHT; return true; }
+  if (s[0] >= '0' && s[0] <= '9') {
+    const int n = std::atoi(s);
+    if (n > 0 && n < 256) {
+      *vk = n;
+      return true;
+    }
+  }
+  return false;
+}
+
+static void format_combo(int vk, bool ctrl, bool alt, bool shift, char* buf, size_t n) {
+  if (!buf || n < 2) return;
+  buf[0] = 0;
+  char key[16] = {};
+  if (!vk_name(vk, key, sizeof(key))) {
+    std::snprintf(buf, n, "?");
+    return;
+  }
+  std::snprintf(buf, n, "%s%s%s%s", ctrl ? "Ctrl+" : "", alt ? "Alt+" : "", shift ? "Shift+" : "",
+                key);
+}
+
+static bool same_combo(const HotkeySlot& s, int vk, bool ctrl, bool alt, bool shift) {
+  return s.vk == vk && s.ctrl == ctrl && s.alt == alt && s.shift == shift;
+}
+
+static bool reserved_hotkey(int vk) {
+  return vk == VK_HOME || vk == VK_INSERT || vk == VK_F8 || vk == VK_ESCAPE ||
+         vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON || vk == VK_XBUTTON1 ||
+         vk == VK_XBUTTON2 || vk == VK_CONTROL || vk == VK_SHIFT || vk == VK_MENU ||
+         vk == VK_LCONTROL || vk == VK_RCONTROL || vk == VK_LSHIFT || vk == VK_RSHIFT ||
+         vk == VK_LMENU || vk == VK_RMENU;
 }
 
 void sync_spectator_hooks() {
@@ -650,34 +983,30 @@ static const FeatureInfo kFeatures[] = {
     {"enemy_weaken", u8"敌方残血", "engine", 0},
     {"ally_god", u8"友军无敌", "engine", 0},
     {"fog_toggle", u8"迷雾开关", "toggle", 0x11},
-    {"spec_gift", u8"观战赠送单位", "engine", 0},
     {"chaos_mode", u8"混乱模式", "engine", 0},
     {"ore_convoy", u8"刷矿车车队", "engine", 0},
     {"spawn_mcv", u8"召唤基地车", "engine", 0},
+    {"spawn_rank", u8"出场等级", "spawn_rank", 0},
 };
 
-static const char* kGroupRes[] = {"money", "money_sel", "power", "scpoint", "haveallsc", "fastbuild", "oremine"};
+static const char* kGroupRes[] = {"money_sel", "money", "power", "scpoint", "haveallsc", "fastbuild", "oremine"};
 static const char* kGroupSw[] = {"superpower", "disableallsp", "map", "nocbuild",
                                  "protocol_ready", "unit_skill_ready", "disable_protocol"};
 static const char* kGroupAmmo[] = {"ammo", "danger"};
 static const char* kGroupUnit[] = {
     "speed_max", "speed_slow", "speed_freeze", "speed_restore", "hp_max", "hp_min", "hp_normal",
     "unit_rank", "unit_kill", "unit_clone", "convert_unit", "spawn_unit", "clone_multi",
-    "damage_mult", "full_buff"};
+    "damage_mult", "full_buff", "spawn_rank", "spawn_mcv"};
 static const char* kGroupBattle[] = {"enemy_weaken", "ally_god"};
 static const char* kGroupIntel[] = {"fog_toggle"};
-static const char* kGroupSpec[] = {"spec_gift"};
-static const char* kGroupFun[] = {"chaos_mode", "ore_convoy", "spawn_mcv"};
 
 static const GroupInfo kGroups[] = {
-    {u8"资源", kGroupRes, 7, u8"己方默认 +10万；选中玩家单位后可加减其资金（默认 1万）"},
+    {u8"资源", kGroupRes, 7, u8"己方默认 +10万；玩家资金从列表选择阵营后加减（默认 1万）"},
     {u8"超武 / 地图", kGroupSw, 7, nullptr},
     {u8"弹药 / 危险", kGroupAmmo, 2, nullptr},
-    {u8"单位操作", kGroupUnit, 15, u8"需先在游戏里选中单位"},
+    {u8"单位操作", kGroupUnit, 17, u8"需先在游戏里选中单位"},
     {u8"战场", kGroupBattle, 2, nullptr},
     {u8"情报", kGroupIntel, 1, nullptr},
-    {u8"观战", kGroupSpec, 1, u8"建议使用观战模式注入"},
-    {u8"趣味", kGroupFun, 3, u8"娱乐向；召唤基地车可能仍不稳定"},
 };
 
 const FeatureInfo* features(int* count) {
@@ -697,6 +1026,166 @@ const FeatureInfo* find_feature(const char* key) {
 const GroupInfo* groups(int* count) {
   if (count) *count = (int)(sizeof(kGroups) / sizeof(kGroups[0]));
   return kGroups;
+}
+
+int hotkey_slot_count() {
+  ensure_hotkeys();
+  return g_hotkey_n;
+}
+
+const char* hotkey_slot_id(int index) {
+  ensure_hotkeys();
+  if (index < 0 || index >= g_hotkey_n) return "";
+  return g_hotkeys[index].id;
+}
+
+const char* hotkey_slot_feature(int index) {
+  ensure_hotkeys();
+  if (index < 0 || index >= g_hotkey_n) return "";
+  return g_hotkeys[index].feature;
+}
+
+void hotkey_slot_mods(int index, int* vk, bool* ctrl, bool* alt, bool* shift) {
+  ensure_hotkeys();
+  if (index < 0 || index >= g_hotkey_n) {
+    if (vk) *vk = 0;
+    if (ctrl) *ctrl = false;
+    if (alt) *alt = false;
+    if (shift) *shift = false;
+    return;
+  }
+  if (vk) *vk = g_hotkeys[index].vk;
+  if (ctrl) *ctrl = g_hotkeys[index].ctrl;
+  if (alt) *alt = g_hotkeys[index].alt;
+  if (shift) *shift = g_hotkeys[index].shift;
+}
+
+void format_hotkey_slot(int index, char* buf, size_t buf_len) {
+  ensure_hotkeys();
+  if (!buf || buf_len == 0) return;
+  buf[0] = 0;
+  if (index < 0 || index >= g_hotkey_n || g_hotkeys[index].vk <= 0) return;
+  format_combo(g_hotkeys[index].vk, g_hotkeys[index].ctrl, g_hotkeys[index].alt,
+               g_hotkeys[index].shift, buf, buf_len);
+}
+
+static int find_hotkey_index(const char* id) {
+  ensure_hotkeys();
+  if (!id) return -1;
+  for (int i = 0; i < g_hotkey_n; ++i) {
+    if (std::strcmp(g_hotkeys[i].id, id) == 0) return i;
+  }
+  return -1;
+}
+
+static bool assign_hotkey(int index, int vk, bool ctrl, bool alt, bool shift, std::string* err) {
+  ensure_hotkeys();
+  if (index < 0 || index >= g_hotkey_n) {
+    if (err) *err = u8"没有这个快捷键";
+    return false;
+  }
+  if (vk <= 0 || vk >= 256 || reserved_hotkey(vk)) {
+    if (err) *err = u8"这个键不能当作快捷键";
+    return false;
+  }
+  for (int i = 0; i < g_hotkey_n; ++i) {
+    if (i == index || g_hotkeys[i].vk <= 0) continue;
+    if (!same_combo(g_hotkeys[i], vk, ctrl, alt, shift)) continue;
+    const FeatureInfo* other = find_feature(g_hotkeys[i].feature);
+    if (err) {
+      *err = std::string(u8"和「") + (other ? other->label : g_hotkeys[i].id) + u8"」冲突";
+    }
+    return false;
+  }
+  g_hotkeys[index].vk = vk;
+  g_hotkeys[index].ctrl = ctrl;
+  g_hotkeys[index].alt = alt;
+  g_hotkeys[index].shift = shift;
+  return true;
+}
+
+bool set_hotkey_slot(int index, int vk, bool ctrl, bool alt, bool shift, std::string* err) {
+  return assign_hotkey(index, vk, ctrl, alt, shift, err);
+}
+
+bool reset_hotkey_slot(int index) {
+  ensure_hotkeys();
+  if (index < 0 || index >= g_hotkey_n) return false;
+  const int n = (int)(sizeof(kDefaultHotkeys) / sizeof(kDefaultHotkeys[0]));
+  for (int i = 0; i < n; ++i) {
+    if (std::strcmp(kDefaultHotkeys[i].id, g_hotkeys[index].id) != 0) continue;
+    g_hotkeys[index].vk = kDefaultHotkeys[i].vk;
+    g_hotkeys[index].ctrl = kDefaultHotkeys[i].ctrl;
+    g_hotkeys[index].alt = kDefaultHotkeys[i].alt;
+    g_hotkeys[index].shift = kDefaultHotkeys[i].shift;
+    return true;
+  }
+  return false;
+}
+
+int hotkey_slots_for_feature(const char* feature, int* indices, int cap) {
+  ensure_hotkeys();
+  int n = 0;
+  if (!feature || !indices || cap <= 0) return 0;
+  for (int i = 0; i < g_hotkey_n && n < cap; ++i) {
+    if (std::strcmp(g_hotkeys[i].feature, feature) == 0) indices[n++] = i;
+  }
+  return n;
+}
+
+bool apply_hotkey_text(const char* slot_id, const char* text) {
+  const int index = find_hotkey_index(slot_id);
+  if (index < 0 || !text) return false;
+  bool ctrl = false, alt = false, shift = false;
+  const char* key = text;
+  while (*key) {
+    const char* plus = std::strchr(key, '+');
+    char tok[32] = {};
+    const size_t len = plus ? (size_t)(plus - key) : std::strlen(key);
+    if (len == 0 || len >= sizeof(tok)) return false;
+    std::memcpy(tok, key, len);
+    tok[len] = 0;
+    if (!plus) {
+      int vk = 0;
+      if (!vk_from_name(tok, &vk) || vk <= 0 || vk >= 256) return false;
+      g_hotkeys[index].vk = vk;
+      g_hotkeys[index].ctrl = ctrl;
+      g_hotkeys[index].alt = alt;
+      g_hotkeys[index].shift = shift;
+      return true;
+    }
+    if (_stricmp(tok, "Ctrl") == 0 || _stricmp(tok, "Control") == 0) ctrl = true;
+    else if (_stricmp(tok, "Alt") == 0) alt = true;
+    else if (_stricmp(tok, "Shift") == 0) shift = true;
+    else return false;
+    key = plus + 1;
+  }
+  return false;
+}
+
+bool hotkey_capture_active() { return g_hotkey_capture; }
+
+void set_hotkey_capture(bool on) { g_hotkey_capture = on; }
+
+const char* hotkey_hint(const char* key) {
+  ensure_hotkeys();
+  if (!key) return nullptr;
+  thread_local char buf[128];
+  buf[0] = 0;
+  size_t used = 0;
+  for (int i = 0; i < g_hotkey_n; ++i) {
+    if (std::strcmp(g_hotkeys[i].feature, key) != 0 || g_hotkeys[i].vk <= 0) continue;
+    char one[48] = {};
+    format_combo(g_hotkeys[i].vk, g_hotkeys[i].ctrl, g_hotkeys[i].alt, g_hotkeys[i].shift, one,
+                 sizeof(one));
+    if (!one[0]) continue;
+    const size_t need = std::strlen(one) + (used ? 1 : 0);
+    if (used + need + 1 >= sizeof(buf)) break;
+    if (used) buf[used++] = ' ';
+    std::memcpy(buf + used, one, std::strlen(one) + 1);
+    used += std::strlen(one);
+  }
+  return buf[0] ? buf : nullptr;
 }
 
 bool feature_enabled(const char* key) {
@@ -780,6 +1269,16 @@ int money_self_step() { return g_money_self_step; }
 int money_sel_step() { return g_money_sel_step; }
 void set_money_self_step(int v) { g_money_self_step = clamp_money_step(v); }
 void set_money_sel_step(int v) { g_money_sel_step = clamp_money_step(v); }
+
+static int g_mcv_faction = 0;
+
+int mcv_faction() { return g_mcv_faction; }
+
+void set_mcv_faction(int faction) {
+  if (faction < 0) faction = 0;
+  if (faction > 2) faction = 2;
+  g_mcv_faction = faction;
+}
 
 uint8_t* flags_base() { return g_flags; }
 uint8_t* mc_base() { return g_mc; }

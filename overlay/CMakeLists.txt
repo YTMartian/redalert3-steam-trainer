@@ -10,6 +10,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui)
+set(IMGUI_PLOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui-plot)
 set(MINHOOK_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/minhook)
 
 add_library(ra3_overlay SHARED
@@ -26,6 +27,7 @@ add_library(ra3_overlay SHARED
   ${IMGUI_DIR}/imgui_widgets.cpp
   ${IMGUI_DIR}/backends/imgui_impl_dx9.cpp
   ${IMGUI_DIR}/backends/imgui_impl_win32.cpp
+  ${IMGUI_PLOT_DIR}/src/imgui_plot.cpp
   ${MINHOOK_DIR}/src/buffer.c
   ${MINHOOK_DIR}/src/hook.c
   ${MINHOOK_DIR}/src/trampoline.c
@@ -36,6 +38,7 @@ target_include_directories(ra3_overlay PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${IMGUI_DIR}
   ${IMGUI_DIR}/backends
+  ${IMGUI_PLOT_DIR}/include
   ${MINHOOK_DIR}/include
 )
 
@@ -45,7 +48,7 @@ target_compile_definitions(ra3_overlay PRIVATE
   _CRT_SECURE_NO_WARNINGS
 )
 
-target_compile_options(ra3_overlay PRIVATE /utf-8)
+target_compile_options(ra3_overlay PRIVATE /utf-8 /Oy-)
 
 target_link_libraries(ra3_overlay PRIVATE
   d3d9
