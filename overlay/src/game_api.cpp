@@ -982,7 +982,6 @@ static const FeatureInfo kFeatures[] = {
     {"full_buff", u8"一键满状态", "engine", 0},
     {"enemy_weaken", u8"敌方残血", "engine", 0},
     {"ally_god", u8"友军无敌", "engine", 0},
-    {"fog_toggle", u8"迷雾开关", "toggle", 0x11},
     {"chaos_mode", u8"混乱模式", "engine", 0},
     {"ore_convoy", u8"刷矿车车队", "engine", 0},
     {"spawn_mcv", u8"召唤基地车", "engine", 0},
@@ -998,7 +997,6 @@ static const char* kGroupUnit[] = {
     "unit_rank", "unit_kill", "unit_clone", "convert_unit", "spawn_unit", "clone_multi",
     "damage_mult", "full_buff", "spawn_rank", "spawn_mcv"};
 static const char* kGroupBattle[] = {"enemy_weaken", "ally_god"};
-static const char* kGroupIntel[] = {"fog_toggle"};
 
 static const GroupInfo kGroups[] = {
     {u8"资源", kGroupRes, 7, u8"己方默认 +10万；玩家资金从列表选择阵营后加减（默认 1万）"},
@@ -1006,7 +1004,6 @@ static const GroupInfo kGroups[] = {
     {u8"弹药 / 危险", kGroupAmmo, 2, nullptr},
     {u8"单位操作", kGroupUnit, 17, u8"需先在游戏里选中单位"},
     {u8"战场", kGroupBattle, 2, nullptr},
-    {u8"情报", kGroupIntel, 1, nullptr},
 };
 
 const FeatureInfo* features(int* count) {

@@ -4120,16 +4120,6 @@ bool engine_run(const char* key, std::string* out_msg) {
     if (out_msg) *out_msg = u8"已脉冲禁用敌方超武/协议约 2 秒";
     return true;
   }
-  if (std::strcmp(key, "fog_toggle") == 0) {
-    if (!ready() || !hook_is_installed("Map")) {
-      if (out_msg) *out_msg = u8"需要已注入且含 Map hook";
-      return false;
-    }
-    uint8_t cur = get_flag(0x11);
-    set_flag(0x11, cur ? 0 : 1);
-    if (out_msg) *out_msg = cur ? u8"已恢复战争迷雾" : u8"已关闭战争迷雾";
-    return true;
-  }
   if (std::strcmp(key, "speed_max") == 0) return apply_speed("max", out_msg);
   if (std::strcmp(key, "speed_slow") == 0) return apply_speed("slow", out_msg);
   if (std::strcmp(key, "speed_freeze") == 0) return apply_speed("freeze", out_msg);
