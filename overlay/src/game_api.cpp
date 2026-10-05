@@ -3,14 +3,127 @@
 #include "embedded_payload.h"
 
 #include <Windows.h>
+#include <TlHelp32.h>
 
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
+
+// 0x416740 returns whatever the game pool allocated. On a failed grow that
+// pointer is NULL, and 0xA01B70 then reads [NULL-4]. Substitute a process-heap
+// block so the caller still receives a real pointer. Hooks stay armed.
+extern "C" void* g_ra3_pool_resume = nullptr;
+extern "C" void* g_ra3_pool_hdr = nullptr;
+extern "C" void* g_ra3_free_resume = nullptr;
+extern "C" void* g_ra3_free_skip = nullptr;
+
+struct PoolFb {
+  uint32_t user;
+  PoolFb* next;
+};
+static PoolFb* g_pool_fb[4096] = {};
+static CRITICAL_SECTION g_pool_fb_cs;
+static bool g_pool_fb_ready = false;
+
+static int pool_fb_slot(uint32_t user) { return static_cast<int>((user >> 4) & 4095u); }
+
+extern "C" uint32_t ra3_pool_fallback(uint32_t size) {
+  if (!g_pool_fb_ready || size == 0 || size > 0x1000000u) return 0;
+  uint32_t bytes = (size + 4u + 7u) & ~7u;
+  if (bytes < 16u) bytes = 16u;
+  auto* raw = static_cast<uint8_t*>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, bytes));
+  auto* node = static_cast<PoolFb*>(HeapAlloc(GetProcessHeap(), 0, sizeof(PoolFb)));
+  if (!raw || !node) {
+    if (raw) HeapFree(GetProcessHeap(), 0, raw);
+    if (node) HeapFree(GetProcessHeap(), 0, node);
+    return 0;
+  }
+  *reinterpret_cast<uint32_t*>(raw) = bytes & 0x7ffffff8u;
+  const uint32_t user = reinterpret_cast<uint32_t>(raw + 4);
+  node->user = user;
+  EnterCriticalSection(&g_pool_fb_cs);
+  const int slot = pool_fb_slot(user);
+  node->next = g_pool_fb[slot];
+  g_pool_fb[slot] = node;
+  LeaveCriticalSection(&g_pool_fb_cs);
+  static volatile LONG reported = 0;
+  if (InterlockedIncrement(&reported) <= 6) {
+    game_api::log("pool returned null, substituted %u bytes", size);
+  }
+  return user;
+}
+
+extern "C" int ra3_pool_take_fallback(uint32_t user) {
+  if (!g_pool_fb_ready || user == 0) return 0;
+  EnterCriticalSection(&g_pool_fb_cs);
+  const int slot = pool_fb_slot(user);
+  PoolFb** link = &g_pool_fb[slot];
+  while (*link) {
+    if ((*link)->user == user) {
+      PoolFb* dead = *link;
+      *link = dead->next;
+      LeaveCriticalSection(&g_pool_fb_cs);
+      HeapFree(GetProcessHeap(), 0, reinterpret_cast<void*>(user - 4));
+      HeapFree(GetProcessHeap(), 0, dead);
+      return 1;
+    }
+    link = &(*link)->next;
+  }
+  LeaveCriticalSection(&g_pool_fb_cs);
+  return 0;
+}
+
+extern "C" void __declspec(naked) ra3_pool_null_stub() {
+  __asm {
+    test eax, eax
+    jz pool_fallback_path
+    mov esi, eax
+    push 1
+    push esi
+    call dword ptr [g_ra3_pool_hdr]
+    jmp dword ptr [g_ra3_pool_resume]
+  pool_fallback_path:
+    push ecx
+    mov eax, dword ptr [esp + 10h]
+    push eax
+    call ra3_pool_fallback
+    add esp, 4
+    pop ecx
+    test eax, eax
+    jz pool_give_up
+    mov esi, eax
+    push 1
+    push esi
+    mov ecx, dword ptr [0x00CD7550]
+    call dword ptr [g_ra3_pool_hdr]
+    jmp dword ptr [g_ra3_pool_resume]
+  pool_give_up:
+    xor esi, esi
+    xor eax, eax
+    jmp dword ptr [g_ra3_pool_resume]
+  }
+}
+
+extern "C" void __declspec(naked) ra3_pool_free_stub() {
+  __asm {
+    mov esi, dword ptr [esp + 0x0c]
+    test esi, esi
+    jz pool_free_skip
+    push esi
+    call ra3_pool_take_fallback
+    add esp, 4
+    test eax, eax
+    jnz pool_free_skip
+    jmp dword ptr [g_ra3_free_resume]
+  pool_free_skip:
+    jmp dword ptr [g_ra3_free_skip]
+  }
+}
 
 namespace game_api {
 namespace {
@@ -157,6 +270,50 @@ bool probe_module() {
   return std::memcmp(addr, probe->aob, probe->aob_len) == 0 || hook_installed("PlayerID");
 }
 
+void install_pool_null_guard() {
+  if (!g_module) return;
+  if (!g_pool_fb_ready) {
+    InitializeCriticalSection(&g_pool_fb_cs);
+    g_pool_fb_ready = true;
+  }
+  auto* site = reinterpret_cast<uint8_t*>(g_module + (0x416797u - kModBase));
+  const uint8_t expect[] = {0x8B, 0xF0, 0x6A, 0x01, 0x56, 0xE8};
+  if (std::memcmp(site, expect, sizeof(expect)) != 0) {
+    log("pool guard skipped, allocator bytes differ");
+    return;
+  }
+  auto* free_site = reinterpret_cast<uint8_t*>(g_module + (0x416A10u - kModBase));
+  const uint8_t free_expect[] = {0x8B, 0x74, 0x24, 0x0C, 0x85, 0xF6, 0x74, 0x26};
+  if (std::memcmp(free_site, free_expect, sizeof(free_expect)) != 0) {
+    log("pool guard skipped, free bytes differ");
+    return;
+  }
+  g_ra3_pool_resume = reinterpret_cast<void*>(g_module + (0x4167A1u - kModBase));
+  g_ra3_pool_hdr = reinterpret_cast<void*>(g_module + (0xA01B70u - kModBase));
+  g_ra3_free_resume = reinterpret_cast<void*>(g_module + (0x416A18u - kModBase));
+  g_ra3_free_skip = reinterpret_cast<void*>(g_module + (0x416A3Eu - kModBase));
+
+  const auto stub = reinterpret_cast<uintptr_t>(&ra3_pool_null_stub);
+  const int32_t rel = static_cast<int32_t>(stub - (reinterpret_cast<uintptr_t>(site) + 5));
+  uint8_t patch[10] = {0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90, 0x90};
+  std::memcpy(patch + 1, &rel, 4);
+  if (!write_code(site, patch, sizeof(patch))) {
+    log("pool guard write failed");
+    return;
+  }
+
+  const auto free_stub = reinterpret_cast<uintptr_t>(&ra3_pool_free_stub);
+  const int32_t free_rel =
+      static_cast<int32_t>(free_stub - (reinterpret_cast<uintptr_t>(free_site) + 5));
+  uint8_t free_patch[8] = {0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90};
+  std::memcpy(free_patch + 1, &free_rel, 4);
+  if (!write_code(free_site, free_patch, sizeof(free_patch))) {
+    log("pool free guard write failed");
+    return;
+  }
+  log("pool null guard at %p", site);
+}
+
 }  // namespace
 
 void install_roster_hooks();
@@ -177,6 +334,7 @@ void init() {
   } else {
     log("module base 0x%X", g_module);
   }
+  install_pool_null_guard();
   install_roster_hooks();
 }
 
@@ -515,8 +673,32 @@ static bool run_arm_python(std::string* err_out) {
   return true;
 }
 
+bool battlenet_client_running() {
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snap == INVALID_HANDLE_VALUE) return false;
+  PROCESSENTRY32W pe{};
+  pe.dwSize = sizeof(pe);
+  bool found = false;
+  if (Process32FirstW(snap, &pe)) {
+    do {
+      if (_wcsicmp(pe.szExeFile, L"Ra3.BattleNet.Client.exe") == 0 ||
+          _wcsicmp(pe.szExeFile, L"RA3BattleNet.exe") == 0) {
+        found = true;
+        break;
+      }
+    } while (Process32NextW(snap, &pe));
+  }
+  CloseHandle(snap);
+  return found;
+}
+
 bool inject(bool spectate_mode) {
   std::lock_guard<std::mutex> lock(g_api_mu);
+  if (battlenet_client_running()) {
+    set_status(u8"请关闭战网进程（RA3BattleNet）");
+    log("inject refused: RA3BattleNet is running");
+    return false;
+  }
   g_spectate_mode = spectate_mode;
   g_auto_spec = false;
 
@@ -1188,6 +1370,7 @@ const char* hotkey_hint(const char* key) {
 bool feature_enabled(const char* key) {
   const FeatureInfo* f = find_feature(key);
   if (!f || std::strcmp(f->type, "toggle") != 0) return false;
+  if (std::strcmp(key, "disableallsp") == 0 && disable_superweapon_held()) return true;
   return get_flag(f->flag) != 0;
 }
 
@@ -1206,6 +1389,7 @@ bool toggle_feature(const char* key, bool enabled, std::string* out_msg) {
     return false;
   }
   if (std::strcmp(key, "disableallsp") == 0) {
+    note_disable_superweapon_toggle(enabled);
     build_lock_sync_disable_superweapon();
   }
   if (out_msg) {

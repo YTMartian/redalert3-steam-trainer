@@ -147,6 +147,9 @@ bool build_lock_set(const char* type_id, bool locked, std::string* out_msg);
 bool build_lock_selected(bool locked, std::string* out_msg);
 void build_lock_tick();
 void build_lock_sync_disable_superweapon();
+// True while 禁用超武 is checked but the flag byte is held off until the match is running.
+bool disable_superweapon_held();
+void note_disable_superweapon_toggle(bool enabled);
 
 // Direct money write (no MustCode hook). Works in match / spectator.
 int money_self_step();

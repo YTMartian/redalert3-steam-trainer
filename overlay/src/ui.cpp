@@ -32,7 +32,7 @@ bool g_show_build_lock = false;
 bool g_stats_open = false;
 bool g_stats_pinned = false;
 std::string g_last_msg =
-    u8"先启动游戏并进局，再运行注入器 EXE。菜单内点「注入」。Home 显隐主菜单。";
+    u8"先启动游戏并进局，再运行修改器。菜单内点「注入」。Home 显隐主菜单。";
 bool g_spectate_inject = false;
 float g_sync_timer = 0.f;
 volatile LONG g_injecting = 0;

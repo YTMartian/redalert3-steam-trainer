@@ -30,7 +30,7 @@ if not exist "%REPO%\payload.py" (
 )
 
 echo [2/3] packaging RA3_Overlay_Inject.exe ...
-"%PY%" -m PyInstaller --noconfirm --onefile --noconsole --uac-admin --name RA3_Overlay_Inject --icon "%ICON%" --distpath "%REPO%\overlay\bin" --workpath "%REPO%\overlay\build\pyi_inject" --specpath "%REPO%\overlay\build" "%REPO%\overlay\tools\inject.py"
+"%PY%" -m PyInstaller --noconfirm --onefile --noconsole --uac-admin --name RA3_Overlay_Inject --icon "%ICON%" --distpath "%REPO%\overlay\bin" --workpath "%REPO%\overlay\build\pyi_inject" --specpath "%REPO%\overlay\build" --add-data "%REPO%\v1.12_change_method;v1.12_change_method" "%REPO%\overlay\tools\inject.py"
 if errorlevel 1 goto :err
 
 echo [3/3] packaging arm_mustcode.exe ...

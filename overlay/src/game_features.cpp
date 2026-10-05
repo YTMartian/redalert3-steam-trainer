@@ -1947,6 +1947,8 @@ static bool should_hide_roster_type(const char* key) {
   if (std::strstr(key, "SatelliteSweep")) return true;
   if (std::strcmp(key, "AlliedSatelliteSweepRevealObject") == 0) return true;
   if (std::strcmp(key, "AlliedSatelliteSweepShroudRevealer") == 0) return true;
+  // Empire point-defense drones are spawned by the tower, not a fielded unit.
+  if (std::strstr(key, "PointDefense")) return true;
   return false;
 }
 
@@ -2921,11 +2923,76 @@ static float g_lock_battle_seconds = -1.f;
 static bool g_lock_seen_battle = false;
 static DWORD g_lock_enter_tick = 0;
 static bool g_sw_toggle_latched = false;
+// 0x883AA0 refreshes the command bar. During a save restore that vector is still
+// empty, the grow returns NULL, and memmove writes address 0. Same window for
+// the DisableAllSP flag (0x0E), which mutates cooldown fields mid-restore.
+static bool g_lock_world_ready = false;
+static bool g_sw_flag_held = false;
+static uint32_t g_world_logic = 0;
+static float g_world_base_secs = -1.f;
+static DWORD g_world_live_since = 0;
+static DWORD g_world_moved_tick = 0;
 static int g_lock_tick_depth = 0;
 static bool g_lock_syncing = false;
 static void sync_disable_superweapon_toggle();
 
+static int live_count_peek() {
+  int n = 0;
+  if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
+  n = (int)g_live.size();
+  if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
+  return n;
+}
+
+// Units on the field mean the save has published objects. A frozen clock with
+// live==0 is still restoring. An empty map falls through once the clock has
+// actually been moving for a while.
+static void refresh_match_world_gate() {
+  uint32_t logic = 0;
+  float secs = 0.f;
+  const bool in_battle = read_battle_clock(&logic, &secs);
+  const DWORD now = GetTickCount();
+  if (!in_battle) {
+    g_world_logic = 0;
+    g_world_base_secs = -1.f;
+    g_world_live_since = 0;
+    g_world_moved_tick = 0;
+    g_lock_world_ready = false;
+  } else if (logic != g_world_logic) {
+    g_world_logic = logic;
+    g_world_base_secs = secs;
+    g_world_live_since = 0;
+    g_world_moved_tick = 0;
+    g_lock_world_ready = false;
+  } else {
+    if (g_world_base_secs < 0.f) g_world_base_secs = secs;
+    if (g_world_moved_tick == 0 && secs > g_world_base_secs + 0.20f) {
+      g_world_moved_tick = now;
+    }
+    const int live = live_count_peek();
+    if (live > 0) {
+      if (g_world_live_since == 0) g_world_live_since = now;
+      if (now - g_world_live_since >= 2000) g_lock_world_ready = true;
+    } else {
+      g_world_live_since = 0;
+      if (g_world_moved_tick != 0 && now - g_world_moved_tick >= 12000) {
+        g_lock_world_ready = true;
+      }
+    }
+  }
+  if (!g_lock_world_ready) {
+    if (get_flag(0x0E) != 0) {
+      set_flag(0x0E, 0);
+      g_sw_flag_held = true;
+    }
+  } else if (g_sw_flag_held) {
+    set_flag(0x0E, 1);
+    g_sw_flag_held = false;
+  }
+}
+
 static bool thiscall_build_lock(uint32_t player, uint32_t tmpl, bool locked) {
+  if (!g_lock_world_ready) return false;
   if (!is_ptr(player) || !is_ptr(tmpl) || !module_base()) return false;
   const uint32_t fn =
       module_base() + ((locked ? kFnBuildDisable : kFnBuildEnable) - kModBase);
@@ -3201,6 +3268,7 @@ static void forget_lock_targets() {
 }
 
 static void build_lock_tick_impl() {
+  refresh_match_world_gate();
   if (g_lock_tick_depth) return;
   const DWORD now = GetTickCount();
   if (g_build_lock_tick != 0 && now - g_build_lock_tick < 400) return;
@@ -3239,8 +3307,8 @@ static void build_lock_tick_impl() {
     g_lock_battle_seconds = battle_seconds;
   }
   sync_disable_superweapon_toggle();
-  const bool lock_ready =
-      in_battle && g_lock_enter_tick != 0 && now - g_lock_enter_tick >= 3000;
+  const bool lock_ready = in_battle && g_lock_world_ready && g_lock_enter_tick != 0 &&
+                          now - g_lock_enter_tick >= 3000;
   if (!g_build_bans.empty() && module_base() && lock_ready) {
     uint32_t players[kMaxEconPlayers] = {};
     int pn = 0;
@@ -3947,6 +4015,19 @@ bool build_lock_selected(bool locked, std::string* out_msg) {
 }
 
 void build_lock_tick() { build_lock_tick_impl(); }
+
+bool disable_superweapon_held() { return g_sw_flag_held; }
+
+void note_disable_superweapon_toggle(bool enabled) {
+  if (!enabled) {
+    g_sw_flag_held = false;
+    return;
+  }
+  if (!g_lock_world_ready) {
+    set_flag(0x0E, 0);
+    g_sw_flag_held = true;
+  }
+}
 
 void build_lock_sync_disable_superweapon() { sync_disable_superweapon_toggle(); }
 
