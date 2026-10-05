@@ -147,6 +147,8 @@ bool build_lock_set(const char* type_id, bool locked, std::string* out_msg);
 bool build_lock_selected(bool locked, std::string* out_msg);
 void build_lock_tick();
 void build_lock_sync_disable_superweapon();
+// 消散战争迷雾：未探索格子按观战的方式画成可见，关掉后按原探索结果恢复。
+void sync_dispel_shroud();
 // True while 禁用超武 is checked but the flag byte is held off until the match is running.
 bool disable_superweapon_held();
 void note_disable_superweapon_toggle(bool enabled);

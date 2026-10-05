@@ -794,6 +794,191 @@ void detach() {
     g_hooked = false;
     log("hooks restored");
   }
+  sync_dispel_shroud();
+}
+
+// Gameplay visibility reads the per-cell counter, but the fog graphic only
+// updates when a cell transitions out of fog inside 0xB21C20. Writing the
+// counter straight to "already visible" shows units and then swallows that
+// transition, so the graphic stays and walking no longer clears it. Force
+// every cell through the real reveal once. The circle painter also rejects
+// cliffs (0xB21AB9) and a height scale can zero the radius (0x73AEFD /
+// 0x73AFBD); skip both while the toggle is on. Saved counters are restored
+// on the way out, and the linked shroud chunks are marked dirty so the game
+// repaints fog from those counters.
+static void patch_site(uint32_t va, const uint8_t* orig, const uint8_t* repl, int n, bool on) {
+  auto* site = reinterpret_cast<uint8_t*>(va_of(va));
+  const uint8_t* want = on ? repl : orig;
+  if (std::memcmp(site, want, n) == 0) return;
+  if (std::memcmp(site, orig, n) != 0 && std::memcmp(site, repl, n) != 0) return;
+  write_code(site, want, n);
+}
+
+static void patch_shroud_filters(bool on) {
+  const uint8_t jbe_cell[] = {0x76, 0x08};
+  const uint8_t nop_cell[] = {0x90, 0x90};
+  const uint8_t jbe_lo[] = {0x76, 0x49};
+  const uint8_t jmp_lo[] = {0xEB, 0x49};
+  const uint8_t jbe_hi[] = {0x76, 0x4B};
+  const uint8_t jmp_hi[] = {0xEB, 0x4B};
+  patch_site(0xB21AB9, jbe_cell, nop_cell, 2, on);
+  patch_site(0x73AEFD, jbe_lo, jmp_lo, 2, on);
+  patch_site(0x73AFBD, jbe_hi, jmp_hi, 2, on);
+}
+
+static int viewed_shroud_player(uint32_t inner) {
+  int player = *reinterpret_cast<int*>(inner + 0x80);
+  if (player >= 0 && player < 0x14) return player;
+  uint32_t list = *reinterpret_cast<uint32_t*>(va_of(0xCEDE2C));
+  if (!is_ptr(list)) return -1;
+  uint32_t local = *reinterpret_cast<uint32_t*>(list + 0x28);
+  if (!is_ptr(local)) return -1;
+  player = *reinterpret_cast<int*>(local + 0x20);
+  if (player < 0 || player >= 0x14) return -1;
+  return player;
+}
+
+static uint16_t* shroud_word(uint8_t* cells, uint32_t index, int player) {
+  return reinterpret_cast<uint16_t*>(cells + index * 0x34u + 4 + player * 2);
+}
+
+static void dirty_cell_shroud(uint8_t* cell, int player) {
+  __try {
+    uint32_t node = *reinterpret_cast<uint32_t*>(cell);
+    for (int n = 0; n < 32 && is_ptr(node); ++n) {
+      uint32_t obj = *reinterpret_cast<uint32_t*>(node + 4);
+      if (is_ptr(obj))
+        *reinterpret_cast<uint32_t*>(obj + static_cast<uint32_t>(player) * 4u + 0x24) = 0;
+      uint32_t next = *reinterpret_cast<uint32_t*>(node + 0xC);
+      if (next == node) break;
+      node = next;
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+}
+
+static int copy_shroud_words(uint8_t* cells, uint32_t count, int player, uint16_t* snap) {
+  __try {
+    for (uint32_t i = 0; i < count; ++i) snap[i] = *shroud_word(cells, i, player);
+    return 1;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return 0;
+  }
+}
+
+// 0xB21C20 updates the fog graphic only when the cell was not already visible.
+// Drop the counter to fog first, then let the game reveal the whole grid.
+static int force_reveal_grid(uint8_t* cells, uint32_t count, uint32_t inner, int player) {
+  __try {
+    for (uint32_t i = 0; i < count; ++i) *shroud_word(cells, i, player) = 0;
+    auto fn = reinterpret_cast<void(__thiscall*)(void*, int)>(va_of(0xB22500));
+    fn(reinterpret_cast<void*>(inner), player);
+    return 1;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return 0;
+  }
+}
+
+static int top_up_reveal(uint8_t* cells, uint32_t count, uint32_t inner, int player) {
+  auto fn = reinterpret_cast<void(__thiscall*)(void*, void*, int)>(va_of(0xB21C20));
+  __try {
+    for (uint32_t i = 0; i < count; ++i) {
+      uint16_t* word = shroud_word(cells, i, player);
+      if (*word != 0 && *word != 0xFFFF) continue;
+      *word = 0;
+      fn(cells + i * 0x34u, reinterpret_cast<void*>(inner), player);
+    }
+    return 1;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return 0;
+  }
+}
+
+static int restore_shroud_cells(uint8_t* cells, uint32_t count, int player,
+                                const uint16_t* snap) {
+  __try {
+    for (uint32_t i = 0; i < count; ++i) {
+      *shroud_word(cells, i, player) = snap[i];
+      dirty_cell_shroud(cells + i * 0x34u, player);
+    }
+    return 1;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return 0;
+  }
+}
+
+void sync_dispel_shroud() {
+  if (!g_module) return;
+  const bool on = g_hooked && g_flags && g_flags[0x11] != 0;
+  patch_shroud_filters(on);
+
+  static bool applied = false;
+  static uint32_t snap_cells = 0;
+  static int snap_player = -1;
+  static uint32_t next_pass = 0;
+  static std::vector<uint16_t> snap;
+
+  uint32_t mgr = *reinterpret_cast<uint32_t*>(va_of(0xCE8130));
+  uint32_t inner = 0;
+  uint32_t cells = 0;
+  uint32_t count = 0;
+  int player = -1;
+  if (is_ptr(mgr)) {
+    inner = *reinterpret_cast<uint32_t*>(mgr + 0x28);
+    if (is_ptr(inner)) {
+      uint32_t w = *reinterpret_cast<uint32_t*>(inner + 0x3C);
+      uint32_t h = *reinterpret_cast<uint32_t*>(inner + 0x40);
+      cells = *reinterpret_cast<uint32_t*>(inner + 0x44);
+      if (is_ptr(cells) && w > 0 && h > 0 && w <= 2048 && h <= 2048)
+        count = w * h;
+      else
+        cells = 0;
+      if (cells) player = viewed_shroud_player(inner);
+    }
+  }
+
+  if (!on) {
+    if (!applied) return;
+    if (cells && cells == snap_cells && player == snap_player && snap.size() == count)
+      restore_shroud_cells(reinterpret_cast<uint8_t*>(cells), count, player, snap.data());
+    snap.clear();
+    snap_cells = 0;
+    snap_player = -1;
+    applied = false;
+    return;
+  }
+  if (!cells || player < 0) return;
+
+  const bool same = applied && cells == snap_cells && player == snap_player && snap.size() == count;
+  if (applied && !same) {
+    if (cells == snap_cells && snap_player >= 0 && snap.size() == count)
+      restore_shroud_cells(reinterpret_cast<uint8_t*>(cells), count, snap_player, snap.data());
+    snap.clear();
+    applied = false;
+  }
+  const uint32_t now = GetTickCount();
+  auto* base = reinterpret_cast<uint8_t*>(cells);
+  if (!applied) {
+    snap.assign(count, 0);
+    if (!copy_shroud_words(base, count, player, snap.data())) {
+      snap.clear();
+      return;
+    }
+    if (!force_reveal_grid(base, count, inner, player)) {
+      restore_shroud_cells(base, count, player, snap.data());
+      snap.clear();
+      return;
+    }
+    snap_cells = cells;
+    snap_player = player;
+    applied = true;
+    next_pass = now;
+    return;
+  }
+  if (now - next_pass >= 300) {
+    top_up_reveal(base, count, inner, player);
+    next_pass = now;
+  }
 }
 
 uint8_t get_flag(uint32_t offset) {
@@ -1140,7 +1325,7 @@ static const FeatureInfo kFeatures[] = {
     {"oremine", u8"恢复矿场", "pulse", 0x14},
     {"superpower", u8"超级武器", "toggle", 0x0D},
     {"disableallsp", u8"禁用超武", "toggle", 0x0E},
-    {"map", u8"全地图", "toggle", 0x11},
+    {"map", u8"消散战争迷雾", "toggle", 0x11},
     {"nocbuild", u8"敌人无法建造", "toggle", 0x15},
     {"protocol_ready", u8"协议无冷却", "engine", 0},
     {"unit_skill_ready", u8"单位技能无冷却", "engine", 0},
