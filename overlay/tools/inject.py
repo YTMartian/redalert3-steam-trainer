@@ -11,9 +11,12 @@ injector's 64-bit kernel32 address.
 from __future__ import print_function
 
 import ctypes
+import hashlib
 import os
+import shutil
 import struct
 import sys
+import time
 from ctypes import wintypes
 
 PROCESS_ALL_ACCESS = 0x1F0FFF
@@ -282,6 +285,93 @@ def unload_module_by_name(hproc, pid, module_name, max_frees=8):
     return True, '; '.join(notes)
 
 
+def bundle_root():
+    """PyInstaller extract dir. Empty when running inject.py directly."""
+    if not getattr(sys, 'frozen', False):
+        return ''
+    return getattr(sys, '_MEIPASS', '') or ''
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def _copy_if_different(src, dst):
+    """Copy src over dst when the bytes differ. Returns (ok, note)."""
+    if not os.path.isfile(src):
+        return False, u'missing'
+    try:
+        if os.path.isfile(dst) and os.path.getsize(src) == os.path.getsize(dst):
+            if _sha256_file(src) == _sha256_file(dst):
+                return True, u'same'
+    except OSError:
+        pass
+    last_err = u''
+    for _attempt in range(6):
+        tmp = dst + '.tmp'
+        try:
+            parent = os.path.dirname(dst)
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent)
+            shutil.copy2(src, tmp)
+            os.replace(tmp, dst)
+            return True, u'copied'
+        except OSError as exc:
+            last_err = str(exc)
+            try:
+                if os.path.isfile(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            time.sleep(0.25)
+    return False, last_err or u'copy failed'
+
+
+def extract_bundled_payload(dest_dir, include_dll=True, only_dll=False, bundle=None):
+    """Unpack DLL, arm helper and name tables next to the injector exe.
+
+    unit_names.txt is created only when missing, so a hand-edited override stays.
+    Returns a list of error strings. A DLL still locked by the game is reported
+    as 'dll-locked: ...'.
+    """
+    root = bundle if bundle is not None else bundle_root()
+    if not root:
+        return []
+    errors = []
+
+    def take(name, required, dll_file=False):
+        src = os.path.join(root, name)
+        dst = os.path.join(dest_dir, name)
+        if not os.path.isfile(src):
+            if required:
+                errors.append(u'%s 不在注入器里' % name)
+            return
+        ok, note = _copy_if_different(src, dst)
+        if ok:
+            return
+        if dll_file:
+            errors.append(u'dll-locked: %s' % note)
+        else:
+            errors.append(u'无法写出 %s（%s）' % (name, note))
+
+    if include_dll or only_dll:
+        take('ra3_overlay_v4.dll', True, dll_file=True)
+    if only_dll:
+        return errors
+
+    take('arm_mustcode.dll', True)
+    take('unit_names_csf.txt', True)
+    names_dst = os.path.join(dest_dir, 'unit_names.txt')
+    names_src = os.path.join(root, 'unit_names.txt')
+    if os.path.isfile(names_src) and not os.path.isfile(names_dst):
+        take('unit_names.txt', False)
+    return errors
+
+
 def battlenet_client_running():
     """RA3 online client. Match the exe name, not the install folder."""
     snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
@@ -344,6 +434,19 @@ def inject(dll_path, pid=None):
                 u'请先完全退出红警 3，再重新进游戏后注入。'
             ) % name
 
+    if getattr(sys, 'frozen', False):
+        bundled_dll = os.path.normpath(os.path.join(
+            os.path.dirname(sys.executable), 'ra3_overlay_v4.dll'))
+        if os.path.normcase(os.path.abspath(dll_path)) == os.path.normcase(bundled_dll):
+            dll_errors = extract_bundled_payload(
+                os.path.dirname(bundled_dll), only_dll=True)
+            if dll_errors:
+                kernel32.CloseHandle(hproc)
+                return False, (
+                    u'无法更新 DLL，文件仍被占用。\n'
+                    u'请先完全退出红警 3，再运行修改器。'
+                )
+
     load_lib, err = resolve_remote_loadlibrary_w(pid)
     if not load_lib:
         kernel32.CloseHandle(hproc)
@@ -385,8 +488,8 @@ def inject(dll_path, pid=None):
     if exit_code.value == 0:
         return False, (
             u'DLL 没有载入成功。\n'
-            u'请确认 ra3_overlay_v4.dll 和修改器在同一目录，且没有被安全软件隔离。\n'
-            u'日志：%TEMP%\\ra3_overlay.log'
+            u'注入器会把 DLL 解到自己旁边。请确认没有被安全软件隔离。\n'
+            u'日志：和修改器同一个目录的 ra3_overlay.log'
         )
     return True, (
         u'覆盖层已载入。\n'
@@ -837,6 +940,13 @@ def main():
     # When frozen by PyInstaller, look next to the exe.
     if getattr(sys, 'frozen', False):
         here = os.path.dirname(sys.executable)
+        unpack_errors = [
+            item for item in extract_bundled_payload(here)
+            if not item.startswith(u'dll-locked:')
+        ]
+        if unpack_errors:
+            _msg(False, u'无法释出修改器文件：\n' + u'\n'.join(unpack_errors))
+            return 1
     candidates = [
         os.path.normpath(os.path.join(here, 'ra3_overlay_v4.dll')),
         os.path.normpath(os.path.join(here, 'ra3_overlay.dll')),

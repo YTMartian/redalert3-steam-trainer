@@ -128,29 +128,6 @@ bool write_entity_hp(uint32_t ent, const char* mode) {
   return false;
 }
 
-std::vector<uint32_t> filter_by_relation(const std::vector<uint32_t>& ents,
-                                         const char* relation) {
-  uint32_t local = local_owner_for_ops();
-  std::vector<uint32_t> out;
-  for (uint32_t ent : ents) {
-    uint32_t ow = read_u32(ent + 0x418);
-    if (std::strcmp(relation, "ally") == 0) {
-      if (local) {
-        if (is_ptr(ow) && ow == local) out.push_back(ent);
-      } else {
-        out.push_back(ent);
-      }
-    } else if (std::strcmp(relation, "enemy") == 0) {
-      if (local) {
-        if (is_ptr(ow) && ow != local) out.push_back(ent);
-      } else if (is_ptr(ow)) {
-        out.push_back(ent);
-      }
-    }
-  }
-  return out;
-}
-
 // ---- in-process game calls on a worker thread ----
 
 struct CallJob {
@@ -2981,12 +2958,11 @@ static void refresh_match_world_gate() {
     }
   }
   if (!g_lock_world_ready) {
-    if (get_flag(0x0E) != 0) {
-      set_flag(0x0E, 0);
-      g_sw_flag_held = true;
-    }
-  } else if (g_sw_flag_held) {
-    set_flag(0x0E, 1);
+    if (get_flag(0x0E) != 0) set_flag(0x0E, 0);
+    if (get_flag(0x1B) != 0) g_sw_flag_held = true;
+  } else {
+    const bool block = get_flag(0x1B) != 0 || get_flag(0x1C) != 0;
+    set_flag(0x0E, block ? 1 : 0);
     g_sw_flag_held = false;
   }
 }
@@ -3737,6 +3713,228 @@ static uint32_t g_money_player = 0;
 static void label_battle_player(uint32_t player, uint32_t player_id, bool is_local, char* out,
                                 size_t out_len);
 
+struct SummonSnap {
+  uint32_t player = 0;
+  int count = 1;
+  int n = 0;
+  char ids[64][96] = {};
+};
+
+static SummonSnap g_summon_snap;
+
+static bool summon_prepare_impl(uint32_t player, int count, const char* const* type_ids,
+                                int type_count, std::string* out_msg) {
+  if (count < 1) count = 1;
+  if (count > 20) count = 20;
+  if (!type_ids || type_count <= 0) {
+    if (out_msg) *out_msg = u8"请先选择要召唤的部队";
+    return false;
+  }
+  if (type_count > 64) type_count = 64;
+  g_summon_snap = SummonSnap{};
+  g_summon_snap.player = player;
+  g_summon_snap.count = count;
+  for (int i = 0; i < type_count; ++i) {
+    if (!type_ids[i] || !type_ids[i][0]) continue;
+    if (type_id_is_building(type_ids[i])) continue;
+    std::snprintf(g_summon_snap.ids[g_summon_snap.n], sizeof(g_summon_snap.ids[0]), "%s",
+                  type_ids[i]);
+    if (++g_summon_snap.n >= 64) break;
+  }
+  if (g_summon_snap.n <= 0) {
+    if (out_msg) *out_msg = u8"请先选择要召唤的部队";
+    return false;
+  }
+  return true;
+}
+
+struct PendingSpawn {
+  uint32_t tmpl = 0;
+  uint32_t owner = 0;
+  uint32_t info = 0;
+  float x = 0.f;
+  float y = 0.f;
+  float z = 0.f;
+};
+
+static PendingSpawn g_spawn_q[1280];
+static volatile LONG g_spawn_pub = 0;
+static volatile LONG g_spawn_made = 0;
+static volatile LONG g_spawn_busy = 0;
+static HANDLE g_spawn_event = nullptr;
+
+static void ensure_spawn_event() {
+  if (!g_spawn_event) g_spawn_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+}
+
+static uint32_t create_unit_on_this_thread(uint32_t tmpl, uint32_t pos, uint32_t owner,
+                                           uint32_t info) {
+  using Fn = uint32_t(__cdecl*)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+  uint32_t ent = 0;
+  __try {
+    ent = reinterpret_cast<Fn>(va_of(kFnCreateUnit))(0, tmpl, pos, owner, info);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    ent = 0;
+  }
+  return ent;
+}
+
+static void drain_unit_spawns_impl() {
+  const int n = (int)InterlockedExchange(&g_spawn_pub, 0);
+  if (n <= 0) return;
+  const int count = n > (int)(sizeof(g_spawn_q) / sizeof(g_spawn_q[0]))
+                        ? (int)(sizeof(g_spawn_q) / sizeof(g_spawn_q[0]))
+                        : n;
+  uint8_t* mc = mc_base();
+  int made = 0;
+  if (mc) {
+    const uint32_t pos_buf = reinterpret_cast<uint32_t>(mc + 0x10A0);
+    for (int i = 0; i < count; ++i) {
+      const PendingSpawn& s = g_spawn_q[i];
+      if (!is_ptr(s.tmpl) || !is_ptr(s.owner)) continue;
+      write_f32(pos_buf, s.x);
+      write_f32(pos_buf + 4, s.y);
+      write_f32(pos_buf + 8, s.z);
+      if (is_ptr(create_unit_on_this_thread(s.tmpl, pos_buf, s.owner, s.info))) ++made;
+    }
+  }
+  InterlockedExchange(&g_spawn_made, made);
+  if (g_spawn_event) SetEvent(g_spawn_event);
+}
+
+static int submit_spawns(int n) {
+  if (n <= 0) return 0;
+  ensure_spawn_event();
+  if (!g_spawn_event) return -1;
+  InterlockedExchange(&g_spawn_made, 0);
+  ResetEvent(g_spawn_event);
+  InterlockedExchange(&g_spawn_pub, n);
+  if (WaitForSingleObject(g_spawn_event, 2000) != WAIT_OBJECT_0) {
+    InterlockedExchange(&g_spawn_pub, 0);
+    return -1;
+  }
+  return (int)g_spawn_made;
+}
+
+static void summon_ring_xy(float ox, float oy, int slot, int total, float* x, float* y) {
+  if (!x || !y) return;
+  if (total <= 1) {
+    *x = ox;
+    *y = oy;
+    return;
+  }
+  constexpr int kPer = 6;
+  const int ring = slot / kPer;
+  const int idx = slot - ring * kPer;
+  int on_ring = total - ring * kPer;
+  if (on_ring > kPer) on_ring = kPer;
+  if (on_ring < 1) on_ring = 1;
+  const float radius = 32.f + 26.f * (float)ring;
+  const float spin = (ring & 1) ? 0.5f : 0.f;
+  const float angle = 6.2831853f * ((float)idx + spin) / (float)on_ring;
+  *x = ox + radius * std::cos(angle);
+  *y = oy + radius * std::sin(angle);
+}
+
+static bool summon_troops_impl(std::string* out_msg) {
+  const SummonSnap snap = g_summon_snap;
+  if (snap.n <= 0 || snap.count <= 0) {
+    if (out_msg) *out_msg = u8"请先选择要召唤的部队";
+    return false;
+  }
+  if (!mc_base()) {
+    if (out_msg) *out_msg = u8"请先点「注入」";
+    return false;
+  }
+  uint32_t owner = snap.player;
+  if (!is_ptr(owner)) owner = local_owner_for_ops();
+  if (!is_ptr(owner)) {
+    if (out_msg) *out_msg = u8"请先选择玩家";
+    return false;
+  }
+  char owner_name[64] = {};
+  {
+    uint32_t pid = 0;
+    safe_read_u32(owner + 0x20, &pid);
+    label_battle_player(owner, pid, owner == local_owner_for_ops(), owner_name, sizeof(owner_name));
+  }
+  uint32_t owner_vt = 0;
+  if (!safe_read_u32(owner, &owner_vt) || !is_ptr(owner_vt)) {
+    if (out_msg) *out_msg = u8"该玩家当前不能接收部队";
+    return false;
+  }
+  uint32_t owner_info = 0;
+  if (!safe_read_u32(owner + 0x10, &owner_info)) {
+    if (out_msg) *out_msg = u8"该玩家当前不能接收部队";
+    return false;
+  }
+  if (owner_info) {
+    uint32_t info_vt = 0;
+    if (!is_ptr(owner_info) || !safe_read_u32(owner_info, &info_vt) || !is_ptr(info_vt)) {
+      if (out_msg) *out_msg = u8"该玩家数据不完整，不能召唤";
+      return false;
+    }
+  }
+  float spawn[3];
+  if (!mouse_world_pos(spawn)) {
+    if (out_msg) *out_msg = u8"读不到鼠标地图坐标（请把鼠标移到战场地形上）";
+    return false;
+  }
+  uint32_t tmpls[64] = {};
+  int planned = 0;
+  int missing = 0;
+  for (int i = 0; i < snap.n; ++i) {
+    tmpls[i] = find_template_by_id(snap.ids[i]);
+    if (!is_ptr(tmpls[i])) ++missing;
+    else planned += snap.count;
+  }
+  log("summon player=%08X info=%08X types=%d each=%d planned=%d", owner, owner_info, snap.n,
+      snap.count, planned);
+  if (InterlockedCompareExchange(&g_spawn_busy, 1, 0) != 0) {
+    if (out_msg) *out_msg = u8"上一次召唤还在进行";
+    return false;
+  }
+  int queued = 0;
+  for (int i = 0; i < snap.n && queued < (int)(sizeof(g_spawn_q) / sizeof(g_spawn_q[0])); ++i) {
+    if (!is_ptr(tmpls[i])) continue;
+    for (int c = 0; c < snap.count && queued < (int)(sizeof(g_spawn_q) / sizeof(g_spawn_q[0]));
+         ++c) {
+      PendingSpawn& s = g_spawn_q[queued];
+      summon_ring_xy(spawn[0], spawn[1], queued, planned, &s.x, &s.y);
+      s.z = spawn[2];
+      s.tmpl = tmpls[i];
+      s.owner = owner;
+      s.info = owner_info;
+      ++queued;
+    }
+  }
+  const int made = queued > 0 ? submit_spawns(queued) : 0;
+  InterlockedExchange(&g_spawn_busy, 0);
+  if (made < 0) {
+    if (out_msg) *out_msg = u8"召唤没有赶上游戏这一帧";
+    return false;
+  }
+  if (made <= 0) {
+    if (out_msg) {
+      *out_msg = missing ? u8"找不到这些部队（请先进入战局）"
+                         : u8"召唤失败（请把鼠标放在可通行的地形上）";
+    }
+    return false;
+  }
+  if (out_msg) {
+    char buf[180];
+    if (missing) {
+      std::snprintf(buf, sizeof(buf), u8"已召唤 %d 个单位（归属%s），%d 种找不到", made,
+                    owner_name[0] ? owner_name : u8"所选玩家", missing);
+    } else {
+      std::snprintf(buf, sizeof(buf), u8"已召唤 %d 个单位（归属%s）", made,
+                    owner_name[0] ? owner_name : u8"所选玩家");
+    }
+    *out_msg = buf;
+  }
+  return true;
+}
+
 static bool spawn_one_mcv(std::string* out_msg) {
   if (!mc_base()) {
     if (out_msg) *out_msg = u8"请先点「注入」";
@@ -4018,6 +4216,8 @@ void build_lock_tick() { build_lock_tick_impl(); }
 
 bool disable_superweapon_held() { return g_sw_flag_held; }
 
+bool build_lock_world_ready() { return g_lock_world_ready; }
+
 void note_disable_superweapon_toggle(bool enabled) {
   if (!enabled) {
     g_sw_flag_held = false;
@@ -4038,6 +4238,13 @@ int list_battle_players(BattlePlayer* out, int max_out) {
 void set_rank_player(uint32_t player) { g_rank_player = player; }
 
 void set_mcv_player(uint32_t player) { g_mcv_player = player; }
+
+bool summon_prepare(uint32_t player, int count, const char* const* type_ids, int type_count,
+                    std::string* out_msg) {
+  return summon_prepare_impl(player, count, type_ids, type_count, out_msg);
+}
+
+void drain_unit_spawns() { drain_unit_spawns_impl(); }
 
 void set_money_player(uint32_t player) { g_money_player = player; }
 
@@ -4174,33 +4381,6 @@ bool engine_run(const char* key, std::string* out_msg) {
     return false;
   }
 
-  if (std::strcmp(key, "protocol_ready") == 0) {
-    if (!ready() || !hook_is_installed("SuperPower")) {
-      if (out_msg) *out_msg = u8"需要已注入且含 SuperPower hook";
-      return false;
-    }
-    pulse_flag(0x0D, 1.0f);
-    if (out_msg) *out_msg = u8"已脉冲协议/超武就绪约 1 秒";
-    return true;
-  }
-  if (std::strcmp(key, "unit_skill_ready") == 0) {
-    if (!ready() || !hook_is_installed("SuperPower")) {
-      if (out_msg) *out_msg = u8"需要已注入且含 SuperPower hook";
-      return false;
-    }
-    pulse_flag(0x0D, 1.2f);
-    if (out_msg) *out_msg = u8"已脉冲单位技能就绪约 1.2 秒";
-    return true;
-  }
-  if (std::strcmp(key, "disable_protocol") == 0) {
-    if (!ready() || !hook_is_installed("DisableAllSP")) {
-      if (out_msg) *out_msg = u8"需要已注入且含 DisableAllSP hook";
-      return false;
-    }
-    pulse_flag(0x0E, 2.0f);
-    if (out_msg) *out_msg = u8"已脉冲禁用敌方超武/协议约 2 秒";
-    return true;
-  }
   if (std::strcmp(key, "speed_max") == 0) return apply_speed("max", out_msg);
   if (std::strcmp(key, "speed_slow") == 0) return apply_speed("slow", out_msg);
   if (std::strcmp(key, "speed_freeze") == 0) return apply_speed("freeze", out_msg);
@@ -4208,14 +4388,6 @@ bool engine_run(const char* key, std::string* out_msg) {
   if (std::strcmp(key, "hp_max") == 0) return apply_hp("max", nullptr, out_msg);
   if (std::strcmp(key, "hp_min") == 0) return apply_hp("min", nullptr, out_msg);
   if (std::strcmp(key, "hp_normal") == 0) return apply_hp("normal", nullptr, out_msg);
-  if (std::strcmp(key, "enemy_weaken") == 0) {
-    auto ents = filter_by_relation(selected_entities_stable(), "enemy");
-    return apply_hp("min", &ents, out_msg);
-  }
-  if (std::strcmp(key, "ally_god") == 0) {
-    auto ents = filter_by_relation(selected_entities_stable(), "ally");
-    return apply_hp("max", &ents, out_msg);
-  }
   if (std::strcmp(key, "unit_kill") == 0) return kill_selected(out_msg);
   if (std::strcmp(key, "unit_rank") == 0) return rank_up(out_msg);
   if (std::strcmp(key, "convert_unit") == 0) return convert_selected(out_msg);
@@ -4240,6 +4412,7 @@ bool engine_run(const char* key, std::string* out_msg) {
     return ok1 || ok2;
   }
   if (std::strcmp(key, "spawn_mcv") == 0) return spawn_one_mcv(out_msg);
+  if (std::strcmp(key, "summon_troops") == 0) return summon_troops_impl(out_msg);
   if (out_msg) *out_msg = u8"未知 engine 功能";
   return false;
 }

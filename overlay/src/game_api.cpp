@@ -574,7 +574,7 @@ static bool find_tool_path(char* out, size_t out_len, const wchar_t* leaf_name) 
   if (!slash) return false;
   *slash = 0;  // .../bin
   wchar_t candidate[MAX_PATH] = {};
-  // Prefer beside DLL: overlay/bin/arm_mustcode.exe
+  // Prefer beside DLL: overlay/bin/arm_mustcode.dll (an exe with a dll name).
   _snwprintf_s(candidate, _TRUNCATE, L"%s\\%s", wpath, leaf_name);
   if (GetFileAttributesW(candidate) != INVALID_FILE_ATTRIBUTES) {
     WideCharToMultiByte(CP_UTF8, 0, candidate, -1, out, (int)out_len, nullptr, nullptr);
@@ -594,9 +594,10 @@ static bool find_tool_path(char* out, size_t out_len, const wchar_t* leaf_name) 
 
 static bool run_arm_python(std::string* err_out) {
   char tool[MAX_PATH] = {};
-  const bool is_exe = find_tool_path(tool, sizeof(tool), L"arm_mustcode.exe");
+  const bool is_exe = find_tool_path(tool, sizeof(tool), L"arm_mustcode.dll") ||
+                      find_tool_path(tool, sizeof(tool), L"arm_mustcode.exe");
   if (!is_exe && !find_tool_path(tool, sizeof(tool), L"arm_mustcode.py")) {
-    if (err_out) *err_out = "arm_mustcode.exe/.py not found in overlay/bin or tools";
+    if (err_out) *err_out = "arm_mustcode.dll not found next to the DLL";
     return false;
   }
 
@@ -1168,6 +1169,7 @@ static const HotkeySlot kDefaultHotkeys[] = {
     {"unit_rank", "unit_rank", 'P', false, false, false},
     {"unit_kill", "unit_kill", VK_DELETE, false, false, false},
     {"unit_clone", "unit_clone", 'I', false, false, false},
+    {"summon_troops", "summon_troops", 'U', false, false, false},
 };
 
 static HotkeySlot g_hotkeys[32];
@@ -1323,13 +1325,13 @@ static const FeatureInfo kFeatures[] = {
     {"haveallsc", u8"全科技", "toggle", 0x0B},
     {"fastbuild", u8"快速建造", "toggle", 0x0C},
     {"oremine", u8"恢复矿场", "pulse", 0x14},
-    {"superpower", u8"超级武器", "toggle", 0x0D},
-    {"disableallsp", u8"禁用超武", "toggle", 0x0E},
+    {"superpower", u8"超级武器", "toggle", 0x18},
+    {"disableallsp", u8"禁用超武", "toggle", 0x1B},
     {"map", u8"消散战争迷雾", "toggle", 0x11},
     {"nocbuild", u8"敌人无法建造", "toggle", 0x15},
-    {"protocol_ready", u8"协议无冷却", "engine", 0},
-    {"unit_skill_ready", u8"单位技能无冷却", "engine", 0},
-    {"disable_protocol", u8"禁用敌方协议", "engine", 0},
+    {"protocol_ready", u8"协议无冷却", "toggle", 0x19},
+    {"unit_skill_ready", u8"单位技能无冷却", "toggle", 0x1A},
+    {"disable_protocol", u8"禁用敌方协议", "toggle", 0x1C},
     {"ammo", u8"弹药无限", "toggle", 0x12},
     {"danger", u8"危险等级", "danger", 0x13},
     {"speed_max", u8"超速 ×500", "engine", 0},
@@ -1347,11 +1349,10 @@ static const FeatureInfo kFeatures[] = {
     {"clone_multi", u8"批量复制", "engine", 0},
     {"damage_mult", u8"伤害×5", "engine", 0},
     {"full_buff", u8"一键满状态", "engine", 0},
-    {"enemy_weaken", u8"敌方残血", "engine", 0},
-    {"ally_god", u8"友军无敌", "engine", 0},
     {"chaos_mode", u8"混乱模式", "engine", 0},
     {"ore_convoy", u8"刷矿车车队", "engine", 0},
     {"spawn_mcv", u8"召唤基地车", "engine", 0},
+    {"summon_troops", u8"召唤部队", "engine", 0},
     {"spawn_rank", u8"出场等级", "spawn_rank", 0},
 };
 
@@ -1362,15 +1363,13 @@ static const char* kGroupAmmo[] = {"ammo", "danger"};
 static const char* kGroupUnit[] = {
     "speed_max", "speed_slow", "speed_freeze", "speed_restore", "hp_max", "hp_min", "hp_normal",
     "unit_rank", "unit_kill", "unit_clone", "convert_unit", "spawn_unit", "clone_multi",
-    "damage_mult", "full_buff", "spawn_rank", "spawn_mcv"};
-static const char* kGroupBattle[] = {"enemy_weaken", "ally_god"};
+    "damage_mult", "full_buff", "spawn_rank", "spawn_mcv", "summon_troops"};
 
 static const GroupInfo kGroups[] = {
     {u8"资源", kGroupRes, 7, u8"己方默认 +10万；玩家资金从列表选择阵营后加减（默认 1万）"},
     {u8"超武 / 地图", kGroupSw, 7, nullptr},
     {u8"弹药 / 危险", kGroupAmmo, 2, nullptr},
-    {u8"单位操作", kGroupUnit, 17, u8"需先在游戏里选中单位"},
-    {u8"战场", kGroupBattle, 2, nullptr},
+    {u8"单位操作", kGroupUnit, 18, u8"需先在游戏里选中单位"},
 };
 
 const FeatureInfo* features(int* count) {
@@ -1559,6 +1558,14 @@ bool feature_enabled(const char* key) {
   return get_flag(f->flag) != 0;
 }
 
+static void publish_power_flags() {
+  const bool ready = get_flag(0x18) || get_flag(0x19) || get_flag(0x1A);
+  set_flag(0x0D, ready ? 1 : 0);
+  const bool block = get_flag(0x1B) || get_flag(0x1C);
+  if (!block || !build_lock_world_ready()) set_flag(0x0E, 0);
+  else set_flag(0x0E, 1);
+}
+
 bool toggle_feature(const char* key, bool enabled, std::string* out_msg) {
   const FeatureInfo* f = find_feature(key);
   if (!f || std::strcmp(f->type, "toggle") != 0) {
@@ -1576,6 +1583,11 @@ bool toggle_feature(const char* key, bool enabled, std::string* out_msg) {
   if (std::strcmp(key, "disableallsp") == 0) {
     note_disable_superweapon_toggle(enabled);
     build_lock_sync_disable_superweapon();
+  }
+  if (std::strcmp(key, "superpower") == 0 || std::strcmp(key, "protocol_ready") == 0 ||
+      std::strcmp(key, "unit_skill_ready") == 0 || std::strcmp(key, "disableallsp") == 0 ||
+      std::strcmp(key, "disable_protocol") == 0) {
+    publish_power_flags();
   }
   if (out_msg) {
     *out_msg = std::string(f->label) + (enabled ? u8"：开" : u8"：关");

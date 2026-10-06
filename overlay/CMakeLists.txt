@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(ra3_overlay LANGUAGES C CXX)
+project(ra3_overlay LANGUAGES C CXX RC)
 
 # RA3 is a 32-bit process — this DLL MUST be Win32.
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
@@ -12,6 +12,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui)
 set(IMGUI_PLOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui-plot)
 set(MINHOOK_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/minhook)
+set(UNIT_RC ${CMAKE_CURRENT_BINARY_DIR}/unit_images.rc)
+if(NOT EXISTS "${UNIT_RC}")
+  message(FATAL_ERROR "Missing ${UNIT_RC}. build.bat packs unit_images into the DLL first.")
+endif()
 
 add_library(ra3_overlay SHARED
   src/dllmain.cpp
@@ -32,6 +36,7 @@ add_library(ra3_overlay SHARED
   ${MINHOOK_DIR}/src/hook.c
   ${MINHOOK_DIR}/src/trampoline.c
   ${MINHOOK_DIR}/src/hde/hde32.c
+  ${UNIT_RC}
 )
 
 target_include_directories(ra3_overlay PRIVATE

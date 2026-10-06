@@ -31,6 +31,7 @@ bool g_show_settings = false;
 bool g_show_build_lock = false;
 bool g_stats_open = false;
 bool g_stats_pinned = false;
+bool g_stats_compact = false;
 std::string g_last_msg =
     u8"先启动游戏并进局，再运行修改器。菜单内点「注入」。Home 显隐主菜单。";
 bool g_spectate_inject = false;
@@ -86,7 +87,8 @@ DWORD WINAPI engine_worker(LPVOID param) {
         std::strcmp(job->key, "spawn_unit") == 0 ||
         std::strcmp(job->key, "clone_multi") == 0 ||
         std::strcmp(job->key, "ore_convoy") == 0 ||
-        std::strcmp(job->key, "spawn_mcv") == 0;
+        std::strcmp(job->key, "spawn_mcv") == 0 ||
+        std::strcmp(job->key, "summon_troops") == 0;
     if (need_terrain) {
       input::set_menu_visible(false);
       Sleep(280);
@@ -136,15 +138,33 @@ bool resolve_ui_settings_path(char* out, size_t out_len) {
   }
   wchar_t wpath[MAX_PATH] = {};
   if (!GetModuleFileNameW(self, wpath, MAX_PATH)) return false;
-  // .../overlay/bin/dll → repo root
-  for (int i = 0; i < 3; ++i) {
-    wchar_t* slash = wcsrchr(wpath, L'\\');
-    if (!slash) return false;
-    *slash = 0;
+  wchar_t* slash = wcsrchr(wpath, L'\\');
+  if (!slash) return false;
+  *slash = 0;
+  wchar_t beside[MAX_PATH] = {};
+  _snwprintf_s(beside, _TRUNCATE, L"%s\\overlay_ui.ini", wpath);
+  // Older builds wrote the ini three levels above the DLL (the repo root).
+  // Bring that file next to the DLL once, so a copied bin folder keeps working.
+  if (GetFileAttributesW(beside) == INVALID_FILE_ATTRIBUTES) {
+    wchar_t legacy_dir[MAX_PATH] = {};
+    wcsncpy_s(legacy_dir, wpath, _TRUNCATE);
+    bool have_legacy = true;
+    for (int i = 0; i < 2; ++i) {
+      wchar_t* up = wcsrchr(legacy_dir, L'\\');
+      if (!up) {
+        have_legacy = false;
+        break;
+      }
+      *up = 0;
+    }
+    if (have_legacy) {
+      wchar_t legacy[MAX_PATH] = {};
+      _snwprintf_s(legacy, _TRUNCATE, L"%s\\overlay_ui.ini", legacy_dir);
+      if (GetFileAttributesW(legacy) != INVALID_FILE_ATTRIBUTES)
+        CopyFileW(legacy, beside, TRUE);
+    }
   }
-  wchar_t wfile[MAX_PATH] = {};
-  _snwprintf_s(wfile, _TRUNCATE, L"%s\\overlay_ui.ini", wpath);
-  return WideCharToMultiByte(CP_UTF8, 0, wfile, -1, out, (int)out_len, nullptr,
+  return WideCharToMultiByte(CP_UTF8, 0, beside, -1, out, (int)out_len, nullptr,
                              nullptr) > 0;
 }
 
@@ -179,6 +199,8 @@ void load_ui_settings() {
     } else if (key == "stats_pinned") {
       // 固定是可选项，启动时一律不固定。
       g_stats_pinned = false;
+    } else if (key == "stats_compact") {
+      g_stats_compact = (val == "1" || val == "true" || val == "yes");
     } else if (key == "money_self_step") {
       game_api::set_money_self_step((int)std::atoi(val.c_str()));
     } else if (key == "money_sel_step") {
@@ -203,6 +225,7 @@ void save_ui_settings() {
   f << "opacity=" << g_ui_opacity << "\n";
   f << "unit_inspect_open=" << (g_unit_inspect_open ? 1 : 0) << "\n";
   f << "stats_pinned=" << (g_stats_pinned ? 1 : 0) << "\n";
+  f << "stats_compact=" << (g_stats_compact ? 1 : 0) << "\n";
   f << "money_self_step=" << game_api::money_self_step() << "\n";
   f << "money_sel_step=" << game_api::money_sel_step() << "\n";
   f << "mcv_faction=" << game_api::mcv_faction() << "\n";
@@ -296,7 +319,7 @@ void mark_settings_dirty() {
 
 void draw_settings_panel() {
   ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"界面设置");
-  ImGui::TextDisabled(u8"界面和快捷键都会自动保存到修改器目录的 overlay_ui.ini");
+  ImGui::TextDisabled(u8"界面和快捷键自动保存到和 DLL 同一目录的 overlay_ui.ini");
   ImGui::Separator();
   ImGui::Spacing();
 
@@ -782,6 +805,241 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
   ImGui::Spacing();
 }
 
+void text_ellipsis(const char* s, float max_w) {
+  if (!s) s = "";
+  if (max_w < 8.f || ImGui::CalcTextSize(s).x <= max_w) {
+    ImGui::TextUnformatted(s);
+    return;
+  }
+  const char* ell = u8"…";
+  const float ell_w = ImGui::CalcTextSize(ell).x;
+  const char* end = s + std::strlen(s);
+  const char* cut = s;
+  for (const char* p = s; p < end;) {
+    const unsigned char c = (unsigned char)*p;
+    int step = 1;
+    if ((c & 0xE0) == 0xC0) step = 2;
+    else if ((c & 0xF0) == 0xE0) step = 3;
+    else if ((c & 0xF8) == 0xF0) step = 4;
+    if (p + step > end) break;
+    if (ImGui::CalcTextSize(s, p + step).x + ell_w > max_w) break;
+    p += step;
+    cut = p;
+  }
+  char buf[160];
+  const size_t n = (size_t)(cut - s);
+  if (n + 4 >= sizeof(buf)) {
+    ImGui::TextUnformatted(s);
+    return;
+  }
+  std::memcpy(buf, s, n);
+  std::memcpy(buf + n, ell, 3);
+  buf[n + 3] = 0;
+  ImGui::TextUnformatted(buf);
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", s);
+}
+
+void draw_compact_icon(ImDrawList* draw, const game_api::RosterType& r, float cell, float icon_sz,
+                       ImU32 border, bool building, bool defeated) {
+  const ImVec2 p0 = ImGui::GetCursorScreenPos();
+  const ImVec2 chip1(p0.x + cell, p0.y + cell);
+  const ImU32 fill = building ? IM_COL32(32, 24, 14, 210) : IM_COL32(14, 20, 32, 210);
+  draw->AddRectFilled(p0, chip1, fill, 4.f);
+  draw->AddRect(p0, chip1, border, 4.f, 0, 1.0f);
+
+  const float inset = (cell - icon_sz) * 0.5f;
+  ImGui::SetCursorScreenPos(ImVec2(p0.x + inset, p0.y + inset));
+  IDirect3DTexture9* tex = unit_icons::get(r.key, r.name, r.is_building);
+  const ImVec4 tint = defeated ? ImVec4(0.62f, 0.62f, 0.62f, 0.80f) : ImVec4(1, 1, 1, 1);
+  if (tex) {
+    ImGui::ImageWithBg((ImTextureID)tex, ImVec2(icon_sz, icon_sz), ImVec2(0, 0), ImVec2(1, 1),
+                       ImVec4(0, 0, 0, 0), tint);
+  } else {
+    ImGui::Dummy(ImVec2(icon_sz, icon_sz));
+    draw->AddRectFilled(ImVec2(p0.x + inset, p0.y + inset),
+                        ImVec2(p0.x + inset + icon_sz, p0.y + inset + icon_sz),
+                        IM_COL32(40, 48, 60, 220), 3.f);
+    const char* short_l = building ? u8"建" : u8"兵";
+    const ImVec2 sts = ImGui::CalcTextSize(short_l);
+    draw->AddText(ImVec2(p0.x + inset + (icon_sz - sts.x) * 0.5f,
+                         p0.y + inset + (icon_sz - sts.y) * 0.5f),
+                  IM_COL32(200, 210, 220, 255), short_l);
+  }
+  if (ImGui::IsMouseHoveringRect(p0, chip1)) {
+    ImGui::BeginTooltip();
+    ImGui::TextUnformatted(r.name[0] ? r.name : r.key);
+    ImGui::TextDisabled("%s  × %d", building ? u8"建筑" : u8"部队", r.count);
+    ImGui::EndTooltip();
+  }
+
+  char cnt[16];
+  std::snprintf(cnt, sizeof(cnt), "%d", r.count);
+  ImFont* font = ImGui::GetFont();
+  const float csz = (std::max)(10.f, ImGui::GetFontSize() * 0.72f);
+  const ImVec2 cts = font->CalcTextSizeA(csz, FLT_MAX, 0.f, cnt);
+  const float bx1 = chip1.x - 1.f;
+  const float by1 = chip1.y - 1.f;
+  const float bx0 = bx1 - cts.x - 5.f;
+  const float by0 = by1 - cts.y - 1.f;
+  draw->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), IM_COL32(8, 10, 14, 230), 3.f);
+  draw->AddText(font, csz, ImVec2(bx0 + 2.5f, by0), IM_COL32(255, 228, 150, 255), cnt);
+
+  ImGui::SetCursorScreenPos(ImVec2(p0.x + cell, p0.y));
+  ImGui::Dummy(ImVec2(0.1f, cell));
+}
+
+void draw_compact_icon_row(const game_api::PlayerEconomy& p, bool buildings, bool defeated) {
+  const float icon_sz = 34.f;
+  const float cell = 38.f;
+  const float gap = 4.f;
+  const float label_w = 62.f;
+
+  if (ImGui::GetCursorPos().x > ImGui::GetWindowContentRegionMin().x + 2.f) ImGui::NewLine();
+
+  const game_api::RosterType* items[game_api::kMaxRosterTypes];
+  int n = 0;
+  for (int i = 0; i < p.roster_count; ++i) {
+    if (p.roster[i].count <= 0 || p.roster[i].is_building != buildings) continue;
+    items[n++] = &p.roster[i];
+  }
+
+  const float avail = ImGui::GetContentRegionAvail().x;
+  ImDrawList* draw = ImGui::GetWindowDrawList();
+  const ImVec2 row0 = ImGui::GetCursorScreenPos();
+  const int total = buildings ? p.building_total : p.unit_total;
+  char head[32];
+  if (n <= 0) std::snprintf(head, sizeof(head), "%s —", buildings ? u8"建筑" : u8"部队");
+  else std::snprintf(head, sizeof(head), "%s %d", buildings ? u8"建筑" : u8"部队", total);
+
+  const ImVec2 ts = ImGui::CalcTextSize(head);
+  const float label_y = n > 0 ? row0.y + (cell - ts.y) * 0.5f : row0.y;
+  draw->AddText(ImVec2(row0.x, label_y), IM_COL32(176, 196, 220, 255), head);
+  if (n <= 0) {
+    ImGui::Dummy(ImVec2(1.f, ts.y));
+    ImGui::NewLine();
+    return;
+  }
+
+  const ImU32 border = buildings
+                           ? (p.is_local ? IM_COL32(196, 148, 64, 200) : IM_COL32(214, 164, 86, 190))
+                           : (p.is_local ? IM_COL32(214, 176, 72, 180) : IM_COL32(96, 156, 224, 180));
+  const float icons_x = row0.x + label_w;
+  const float wrap_w = (std::max)(cell, avail - label_w);
+  ImGui::SetCursorScreenPos(ImVec2(icons_x, row0.y));
+
+  float used_x = 0.f;
+  bool row_started = false;
+  for (int i = 0; i < n; ++i) {
+    if (row_started && used_x + cell > wrap_w) {
+      ImGui::NewLine();
+      ImGui::SetCursorScreenPos(ImVec2(icons_x, ImGui::GetCursorScreenPos().y));
+      used_x = 0.f;
+      row_started = false;
+    }
+    if (row_started) ImGui::SameLine(0.f, gap);
+    ImGui::PushID(items[i]->key[0] ? items[i]->key : items[i]->name);
+    draw_compact_icon(draw, *items[i], cell, icon_sz, border, buildings, defeated);
+    ImGui::PopID();
+    used_x += cell + gap;
+    row_started = true;
+  }
+  ImGui::NewLine();
+}
+
+void draw_compact_player(const game_api::PlayerEconomy& p, int index) {
+  ImVec4 accent(p.color_r / 255.f, p.color_g / 255.f, p.color_b / 255.f, 1.f);
+  if (!p.has_color) {
+    accent = p.is_local ? ImVec4(0.95f, 0.78f, 0.28f, 1.f) : ImVec4(0.55f, 0.62f, 0.72f, 1.f);
+  }
+  const ImVec4 money_col(1.00f, 0.86f, 0.38f, 1.f);
+  const ImVec4 power_ok(0.45f, 0.90f, 0.62f, 1.f);
+  const ImVec4 power_warn(0.95f, 0.62f, 0.28f, 1.f);
+  const ImVec4 power_bad(0.95f, 0.38f, 0.34f, 1.f);
+  const ImVec4 muted(0.55f, 0.60f, 0.68f, 1.f);
+  const ImVec4 name_col = p.defeated ? muted : ImVec4(0.94f, 0.96f, 0.98f, 1.f);
+
+  char label[96];
+  const char* title = p.name[0] ? p.name : u8"玩家";
+  std::snprintf(label, sizeof(label), "%s%s%s", title, p.is_local ? u8" ·己" : "",
+                p.defeated ? u8" ·败" : "");
+  char money_s[32];
+  if (p.has_money) format_uint_grouped(money_s, sizeof(money_s), p.money);
+  else std::snprintf(money_s, sizeof(money_s), u8"—");
+  char power_s[48];
+  float frac = 0.f;
+  ImVec4 power_col = muted;
+  if (p.has_power) {
+    char used_s[24], total_s[24];
+    format_uint_grouped(used_s, sizeof(used_s), p.power_used);
+    format_uint_grouped(total_s, sizeof(total_s), p.power_total);
+    std::snprintf(power_s, sizeof(power_s), "%s/%s", used_s, total_s);
+    if (p.power_total > 0) {
+      frac = (float)p.power_used / (float)p.power_total;
+      if (frac > 1.f) frac = 1.f;
+    }
+    power_col = power_ok;
+    if (frac >= 0.95f) power_col = power_bad;
+    else if (frac >= 0.75f) power_col = power_warn;
+  } else {
+    std::snprintf(power_s, sizeof(power_s), u8"—");
+  }
+
+  const float avail = ImGui::GetContentRegionAvail().x;
+  const float right_w = 8.f + ImGui::CalcTextSize(u8"资金").x + 4.f + ImGui::CalcTextSize(money_s).x +
+                        10.f + ImGui::CalcTextSize(u8"电力").x + 4.f + ImGui::CalcTextSize(power_s).x;
+
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  dl->ChannelsSplit(2);
+  dl->ChannelsSetCurrent(1);
+
+  const ImVec2 origin = ImGui::GetCursorScreenPos();
+  ImGui::PushID(index + 1);
+  ImGui::BeginGroup();
+  ImGui::Dummy(ImVec2(0.f, 1.f));
+
+  const float sw = ImGui::GetTextLineHeight();
+  const ImVec2 sw0 = ImGui::GetCursorScreenPos();
+  dl->AddRectFilled(sw0, ImVec2(sw0.x + sw, sw0.y + sw), ImGui::GetColorU32(accent), 2.f);
+  ImGui::Dummy(ImVec2(sw, sw));
+  ImGui::SameLine(0.f, 4.f);
+  const float name_w = (std::max)(28.f, avail - sw - 8.f - right_w);
+  ImGui::PushStyleColor(ImGuiCol_Text, name_col);
+  text_ellipsis(label, name_w);
+  ImGui::PopStyleColor();
+  ImGui::SameLine(0.f, 8.f);
+  ImGui::TextDisabled(u8"资金");
+  ImGui::SameLine(0.f, 4.f);
+  ImGui::TextColored(p.has_money ? money_col : muted, "%s", money_s);
+  ImGui::SameLine(0.f, 10.f);
+  ImGui::TextDisabled(u8"电力");
+  ImGui::SameLine(0.f, 4.f);
+  ImGui::TextColored(power_col, "%s", power_s);
+
+  draw_compact_icon_row(p, false, p.defeated);
+  draw_compact_icon_row(p, true, p.defeated);
+
+  ImGui::Dummy(ImVec2(0.f, 1.f));
+  ImGui::EndGroup();
+  const ImVec2 r0 = ImGui::GetItemRectMin();
+  const ImVec2 r1 = ImGui::GetItemRectMax();
+  ImGui::PopID();
+
+  dl->ChannelsSetCurrent(0);
+  const ImU32 bg = (index & 1) ? IM_COL32(18, 24, 34, 150) : IM_COL32(24, 32, 44, 130);
+  dl->AddRectFilled(ImVec2(origin.x, r0.y), ImVec2(origin.x + avail, r1.y), bg, 4.f);
+  dl->AddRectFilled(ImVec2(origin.x, r0.y), ImVec2(origin.x + 3.f, r1.y), ImGui::GetColorU32(accent),
+                    2.f);
+  dl->ChannelsMerge();
+}
+
+void draw_stats_compact(const game_api::MatchEconomy& st) {
+  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.f, 3.f));
+  for (int i = 0; i < st.player_count; ++i) {
+    draw_compact_player(st.players[i], i);
+  }
+  ImGui::PopStyleVar();
+}
+
 void draw_stats_panel() {
   static game_api::MatchEconomy st{};
   static double last_poll = -1.0;
@@ -807,10 +1065,15 @@ void draw_stats_panel() {
   ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.35f, 0.48f, 0.65f, 0.55f));
   ImGui::Separator();
   ImGui::PopStyleColor();
-  ImGui::Spacing();
+  if (!g_stats_compact) ImGui::Spacing();
 
   if (!st.valid) {
     ImGui::TextWrapped(u8"%s", st.note[0] ? st.note : u8"暂无数据：请先进入对局。");
+    return;
+  }
+
+  if (g_stats_compact) {
+    draw_stats_compact(st);
     return;
   }
 
@@ -859,8 +1122,11 @@ void draw_stats_window() {
     }
   }
   ImGui::SameLine();
-  ImGui::TextDisabled(g_stats_pinned ? u8"主菜单隐藏后仍显示"
-                                     : u8"取消固定后可关闭本窗口");
+  if (ImGui::Checkbox(u8"精简", &g_stats_compact)) mark_settings_dirty();
+  ImGui::SameLine();
+  ImGui::TextDisabled(g_stats_compact ? u8"图标、资金、电力"
+                                      : (g_stats_pinned ? u8"主菜单隐藏后仍显示"
+                                                        : u8"取消固定后可关闭本窗口"));
 
   ImGui::Spacing();
   draw_stats_panel();
@@ -1298,7 +1564,8 @@ static bool feature_needs_hooks(const char* key) {
          std::strcmp(key, "disable_protocol") == 0 || std::strcmp(key, "unit_clone") == 0 ||
          std::strcmp(key, "spawn_unit") == 0 || std::strcmp(key, "clone_multi") == 0 ||
          std::strcmp(key, "ore_convoy") == 0 ||
-         std::strcmp(key, "full_buff") == 0 || std::strcmp(key, "spawn_mcv") == 0;
+         std::strcmp(key, "full_buff") == 0 || std::strcmp(key, "spawn_mcv") == 0 ||
+         std::strcmp(key, "summon_troops") == 0;
 }
 
 static int g_pair_col = 0;
@@ -1612,6 +1879,159 @@ static int draw_rank_slider(int level, bool* dragging) {
 static uint32_t g_rank_player_ui = 0;
 static uint32_t g_mcv_player_ui = 0;
 static uint32_t g_money_player_ui = 0;
+static uint32_t g_summon_player_ui = 0;
+static int g_summon_count = 1;
+static std::vector<std::string> g_summon_sel;
+
+static bool summon_is_picked(const char* id) {
+  if (!id) return false;
+  for (const auto& s : g_summon_sel) {
+    if (s == id) return true;
+  }
+  return false;
+}
+
+static void summon_add(const char* id) {
+  if (!id || !id[0] || summon_is_picked(id)) return;
+  if (g_summon_sel.size() < 64) g_summon_sel.push_back(id);
+}
+
+static bool draw_summon_icon(const char* tip, const char* icon_id, const char* icon_name,
+                             bool removable) {
+  constexpr float kIcon = 40.f;
+  const ImVec2 p0 = ImGui::GetCursorScreenPos();
+  ImGui::InvisibleButton("##ico", ImVec2(kIcon, kIcon));
+  const bool hovered = ImGui::IsItemHovered();
+  const bool clicked = ImGui::IsItemClicked();
+  ImDrawList* draw = ImGui::GetWindowDrawList();
+  draw->AddRectFilled(p0, ImVec2(p0.x + kIcon, p0.y + kIcon), IM_COL32(16, 22, 32, 220), 4.f);
+  draw->AddRect(p0, ImVec2(p0.x + kIcon, p0.y + kIcon),
+                hovered ? IM_COL32(255, 214, 120, 255) : IM_COL32(70, 96, 130, 255), 4.f, 0,
+                hovered ? 2.f : 1.f);
+  if (icon_id && icon_id[0]) {
+    IDirect3DTexture9* tex = unit_icons::get(icon_id, icon_name, false);
+    if (tex) {
+      draw->AddImage((ImTextureID)tex, ImVec2(p0.x + 2.f, p0.y + 2.f),
+                     ImVec2(p0.x + kIcon - 2.f, p0.y + kIcon - 2.f));
+    }
+  }
+  if (hovered && tip && tip[0]) {
+    ImGui::BeginTooltip();
+    ImGui::TextUnformatted(tip);
+    if (removable) ImGui::TextDisabled(u8"点击拿掉");
+    ImGui::EndTooltip();
+  }
+  return clicked;
+}
+
+static int build_faction_rank_ui(const char* id);
+static const char* build_faction_label(int rank);
+static bool is_visible_rep(const game_api::BuildLockEntry* cat, int count, int index);
+
+static const game_api::BuildLockEntry* summon_lookup(const game_api::BuildLockEntry* cat, int count,
+                                                     const std::string& id) {
+  if (!cat) return nullptr;
+  for (int i = 0; i < count; ++i) {
+    if (id == cat[i].type_id) return &cat[i];
+  }
+  return nullptr;
+}
+
+static void draw_summon_candidate_box(const game_api::BuildLockEntry* cat, int count) {
+  constexpr float kIcon = 40.f;
+  constexpr float kGap = 4.f;
+  constexpr float kPad = 8.f;
+
+  ImGui::TextDisabled(u8"候选 %d", (int)g_summon_sel.size());
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const float full_w = ImGui::GetContentRegionAvail().x;
+  dl->ChannelsSplit(2);
+  dl->ChannelsSetCurrent(1);
+
+  ImGui::BeginGroup();
+  ImGui::Dummy(ImVec2(full_w, kPad));
+  ImGui::Indent(kPad);
+  int remove_at = -1;
+  if (g_summon_sel.empty()) {
+    ImGui::TextDisabled(u8"点击下方部队加入，再点这里的图标可拿掉");
+  } else {
+    const float avail = ImGui::GetContentRegionAvail().x - kPad;
+    float used = 0.f;
+    bool started = false;
+    for (size_t n = 0; n < g_summon_sel.size(); ++n) {
+      const auto* e = summon_lookup(cat, count, g_summon_sel[n]);
+      const char* tip = e && e->name[0] ? e->name : g_summon_sel[n].c_str();
+      const char* icon_id = e ? (e->icon_id[0] ? e->icon_id : e->type_id) : "";
+      const char* icon_name = e ? (e->icon_name[0] ? e->icon_name : e->name) : "";
+      if (started && used + kIcon + kGap > avail) {
+        used = 0.f;
+        started = false;
+      }
+      if (started) ImGui::SameLine(0.f, kGap);
+      ImGui::PushID((int)n + 40000);
+      if (draw_summon_icon(tip, icon_id, icon_name, true)) remove_at = (int)n;
+      ImGui::PopID();
+      used += kIcon + kGap;
+      started = true;
+    }
+  }
+  ImGui::Unindent(kPad);
+  ImGui::Dummy(ImVec2(1.f, kPad));
+  ImGui::EndGroup();
+  const ImVec2 r0 = ImGui::GetItemRectMin();
+  const ImVec2 r1 = ImGui::GetItemRectMax();
+
+  dl->ChannelsSetCurrent(0);
+  dl->AddRectFilled(r0, ImVec2(r0.x + full_w, r1.y), IM_COL32(12, 18, 28, 220), 6.f);
+  dl->AddRect(r0, ImVec2(r0.x + full_w, r1.y), IM_COL32(70, 96, 130, 220), 6.f, 0, 1.2f);
+  dl->ChannelsMerge();
+  if (remove_at >= 0 && remove_at < (int)g_summon_sel.size()) {
+    g_summon_sel.erase(g_summon_sel.begin() + remove_at);
+  }
+  ImGui::Spacing();
+}
+
+static void draw_summon_unit_icons() {
+  int count = 0;
+  const game_api::BuildLockEntry* cat = game_api::build_lock_catalog(&count);
+  draw_summon_candidate_box(cat, count);
+  if (count <= 0 || !cat) {
+    ImGui::TextWrapped(u8"还没读到部队。进入对局后再打开这一页。");
+    return;
+  }
+  constexpr float kIcon = 40.f;
+  constexpr float kGap = 4.f;
+  for (int fac = 0; fac < 3; ++fac) {
+    ImGui::TextDisabled("%s", build_faction_label(fac));
+    const float avail = ImGui::GetContentRegionAvail().x;
+    float used = 0.f;
+    bool started = false;
+    bool any = false;
+    for (int i = 0; i < count; ++i) {
+      const auto& e = cat[i];
+      if (e.building) continue;
+      if (build_faction_rank_ui(e.type_id) != fac) continue;
+      if (!is_visible_rep(cat, count, i)) continue;
+      if (started && used + kIcon + kGap > avail) {
+        used = 0.f;
+        started = false;
+      }
+      if (started) ImGui::SameLine(0.f, kGap);
+      const char* icon_id = e.icon_id[0] ? e.icon_id : e.type_id;
+      const char* icon_name = e.icon_name[0] ? e.icon_name : e.name;
+      ImGui::PushID(i + 30000);
+      if (draw_summon_icon(e.name[0] ? e.name : e.type_id, icon_id, icon_name, false)) {
+        summon_add(e.type_id);
+      }
+      ImGui::PopID();
+      used += kIcon + kGap;
+      started = true;
+      any = true;
+    }
+    if (!any) ImGui::TextDisabled(u8"—");
+    ImGui::Spacing();
+  }
+}
 
 static uint32_t draw_player_picker(const char* scope, uint32_t* selected) {
   static int cached_frame = -1;
@@ -1909,6 +2329,55 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (56.f - summon_y) * 0.5f);
     if (ImGui::Button(u8"召唤", ImVec2(72.f, summon_y))) run_feature_action(f);
     if (!action_ok) ImGui::EndDisabled();
+    ImGui::PopID();
+    return;
+  }
+
+  if (std::strcmp(f->type, "engine") == 0 && std::strcmp(f->key, "summon_troops") == 0) {
+    end_chip_flow();
+    const bool busy = InterlockedCompareExchange(&g_engine_busy, 0, 0) != 0;
+    const bool action_ok = armed && !busy;
+    ImGui::PushID(f->key);
+    ImGui::TextUnformatted(f->label);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped(
+        u8"点下方部队放进候选框，再点候选里的图标可拿掉。数量是每种各召唤几个。出现在鼠标处，归所选玩家。快捷键按当前这些设置召唤。");
+    ImGui::PopStyleColor();
+    const uint32_t who = draw_player_picker("summon", &g_summon_player_ui);
+    int count = g_summon_count;
+    ImGui::SetNextItemWidth(120.f);
+    if (ImGui::InputInt(u8"每种数量", &count, 1, 5)) {
+      if (count < 1) count = 1;
+      if (count > 20) count = 20;
+      g_summon_count = count;
+    }
+    ImGui::SameLine();
+    if (!action_ok) ImGui::BeginDisabled();
+    if (ImGui::Button(u8"召唤", ImVec2(72.f, 0))) {
+      std::vector<const char*> ids;
+      ids.reserve(g_summon_sel.size());
+      for (const auto& s : g_summon_sel) ids.push_back(s.c_str());
+      std::string msg;
+      if (!game_api::summon_prepare(who, g_summon_count, ids.data(), (int)ids.size(), &msg)) {
+        g_last_msg = msg;
+        game_api::beep("error");
+      } else if (!start_engine_async(f->key)) {
+        g_last_msg = u8"上一次操作仍在进行中";
+        game_api::beep("error");
+      } else {
+        g_last_msg = u8"正在召唤…（请把鼠标移到地形上）";
+      }
+    }
+    if (!action_ok) ImGui::EndDisabled();
+    ImGui::SameLine();
+    draw_feature_gear(f->key);
+    {
+      std::vector<const char*> live;
+      live.reserve(g_summon_sel.size());
+      for (const auto& s : g_summon_sel) live.push_back(s.c_str());
+      game_api::summon_prepare(who, g_summon_count, live.data(), (int)live.size(), nullptr);
+    }
+    draw_summon_unit_icons();
     ImGui::PopID();
     return;
   }
@@ -2420,7 +2889,8 @@ void draw() {
       for (int i = 0; i < g.key_count; ++i) {
         const game_api::FeatureInfo* feat = game_api::find_feature(g.keys[i]);
         const bool unit_full = feat && (std::strcmp(feat->key, "spawn_mcv") == 0 ||
-                                        std::strcmp(feat->key, "spawn_rank") == 0);
+                                        std::strcmp(feat->key, "spawn_rank") == 0 ||
+                                        std::strcmp(feat->key, "summon_troops") == 0);
         const bool money_cell = feat && std::strcmp(feat->type, "money") == 0;
         const bool money_pick = feat && std::strcmp(feat->key, "money_sel") == 0;
         if (unit_page && feat && !unit_full) {

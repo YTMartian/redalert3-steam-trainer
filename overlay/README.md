@@ -13,10 +13,10 @@
 | Win32 (x86) DLL | OK（`ra3_overlay_v4.dll`） |
 | D3D9 Present/EndScene（MinHook） | OK |
 | Home / Insert / F8 显隐 | OK |
-| MustCode 注入（`mustcode_asm.build()` / `arm_mustcode.exe`） | OK |
+| MustCode 注入（`mustcode_asm.build()` / `arm_mustcode.dll`） | OK |
 | FLAGS 开关（勾选框）+ 危险等级（分段条） | OK |
 | 单位速度/血量/摧毁/满星/复制等 | OK |
-| 一键注入器 EXE | OK（`RA3_Overlay_Inject.exe`，弹窗标题为「注入成功」或「注入失败」） |
+| 一键注入器 EXE | OK（`main.exe`，弹窗标题为「注入成功」或「注入失败」） |
 | 战况统计（资金/电力、图标数量、本局折线） | OK |
 | 建造限制（按图标禁止单位/建筑，全玩家生效） | OK |
 ## 使用
@@ -25,7 +25,7 @@
 2. 进局后，**以管理员身份**双击：
 
 ```
-overlay\bin\RA3_Overlay_Inject.exe
+overlay\bin\main.exe
 ```
 
 （自动加载同目录 `ra3_overlay_v4.dll`。弹窗标题就是结果：**注入成功** 或 **注入失败**，窗口置顶；失败时正文写原因，例如没找到游戏、没有管理员权限、DLL 没载入。若启动的不是 1.12，会改为弹出两张图，说明在 Steam 属性的启动选项里填 `-runver 1.12`。若战网客户端在运行，会提示关闭 `RA3BattleNet`，并且不会注入。）
@@ -37,20 +37,21 @@ overlay\bin\RA3_Overlay_Inject.exe
    - 资金 → 「+」「-」，点名称修改每次金额
    - 一次性操作（复制/摧毁等）→ **执行**（后台异步，避免卡渲染线程）
 
-同目录还需有 `arm_mustcode.exe`（菜单「注入」时由 DLL 调用；内含 `keystone.dll`，用 `mustcode_asm.py` 装配 MustCode）。
+发给别人时只拷贝这一个 exe。它会在自己旁边释出 `ra3_overlay_v4.dll`、`arm_mustcode.dll` 和名字表。`arm_mustcode.dll` 仍是装配程序，扩展名做成 dll，避免和 `main.exe` 点错。单位图标在 DLL 里，不会再写出 `unit_images`。菜单「注入」仍由覆盖层 DLL 调用旁边的 `arm_mustcode.dll`（内含 `keystone.dll`）。
 
-日志：与 `RA3_Overlay_Inject.exe` 同目录的 `ra3_overlay.log`。普通记录和崩溃堆栈都在这个文件里，每次重新注入会先清空。
+日志：与 `main.exe` 同目录的 `ra3_overlay.log`。普通记录和崩溃堆栈都在这个文件里，每次重新注入会先清空。
 
 ### 菜单
 
-侧栏有资源、超武/地图、弹药/危险、单位操作、战场，以及建造限制、战况统计、界面设置。没有单独的观战页。观战仍用「注入」旁的「观战模式」勾选。
+侧栏有资源、超武/地图、弹药/危险、单位操作，以及建造限制、战况统计、界面设置。没有单独的观战页。观战仍用「注入」旁的「观战模式」勾选。
 
 - **己方资金**：加减自己的钱，默认每次 10 万。
 - **选中玩家资金**：列出已经进局的玩家，颜色方块加阵营名，点选后加减该玩家的钱，默认每次 1 万。
 - **出场等级**：选玩家后设 0–3。0 为不设置，1–3 只影响该玩家之后生产的单位。
 - **召唤基地车**：选玩家，再用盟军 / 苏联 / 帝国基地车图标决定车型，在鼠标所在地形召唤一辆。
+- **召唤部队**：选玩家，把三家部队图标放进候选框（可多选，不含建筑），每种数量默认 1。围着鼠标散开，归所选玩家。热键 `U` 使用当前设置。
 
-这三项的玩家选择互不影响。只列出战场上存在的玩家；己方、已击败单独标注。
+这四项的玩家选择互不影响。只列出战场上存在的玩家；己方、已击败单独标注。
 
 ### 战况统计
 
@@ -60,9 +61,10 @@ overlay\bin\RA3_Overlay_Inject.exe
 - 卡片上有当前资金、电力，以及场上还活着的部队、建筑（图标 + 数量）。
 - **本局**是一张折线图：建造、损失、消灭（部队和建筑加在一起），以及收入、支出。数量和金额各自按自己的最大值缩放，避免金额把前三条线压扁。鼠标悬停可看该时刻的时间、部队与建筑的拆分，以及收入、支出金额。
 - 折线横轴从战局 0 秒画到现在。游戏只保存累计总数，不保存逐秒曲线；开始记录之前的那一段，是从开局的 0 连到当时的官方累计值，之后按实际变化画。右端始终是当前的完整统计。
-- 「固定」默认关闭。不固定时，关掉主菜单会一起关掉战况窗口；勾上固定后，Home 只关主菜单。
+- 「固定」默认关闭。不固定时，关掉主菜单会一起关掉战况窗口；勾上固定后，Home 只关主菜单。每次重新注入都会回到不固定。
+- 「精简」不画折线。资金和电力在名字那一行，下面部队一行、建筑一行，仍是图标加数量。勾选会记在 `overlay_ui.ini` 里。
 
-图标放在与 DLL 同目录的 `unit_images\`（仓库根目录的 `unit_images\` 也会被找到；`build.bat` 会复制过去）。文件名用游戏/Wiki 中文名（不含 `.png`），按阵营分子目录：
+图标编进 DLL。源图在仓库根目录的 `unit_images\`，`build.bat` 打包时读它。文件名用游戏/Wiki 中文名（不含 `.png`），按阵营分子目录：
 
 ```
 unit_images/
@@ -118,10 +120,12 @@ cd overlay
 build_injector.bat
 ```
 
+先编 DLL，再编注入器。注入器会把 DLL、装配程序、名字表和图标打进同一个 exe。
+
 输出：
 
-- `overlay\bin\RA3_Overlay_Inject.exe`（带自定义图标，管理员权限）
-- `overlay\bin\arm_mustcode.exe`（打包 `keystone.dll`）
+- `overlay\bin\main.exe`（带自定义图标，管理员权限；对外只发这一个文件）
+- `overlay\bin\arm_mustcode.dll`（装配程序，扩展名是 dll，供上面的 exe 打包）
 
 若改过 `mustcode_body.asm` / `payload.py`，先在仓库根目录：
 
@@ -142,10 +146,9 @@ overlay/
     ra3_overlay_v4.dll
     unit_names_csf.txt       # CSF 官方名称表（与 DLL 同目录）
     unit_names.txt           # 手动覆盖（与 DLL 同目录）
-    unit_images/             # 单位/建筑图标（build.bat 从仓库根 unit_images 复制）
-                             # 盟军|苏联|帝国/{单位,建筑}、中立单位建筑、战役建筑、特殊单位
-    RA3_Overlay_Inject.exe   # 由 build_injector.bat 生成，*.exe 默认不入库
-    arm_mustcode.exe
+                             # 图标编进 DLL，源图在仓库根 unit_images/
+    main.exe   # 由 build_injector.bat 生成，*.exe 默认不入库
+    arm_mustcode.dll         # 装配程序，扩展名做成 dll
   src/          # dllmain, d3d9_hook, ui, input, game_api, game_features
   tools/inject.py
   tools/arm_mustcode.py
@@ -161,7 +164,7 @@ overlay/
 | 注入弹窗写「注入失败」 | 先看正文：游戏没开、没管理员权限，或 DLL 被安全软件隔离 |
 | 注入失败 / probe failed | 不是 1.12，或已有其它 MustCode 改写了 PlayerID 处字节 |
 | 开关无效 | 未点「注入」；或观战模式卸掉了资源 hook |
-| 菜单「注入」失败找不到 arm | `arm_mustcode.exe` 未放在 `overlay\bin` |
+| 菜单「注入」失败找不到 arm | 重新运行注入器，让它释出 `arm_mustcode.dll`。安全软件可能隔离释出的文件 |
 | arm 报 keystone 动态库失败 | 重新跑 `build_injector.bat`（需打包 `keystone.dll`） |
 | 复制失败 | 鼠标不在地形上；先选中单位；观战时没有本地玩家归属 |
 | 菜单不出现 | Steam Overlay 冲突；看 log 是否有 `hooked Present` |

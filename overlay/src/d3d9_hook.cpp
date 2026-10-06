@@ -279,6 +279,7 @@ void render_overlay(IDirect3DDevice9* device) {
 }
 
 HRESULT APIENTRY hk_end_scene(IDirect3DDevice9* device) {
+  game_api::drain_unit_spawns();
   InterlockedIncrement(&g_endscene_count);
   // Draw only from Present. Creating the font texture inside EndScene faults d3d9.
   return g_orig_end_scene(device);
@@ -286,6 +287,7 @@ HRESULT APIENTRY hk_end_scene(IDirect3DDevice9* device) {
 
 HRESULT APIENTRY hk_present(IDirect3DDevice9* device, const RECT* src, const RECT* dst,
                             HWND hwnd, const RGNDATA* dirty) {
+  game_api::drain_unit_spawns();
   InterlockedIncrement(&g_present_count);
   render_overlay_seh(device);
   const HRESULT hr = g_orig_present(device, src, dst, hwnd, dirty);
@@ -308,6 +310,7 @@ HRESULT APIENTRY hk_reset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* param
 
 HRESULT APIENTRY hk_swap_present(IDirect3DSwapChain9* swap, const RECT* src, const RECT* dst,
                                  HWND hwnd, const RGNDATA* dirty, DWORD flags) {
+  game_api::drain_unit_spawns();
   InterlockedIncrement(&g_swap_present_count);
   IDirect3DDevice9* device = nullptr;
   if (swap && SUCCEEDED(swap->GetDevice(&device)) && device) {

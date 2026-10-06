@@ -19,7 +19,8 @@ IDirect3DDevice9* g_device = nullptr;
 bool g_indexed = false;
 
 struct FileRef {
-  std::wstring path;
+  const unsigned char* bytes = nullptr;
+  unsigned size = 0;
   std::string faction;  // 苏联 / 盟军 / 帝国 / 中立单位建筑 / 战役建筑 / 特殊单位
   bool building = false;
   std::string name;  // basename without .png
@@ -53,109 +54,85 @@ std::wstring widen_utf8(const char* u8) {
   return w;
 }
 
-std::wstring module_dir_w() {
-  wchar_t path[MAX_PATH] = {};
+void add_packed_png(const std::string& rel, const unsigned char* bytes, unsigned size) {
+  std::string parts[4];
+  int nparts = 0;
+  size_t start = 0;
+  for (size_t i = 0; i <= rel.size() && nparts < 4; ++i) {
+    if (i == rel.size() || rel[i] == '/') {
+      if (i > start && nparts < 4) parts[nparts++] = rel.substr(start, i - start);
+      start = i + 1;
+    }
+  }
+  if (nparts < 2) return;
+  const std::string& faction = parts[0];
+  bool building = false;
+  if (faction == u8"中立单位建筑" || faction == u8"战役建筑") {
+    building = true;
+  } else if (faction == u8"特殊单位") {
+    building = false;
+  } else if (faction == u8"苏联" || faction == u8"盟军" || faction == u8"帝国") {
+    if (nparts < 3) return;
+    if (parts[1] == u8"建筑") building = true;
+    else if (parts[1] == u8"单位") building = false;
+    else return;
+  } else {
+    return;
+  }
+  std::string name = parts[nparts - 1];
+  const size_t dot = name.rfind('.');
+  if (dot != std::string::npos) name = name.substr(0, dot);
+  if (name.empty()) return;
+  FileRef ref;
+  ref.bytes = bytes;
+  ref.size = size;
+  ref.faction = faction;
+  ref.building = building;
+  ref.name = name;
+  const int idx = (int)g_files.size();
+  g_files.push_back(ref);
+  g_by_name[ref.name].push_back(idx);
+}
+
+void index_embedded() {
+  g_files.clear();
+  g_by_name.clear();
+  g_indexed = true;
   HMODULE self = nullptr;
   if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                          reinterpret_cast<LPCWSTR>(&module_dir_w), &self) ||
+                          reinterpret_cast<LPCWSTR>(&index_embedded), &self) ||
       !self) {
-    return {};
+    return;
   }
-  GetModuleFileNameW(self, path, MAX_PATH);
-  wchar_t* slash = wcsrchr(path, L'\\');
-  if (slash) *slash = 0;
-  return path;
-}
-
-bool dir_exists(const std::wstring& p) {
-  const DWORD a = GetFileAttributesW(p.c_str());
-  return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
-}
-
-std::wstring find_images_root() {
-  const std::wstring mod = module_dir_w();
-  const std::wstring candidates[] = {
-      mod + L"\\unit_images",
-      mod + L"\\..\\unit_images",
-      mod + L"\\..\\..\\unit_images",
-  };
-  for (const auto& c : candidates) {
-    wchar_t full[MAX_PATH] = {};
-    if (GetFullPathNameW(c.c_str(), MAX_PATH, full, nullptr) && dir_exists(full)) {
-      return full;
-    }
+  HRSRC res = FindResourceW(self, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(10));
+  if (!res) return;
+  HGLOBAL glob = LoadResource(self, res);
+  if (!glob) return;
+  const DWORD nbytes = SizeofResource(self, res);
+  const unsigned char* data = static_cast<const unsigned char*>(LockResource(glob));
+  if (!data || nbytes < 12) return;
+  unsigned magic = 0, version = 0, count = 0;
+  std::memcpy(&magic, data, 4);
+  std::memcpy(&version, data + 4, 4);
+  std::memcpy(&count, data + 8, 4);
+  if (magic != 0x474D4955u || version != 1u) return;
+  size_t off = 12;
+  for (unsigned i = 0; i < count; ++i) {
+    if (off + 2 > nbytes) return;
+    unsigned short plen = 0;
+    std::memcpy(&plen, data + off, 2);
+    off += 2;
+    if (off + plen + 4 > nbytes) return;
+    const std::string rel(reinterpret_cast<const char*>(data + off), plen);
+    off += plen;
+    unsigned dlen = 0;
+    std::memcpy(&dlen, data + off, 4);
+    off += 4;
+    if (off + dlen > nbytes) return;
+    add_packed_png(rel, data + off, dlen);
+    off += dlen;
   }
-  return {};
-}
-
-void index_dir(const std::wstring& root) {
-  g_files.clear();
-  g_by_name.clear();
-  g_indexed = false;
-  if (root.empty()) return;
-
-  const std::wstring pattern = root + L"\\*";
-  WIN32_FIND_DATAW fd{};
-  HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
-  if (h == INVALID_HANDLE_VALUE) return;
-
-  auto add_png = [&](const std::wstring& dir, const wchar_t* file, const std::string& faction,
-                     bool building) {
-    std::wstring base = file;
-    const size_t dot = base.find_last_of(L'.');
-    if (dot != std::wstring::npos) base = base.substr(0, dot);
-    FileRef ref;
-    ref.path = dir + L"\\" + file;
-    ref.faction = faction;
-    ref.building = building;
-    ref.name = narrow_utf8(base.c_str());
-    if (ref.name.empty()) return;
-    const int idx = (int)g_files.size();
-    g_files.push_back(ref);
-    g_by_name[ref.name].push_back(idx);
-  };
-
-  // unit_images/{faction}/{单位|建筑}/*.png
-  // unit_images/{中立单位建筑|战役建筑|特殊单位}/*.png  (flat folders)
-  do {
-    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-    if (fd.cFileName[0] == L'.') continue;
-    const std::string faction = narrow_utf8(fd.cFileName);
-
-    if (faction == u8"中立单位建筑" || faction == u8"战役建筑" || faction == u8"特殊单位") {
-      const std::wstring kind_dir = root + L"\\" + fd.cFileName;
-      const std::wstring glob = kind_dir + L"\\*.png";
-      WIN32_FIND_DATAW ff{};
-      HANDLE hf = FindFirstFileW(glob.c_str(), &ff);
-      if (hf == INVALID_HANDLE_VALUE) continue;
-      do {
-        if (ff.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        add_png(kind_dir, ff.cFileName, faction, faction != u8"特殊单位");
-      } while (FindNextFileW(hf, &ff));
-      FindClose(hf);
-      continue;
-    }
-
-    if (faction != u8"苏联" && faction != u8"盟军" && faction != u8"帝国") continue;
-
-    const wchar_t* kinds[] = {L"单位", L"建筑"};
-    for (const wchar_t* kind : kinds) {
-      const bool building = (wcscmp(kind, L"建筑") == 0);
-      const std::wstring kind_dir = root + L"\\" + fd.cFileName + L"\\" + kind;
-      const std::wstring glob = kind_dir + L"\\*.png";
-      WIN32_FIND_DATAW ff{};
-      HANDLE hf = FindFirstFileW(glob.c_str(), &ff);
-      if (hf == INVALID_HANDLE_VALUE) continue;
-      do {
-        if (ff.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        add_png(kind_dir, ff.cFileName, faction, building);
-      } while (FindNextFileW(hf, &ff));
-      FindClose(hf);
-    }
-  } while (FindNextFileW(h, &fd));
-  FindClose(h);
-  g_indexed = true;
 }
 
 const char* faction_from_key(const char* key) {
@@ -417,7 +394,7 @@ static std::string simplify_zh(const char* u8) {
 
 const FileRef* pick_file(const char* type_key, const char* disp, bool building) {
   if (!g_indexed) {
-    index_dir(find_images_root());
+    index_embedded();
   }
   const char* faction = faction_from_key(type_key);
   const char* names_try[8] = {};
@@ -526,46 +503,15 @@ const FileRef* pick_file(const char* type_key, const char* disp, bool building) 
   return best;
 }
 
-IDirect3DTexture9* load_png(const std::wstring& path) {
-  if (!g_device || path.empty()) return nullptr;
-
-  IWICImagingFactory* factory = nullptr;
-  if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                              IID_PPV_ARGS(&factory))) ||
-      !factory) {
-    // OLE may not be inited in game thread.
-    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
-      CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    }
-    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                                IID_PPV_ARGS(&factory))) ||
-        !factory) {
-      return nullptr;
-    }
-  }
-
-  IWICBitmapDecoder* decoder = nullptr;
-  HRESULT hr = factory->CreateDecoderFromFilename(
-      path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder);
-  if (FAILED(hr) || !decoder) {
-    factory->Release();
-    return nullptr;
-  }
-
+IDirect3DTexture9* texture_from_decoder(IWICImagingFactory* factory, IWICBitmapDecoder* decoder) {
   IWICBitmapFrameDecode* frame = nullptr;
-  hr = decoder->GetFrame(0, &frame);
-  if (FAILED(hr) || !frame) {
-    decoder->Release();
-    factory->Release();
-    return nullptr;
-  }
+  HRESULT hr = decoder->GetFrame(0, &frame);
+  if (FAILED(hr) || !frame) return nullptr;
 
   IWICFormatConverter* conv = nullptr;
   hr = factory->CreateFormatConverter(&conv);
   if (FAILED(hr) || !conv) {
     frame->Release();
-    decoder->Release();
-    factory->Release();
     return nullptr;
   }
 
@@ -574,8 +520,6 @@ IDirect3DTexture9* load_png(const std::wstring& path) {
   if (FAILED(hr)) {
     conv->Release();
     frame->Release();
-    decoder->Release();
-    factory->Release();
     return nullptr;
   }
 
@@ -584,8 +528,6 @@ IDirect3DTexture9* load_png(const std::wstring& path) {
   if (w == 0 || h == 0 || w > 2048 || h > 2048) {
     conv->Release();
     frame->Release();
-    decoder->Release();
-    factory->Release();
     return nullptr;
   }
 
@@ -593,13 +535,10 @@ IDirect3DTexture9* load_png(const std::wstring& path) {
   hr = conv->CopyPixels(nullptr, w * 4, (UINT)pixels.size(), pixels.data());
   conv->Release();
   frame->Release();
-  decoder->Release();
-  factory->Release();
   if (FAILED(hr)) return nullptr;
 
   IDirect3DTexture9* tex = nullptr;
-  hr = g_device->CreateTexture(w, h, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &tex,
-                               nullptr);
+  hr = g_device->CreateTexture(w, h, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &tex, nullptr);
   if (FAILED(hr) || !tex) return nullptr;
 
   D3DLOCKED_RECT lr{};
@@ -610,10 +549,50 @@ IDirect3DTexture9* load_png(const std::wstring& path) {
   for (UINT y = 0; y < h; ++y) {
     BYTE* dst = static_cast<BYTE*>(lr.pBits) + y * lr.Pitch;
     const BYTE* src = pixels.data() + (size_t)y * w * 4;
-    // WIC BGRA -> D3D A8R8G8B8 (same byte order on LE)
     std::memcpy(dst, src, (size_t)w * 4);
   }
   tex->UnlockRect(0);
+  return tex;
+}
+
+IWICImagingFactory* wic_factory() {
+  IWICImagingFactory* factory = nullptr;
+  if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(&factory))) ||
+      !factory) {
+    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
+      CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    }
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&factory))) ||
+        !factory) {
+      return nullptr;
+    }
+  }
+  return factory;
+}
+
+IDirect3DTexture9* load_png(const unsigned char* bytes, unsigned size) {
+  if (!g_device || !bytes || size == 0) return nullptr;
+  IWICImagingFactory* factory = wic_factory();
+  if (!factory) return nullptr;
+
+  IWICStream* stream = nullptr;
+  HRESULT hr = factory->CreateStream(&stream);
+  if (FAILED(hr) || !stream) {
+    factory->Release();
+    return nullptr;
+  }
+  hr = stream->InitializeFromMemory(const_cast<BYTE*>(bytes), size);
+  IWICBitmapDecoder* decoder = nullptr;
+  if (SUCCEEDED(hr)) {
+    hr = factory->CreateDecoderFromStream(stream, nullptr, WICDecodeMetadataCacheOnLoad, &decoder);
+  }
+  IDirect3DTexture9* tex = nullptr;
+  if (SUCCEEDED(hr) && decoder) tex = texture_from_decoder(factory, decoder);
+  if (decoder) decoder->Release();
+  stream->Release();
+  factory->Release();
   return tex;
 }
 
@@ -630,7 +609,7 @@ void init(IDirect3DDevice9* device) {
   g_indexed = false;
   g_files.clear();
   g_by_name.clear();
-  index_dir(find_images_root());
+  index_embedded();
 }
 
 void shutdown() {
@@ -656,7 +635,7 @@ IDirect3DTexture9* get(const char* type_key, const char* disp_name, bool is_buil
   TexCache& c = g_tex[ck];
   if (c.tried) return c.tex;
   c.tried = true;
-  c.tex = load_png(ref->path);
+  c.tex = load_png(ref->bytes, ref->size);
   return c.tex;
 }
 

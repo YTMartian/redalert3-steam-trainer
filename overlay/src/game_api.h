@@ -151,6 +151,7 @@ void build_lock_sync_disable_superweapon();
 void sync_dispel_shroud();
 // True while 禁用超武 is checked but the flag byte is held off until the match is running.
 bool disable_superweapon_held();
+bool build_lock_world_ready();
 void note_disable_superweapon_toggle(bool enabled);
 
 // Direct money write (no MustCode hook). Works in match / spectator.
@@ -188,6 +189,11 @@ int list_battle_players(BattlePlayer* out, int max_out);
 void set_rank_player(uint32_t player);
 void set_mcv_player(uint32_t player);
 void set_money_player(uint32_t player);
+// 召唤部队：先记下玩家、每种数量和选中的兵种，再由 run_engine("summon_troops") 生成。
+bool summon_prepare(uint32_t player, int count, const char* const* type_ids, int type_count,
+                    std::string* out_msg);
+// 在 EndScene/Present（游戏线程）上把排队的 CreateUnit 做完，避免和模拟线程抢单位。
+void drain_unit_spawns();
 // 该玩家的出场等级。-1 没有这个玩家，-2 还没读到升级数据。0..3 为等级。
 int player_spawn_rank(uint32_t player);
 bool set_spawn_rank(int level, std::string* out_msg);
