@@ -88,6 +88,7 @@ static const UnitNameEntry kUnitNamesZh[] = {
     {"JapanAntiVehicleVehicleTech1_Naval", u8"海啸坦克"},
     {"JapanAntiAirVehicleTech1", u8"打击者-VX"},
     {"JapanAntiVehicleVehicle", u8"鬼王"},
+    {"JapanMechaKing", u8"将军刽子手"},
     {"JapanAntiStructureVehicle", u8"波能坦克"},
     {"JapanAntiShipAircraft", u8"天狗战机"},
     {"JapanFinalSquadronAircraft", u8"斩首中队"},
@@ -164,6 +165,8 @@ static const UnitNameEntry kUnitNamesZh[] = {
     {"JapanWallHub", u8"围墙"},
     {"JapanTechStructure", u8"纳米科技电脑主机"},
     {"JapanPsionicDecimator", u8"超能波毁灭装置"},
+    {"JapanSuperWeapon", u8"纳米虫群巢穴"},
+    {"JAPANSUPERWEAPON", u8"纳米虫群巢穴"},
     {"JapanSuperWeaponAdvanced", u8"超能波毁灭装置"},
     {"JapanNanotechMainframe", u8"纳米主机"},
 

@@ -699,7 +699,7 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
     draw_trend_chart(u8"本局", trend_for(p.player));
   }
 
-  if (p.roster_count > 0 || p.unit_total || p.building_total) {
+  if (p.roster_count > 0 || p.unit_total || p.building_total || p.protocol_count > 0) {
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
@@ -796,6 +796,59 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
         p.is_local ? IM_COL32(180, 140, 40, 140) : IM_COL32(90, 150, 220, 140);
     draw_roster_section(u8"部队", false, unit_accent);
     draw_roster_section(u8"建筑", true, bld_accent);
+    if (p.protocol_count > 0) {
+      ImGui::TextColored(ImVec4(0.70f, 0.78f, 0.90f, 1.f), u8"协议");
+      ImGui::SameLine();
+      ImGui::TextDisabled("%d", p.protocol_count);
+      ImGui::Dummy(ImVec2(0.f, 2.f));
+      const float avail = ImGui::GetContentRegionAvail().x;
+      float used_x = 0.f;
+      bool row_started = false;
+      const ImU32 proto_accent = IM_COL32(120, 196, 168, 160);
+      for (int i = 0; i < p.protocol_count; ++i) {
+        const auto& pr = p.protocols[i];
+        if (row_started && used_x + cell_w + gap > avail) {
+          ImGui::Dummy(ImVec2(0.f, 2.f));
+          used_x = 0.f;
+          row_started = false;
+        }
+        if (row_started) ImGui::SameLine(0.f, gap);
+        ImGui::PushID(pr.key[0] ? pr.key : pr.name);
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        const ImVec2 chip1(p0.x + cell_w, p0.y + cell_h);
+        draw->AddRectFilled(p0, chip1, IM_COL32(12, 22, 20, 180), 6.f);
+        draw->AddRect(p0, chip1, proto_accent, 6.f, 0, 1.0f);
+        IDirect3DTexture9* tex = unit_icons::get(pr.key, pr.name, false);
+        ImGui::SetCursorScreenPos(ImVec2(p0.x + 2.f, p0.y + 2.f));
+        if (tex) ImGui::Image((ImTextureID)tex, ImVec2(icon_sz, icon_sz));
+        else ImGui::Dummy(ImVec2(icon_sz, icon_sz));
+        if (ImGui::IsMouseHoveringRect(p0, chip1)) {
+          ImGui::BeginTooltip();
+          ImGui::TextUnformatted(pr.name[0] ? pr.name : pr.key);
+          if (pr.remain_sec > 0) ImGui::TextDisabled(u8"剩余 %d 秒", pr.remain_sec);
+          else ImGui::TextDisabled(u8"就绪");
+          ImGui::EndTooltip();
+        }
+        if (pr.remain_sec > 0) {
+          char clk[16];
+          if (pr.remain_sec < 60) std::snprintf(clk, sizeof(clk), "%ds", pr.remain_sec);
+          else std::snprintf(clk, sizeof(clk), "%d:%02d", pr.remain_sec / 60, pr.remain_sec % 60);
+          const ImVec2 cts = ImGui::CalcTextSize(clk);
+          const float bx1 = chip1.x - 2.f;
+          const float by1 = chip1.y - 2.f;
+          const float bx0 = bx1 - cts.x - 6.f;
+          const float by0 = by1 - cts.y - 2.f;
+          draw->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), IM_COL32(8, 10, 14, 230), 4.f);
+          draw->AddText(ImVec2(bx0 + 3.f, by0 + 1.f), IM_COL32(255, 214, 120, 255), clk);
+        }
+        ImGui::SetCursorScreenPos(ImVec2(p0.x + cell_w, p0.y));
+        ImGui::Dummy(ImVec2(0.1f, cell_h));
+        ImGui::PopID();
+        used_x += cell_w + gap;
+        row_started = true;
+      }
+      ImGui::Spacing();
+    }
   }
 
   ImGui::EndChild();
@@ -1017,6 +1070,79 @@ void draw_compact_player(const game_api::PlayerEconomy& p, int index) {
 
   draw_compact_icon_row(p, false, p.defeated);
   draw_compact_icon_row(p, true, p.defeated);
+  if (p.protocol_count > 0) {
+    const float icon_sz = 34.f;
+    const float cell = 38.f;
+    const float gap = 4.f;
+    const float label_w = 62.f;
+    if (ImGui::GetCursorPos().x > ImGui::GetWindowContentRegionMin().x + 2.f) ImGui::NewLine();
+    const float avail = ImGui::GetContentRegionAvail().x;
+    ImDrawList* pdraw = ImGui::GetWindowDrawList();
+    const ImVec2 row0 = ImGui::GetCursorScreenPos();
+    char head[32];
+    std::snprintf(head, sizeof(head), u8"协议 %d", p.protocol_count);
+    const ImVec2 ts = ImGui::CalcTextSize(head);
+    pdraw->AddText(ImVec2(row0.x, row0.y + (cell - ts.y) * 0.5f), IM_COL32(150, 214, 186, 255),
+                   head);
+    const float icons_x = row0.x + label_w;
+    const float wrap_w = (std::max)(cell, avail - label_w);
+    ImGui::SetCursorScreenPos(ImVec2(icons_x, row0.y));
+    float used_x = 0.f;
+    bool row_started = false;
+    const ImU32 border = IM_COL32(96, 186, 156, 190);
+    for (int i = 0; i < p.protocol_count; ++i) {
+      const auto& pr = p.protocols[i];
+      if (row_started && used_x + cell > wrap_w) {
+        ImGui::NewLine();
+        ImGui::SetCursorScreenPos(ImVec2(icons_x, ImGui::GetCursorScreenPos().y));
+        used_x = 0.f;
+        row_started = false;
+      }
+      if (row_started) ImGui::SameLine(0.f, gap);
+      ImGui::PushID(pr.key[0] ? pr.key : pr.name);
+      const ImVec2 p0 = ImGui::GetCursorScreenPos();
+      const ImVec2 chip1(p0.x + cell, p0.y + cell);
+      pdraw->AddRectFilled(p0, chip1, IM_COL32(14, 28, 24, 210), 4.f);
+      pdraw->AddRect(p0, chip1, border, 4.f, 0, 1.0f);
+      const float inset = (cell - icon_sz) * 0.5f;
+      ImGui::SetCursorScreenPos(ImVec2(p0.x + inset, p0.y + inset));
+      IDirect3DTexture9* tex = unit_icons::get(pr.key, pr.name, false);
+      const ImVec4 tint = p.defeated ? ImVec4(0.62f, 0.62f, 0.62f, 0.80f) : ImVec4(1, 1, 1, 1);
+      if (tex) {
+        ImGui::ImageWithBg((ImTextureID)tex, ImVec2(icon_sz, icon_sz), ImVec2(0, 0), ImVec2(1, 1),
+                           ImVec4(0, 0, 0, 0), tint);
+      } else {
+        ImGui::Dummy(ImVec2(icon_sz, icon_sz));
+      }
+      if (ImGui::IsMouseHoveringRect(p0, chip1)) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted(pr.name[0] ? pr.name : pr.key);
+        if (pr.remain_sec > 0) ImGui::TextDisabled(u8"剩余 %d 秒", pr.remain_sec);
+        else ImGui::TextDisabled(u8"就绪");
+        ImGui::EndTooltip();
+      }
+      if (pr.remain_sec > 0) {
+        char clk[16];
+        if (pr.remain_sec < 60) std::snprintf(clk, sizeof(clk), "%ds", pr.remain_sec);
+        else std::snprintf(clk, sizeof(clk), "%d:%02d", pr.remain_sec / 60, pr.remain_sec % 60);
+        ImFont* font = ImGui::GetFont();
+        const float csz = (std::max)(10.f, ImGui::GetFontSize() * 0.72f);
+        const ImVec2 cts = font->CalcTextSizeA(csz, FLT_MAX, 0.f, clk);
+        const float bx1 = chip1.x - 1.f;
+        const float by1 = chip1.y - 1.f;
+        const float bx0 = bx1 - cts.x - 5.f;
+        const float by0 = by1 - cts.y - 1.f;
+        pdraw->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), IM_COL32(8, 10, 14, 230), 3.f);
+        pdraw->AddText(font, csz, ImVec2(bx0 + 2.5f, by0), IM_COL32(255, 214, 120, 255), clk);
+      }
+      ImGui::SetCursorScreenPos(ImVec2(p0.x + cell, p0.y));
+      ImGui::Dummy(ImVec2(0.1f, cell));
+      ImGui::PopID();
+      used_x += cell + gap;
+      row_started = true;
+    }
+    ImGui::NewLine();
+  }
 
   ImGui::Dummy(ImVec2(0.f, 1.f));
   ImGui::EndGroup();
@@ -1928,13 +2054,45 @@ static int build_faction_rank_ui(const char* id);
 static const char* build_faction_label(int rank);
 static bool is_visible_rep(const game_api::BuildLockEntry* cat, int count, int index);
 
-static const game_api::BuildLockEntry* summon_lookup(const game_api::BuildLockEntry* cat, int count,
-                                                     const std::string& id) {
-  if (!cat) return nullptr;
-  for (int i = 0; i < count; ++i) {
-    if (id == cat[i].type_id) return &cat[i];
+struct SummonExtra {
+  const char* id;
+  const char* name;
+};
+
+static const SummonExtra kSummonExtra[] = {
+    {"SovietAntiVehicleVehicleTech2", u8"磁暴坦克"},
+};
+
+static bool summon_is_extra(const char* id) {
+  if (!id) return false;
+  for (const auto& e : kSummonExtra) {
+    if (std::strcmp(id, e.id) == 0) return true;
+  }
+  return false;
+}
+
+static const game_api::BuildLockEntry* summon_extra_entry(const std::string& id) {
+  static game_api::BuildLockEntry row;
+  for (const auto& e : kSummonExtra) {
+    if (id != e.id) continue;
+    row = {};
+    std::snprintf(row.type_id, sizeof(row.type_id), "%s", e.id);
+    std::snprintf(row.name, sizeof(row.name), "%s", e.name);
+    std::snprintf(row.icon_id, sizeof(row.icon_id), "%s", e.id);
+    std::snprintf(row.icon_name, sizeof(row.icon_name), "%s", e.name);
+    return &row;
   }
   return nullptr;
+}
+
+static const game_api::BuildLockEntry* summon_lookup(const game_api::BuildLockEntry* cat, int count,
+                                                     const std::string& id) {
+  if (cat) {
+    for (int i = 0; i < count; ++i) {
+      if (id == cat[i].type_id) return &cat[i];
+    }
+  }
+  return summon_extra_entry(id);
 }
 
 static void draw_summon_candidate_box(const game_api::BuildLockEntry* cat, int count) {
@@ -1995,13 +2153,12 @@ static void draw_summon_unit_icons() {
   int count = 0;
   const game_api::BuildLockEntry* cat = game_api::build_lock_catalog(&count);
   draw_summon_candidate_box(cat, count);
-  if (count <= 0 || !cat) {
-    ImGui::TextWrapped(u8"还没读到部队。进入对局后再打开这一页。");
-    return;
-  }
   constexpr float kIcon = 40.f;
   constexpr float kGap = 4.f;
-  for (int fac = 0; fac < 3; ++fac) {
+  if (count <= 0 || !cat) {
+    ImGui::TextWrapped(u8"还没读到部队。进入对局后再打开这一页。");
+  }
+  for (int fac = 0; fac < 3 && count > 0 && cat; ++fac) {
     ImGui::TextDisabled("%s", build_faction_label(fac));
     const float avail = ImGui::GetContentRegionAvail().x;
     float used = 0.f;
@@ -2010,6 +2167,7 @@ static void draw_summon_unit_icons() {
     for (int i = 0; i < count; ++i) {
       const auto& e = cat[i];
       if (e.building) continue;
+      if (summon_is_extra(e.type_id)) continue;
       if (build_faction_rank_ui(e.type_id) != fac) continue;
       if (!is_visible_rep(cat, count, i)) continue;
       if (started && used + kIcon + kGap > avail) {
@@ -2031,6 +2189,26 @@ static void draw_summon_unit_icons() {
     if (!any) ImGui::TextDisabled(u8"—");
     ImGui::Spacing();
   }
+  ImGui::TextDisabled(u8"特殊单位");
+  {
+    const float avail = ImGui::GetContentRegionAvail().x;
+    float used = 0.f;
+    bool started = false;
+    for (int i = 0; i < (int)(sizeof(kSummonExtra) / sizeof(kSummonExtra[0])); ++i) {
+      const auto& extra = kSummonExtra[i];
+      if (started && used + kIcon + kGap > avail) {
+        used = 0.f;
+        started = false;
+      }
+      if (started) ImGui::SameLine(0.f, kGap);
+      ImGui::PushID(i + 50000);
+      if (draw_summon_icon(extra.name, extra.id, extra.name, false)) summon_add(extra.id);
+      ImGui::PopID();
+      used += kIcon + kGap;
+      started = true;
+    }
+  }
+  ImGui::Spacing();
 }
 
 static uint32_t draw_player_picker(const char* scope, uint32_t* selected) {

@@ -248,6 +248,7 @@ void render_overlay(IDirect3DDevice9* device) {
     return;
   }
   game_api::build_lock_tick();
+  game_api::refresh_power_cooldowns();
   game_api::sync_dispel_shroud();
   // Avoid touching D3D/ImGui during load screens when overlay is closed.
   if (!ui::overlay_visible() && g_ui_ready) {

@@ -74,7 +74,7 @@ void add_packed_png(const std::string& rel, const unsigned char* bytes, unsigned
   } else if (faction == u8"苏联" || faction == u8"盟军" || faction == u8"帝国") {
     if (nparts < 3) return;
     if (parts[1] == u8"建筑") building = true;
-    else if (parts[1] == u8"单位") building = false;
+    else if (parts[1] == u8"单位" || parts[1] == u8"协议") building = false;
     else return;
   } else {
     return;
@@ -224,11 +224,15 @@ const char* alias_image_name(const char* type_key, const char* disp) {
         {"JapanTechStructure", u8"纳米主机"},
         {"JapanNanotechMainframe", u8"纳米主机"},
         {"JapanPsionicDecimator", u8"超能波毁灭装置"},
+        {"JapanSuperWeapon", u8"纳米虫群巢穴"},
+        {"JAPANSUPERWEAPON", u8"纳米虫群巢穴"},
         {"JapanSuperWeaponAdvanced", u8"超能波毁灭装置"},
         {"JAPANSUPERWEAPONADVANCED", u8"超能波毁灭装置"},
         {"JapanLightTransportVehicle", u8"迅雷运输艇"},
         {"JapanNavyScoutShip", u8"长枪迷你潜艇"},
         {"JapanAntiVehicleVehicle", u8"鬼王"},
+        {"JapanMechaKing", u8"将军刽子手"},
+        {"SovietAntiVehicleVehicleTech2", u8"磁暴坦克"},
         {"JapanBaseDefenseAdv", u8"波能塔"},
         {"JapanOutpost", u8"纳米核心（通用）"},
         // Neutral / tech map props → 中立单位建筑/
@@ -280,6 +284,8 @@ const char* alias_image_name(const char* type_key, const char* disp) {
         {u8"瞬息发电机", u8"瞬息发电厂"},
         {u8"波能坦克", u8"波能炮"},
         {u8"纳米科技电脑主机", u8"纳米主机"},
+        {u8"奈米蟲群巢穴", u8"纳米虫群巢穴"},
+        {u8"奈米虫群巢穴", u8"纳米虫群巢穴"},
         {u8"心灵毁灭者", u8"超能波毁灭装置"},
         {u8"超能波毀滅裝置", u8"超能波毁灭装置"},
         {u8"质子碰撞器", u8"质子撞击炮"},
@@ -341,6 +347,7 @@ const char* alias_image_name(const char* type_key, const char* disp) {
         {u8"四矿脉", u8"矿脉"},
         {u8"探矿车", u8"勘探者"},
         {u8"探礦車", u8"勘探者"},
+        {u8"磁爆坦克", u8"磁暴坦克"},
     };
     for (const auto& p : kDisp) {
       if (std::strcmp(disp, p.from) == 0) return p.to;
@@ -441,10 +448,12 @@ const FileRef* pick_file(const char* type_key, const char* disp, bool building) 
   auto score = [&](const FileRef& f) -> int {
     const bool is_neutral =
         (f.faction == u8"中立单位建筑" || f.faction == u8"战役建筑");
-    // Known faction → only own folder (or neutral). Never steal another faction's art.
-    if (faction[0] && f.faction != faction && !is_neutral) return -1;
+    const bool is_special = (f.faction == u8"特殊单位");
+    // Known faction → own folder, neutral, or the special-unit folder.
+    if (faction[0] && f.faction != faction && !is_neutral && !is_special) return -1;
     int s = 0;
     if (faction[0] && f.faction == faction) s += 100;
+    if (is_special) s += 70;
     if (is_neutral) {
       if (want_neutral) s += 90;
       else s += 15;  // weak fallback only when own-faction art missing

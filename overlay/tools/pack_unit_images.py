@@ -25,12 +25,26 @@ def main():
     for dirpath, dirnames, filenames in os.walk(src):
         dirnames.sort()
         for name in sorted(filenames):
-            if not name.lower().endswith('.png'):
+            lower = name.lower()
+            if not (lower.endswith('.png') or lower.endswith('.webp')):
                 continue
             full = os.path.join(dirpath, name)
             rel = os.path.relpath(full, src).replace('\\', '/')
-            with open(full, 'rb') as handle:
-                data = handle.read()
+            if lower.endswith('.webp'):
+                try:
+                    import io
+                    from PIL import Image
+                    image = Image.open(full).convert('RGBA')
+                    buf = io.BytesIO()
+                    image.save(buf, format='PNG')
+                    data = buf.getvalue()
+                except Exception as exc:
+                    print('skip %s (%s)' % (rel, exc))
+                    continue
+                rel = rel[:-5] + '.png'
+            else:
+                with open(full, 'rb') as handle:
+                    data = handle.read()
             entries.append((rel.encode('utf-8'), data))
 
     blob = bytearray()

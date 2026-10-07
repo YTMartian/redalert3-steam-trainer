@@ -21,6 +21,13 @@ extern "C" void* g_ra3_pool_resume = nullptr;
 extern "C" void* g_ra3_pool_hdr = nullptr;
 extern "C" void* g_ra3_free_resume = nullptr;
 extern "C" void* g_ra3_free_skip = nullptr;
+extern "C" void* g_ai_power_resume = nullptr;
+extern "C" void* g_ai_power_miss = nullptr;
+extern "C" void* g_ai_child_resume = nullptr;
+extern "C" void* g_ai_child_skip = nullptr;
+extern "C" uint32_t g_player_list_global = 0;
+extern "C" void* g_script_player_resume = nullptr;
+extern "C" void* g_script_player_miss = nullptr;
 
 struct PoolFb {
   uint32_t user;
@@ -122,6 +129,99 @@ extern "C" void __declspec(naked) ra3_pool_free_stub() {
     jmp dword ptr [g_ra3_free_resume]
   pool_free_skip:
     jmp dword ptr [g_ra3_free_skip]
+  }
+}
+
+// AISpecialPowerHeuristic (0x8C0A52) looks up a named power object and then
+// reads [NULL+4] when the campaign has not spawned it. Skip that bind, and
+// skip the follow-up call when the child pointer is still empty.
+extern "C" void __declspec(naked) ra3_ai_power_stub() {
+  __asm {
+    test eax, eax
+    jz ai_power_miss
+    mov edx, dword ptr [eax + 4]
+    test edx, edx
+    jz ai_power_miss
+    mov eax, dword ptr [edx + 18h]
+    test eax, eax
+    jz ai_power_miss
+    jmp dword ptr [g_ai_power_resume]
+  ai_power_miss:
+    jmp dword ptr [g_ai_power_miss]
+  }
+}
+
+extern "C" void __declspec(naked) ra3_ai_child_stub() {
+  __asm {
+    mov ecx, dword ptr [edi + 10h]
+    test ecx, ecx
+    jz ai_child_skip
+    mov eax, dword ptr [ecx]
+    test eax, eax
+    jz ai_child_skip
+    jmp dword ptr [g_ai_child_resume]
+  ai_child_skip:
+    jmp dword ptr [g_ai_child_skip]
+  }
+}
+
+// 0x892DCB indexes PlayerList with a slot taken from a script. After a skirmish
+// the global still points at freed memory, so the read AVs. Return 0 and let
+// the caller take its existing failure path.
+extern "C" uint32_t ra3_safe_player_slot(uint32_t index) {
+  if (!g_player_list_global) return 0;
+  __try {
+    const uint32_t list = *reinterpret_cast<uint32_t*>(g_player_list_global);
+    if (list < 0x10000u || (list & 3u)) return 0;
+    const uint32_t count = *reinterpret_cast<uint32_t*>(list + 0x2C);
+    if (count == 0 || count > 0x14u || index >= count) return 0;
+    const uint32_t player = *reinterpret_cast<uint32_t*>(list + 0x30u + index * 4u);
+    if (player < 0x10000u || (player & 3u)) return 0;
+    return player;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return 0;
+  }
+}
+
+extern "C" void __declspec(naked) ra3_script_player_stub() {
+  __asm {
+    mov eax, dword ptr [esp + 18h]
+    push eax
+    call ra3_safe_player_slot
+    add esp, 4
+    mov edi, eax
+    test edi, edi
+    jz script_player_miss
+    jmp dword ptr [g_script_player_resume]
+  script_player_miss:
+    jmp dword ptr [g_script_player_miss]
+  }
+}
+
+extern "C" void* g_slot_resume_db = nullptr;
+extern "C" void* g_slot_resume_e4 = nullptr;
+
+// These two script updates only need the player pointer. If the list was
+// freed when the skirmish ended, store a null player and keep going.
+extern "C" void __declspec(naked) ra3_slot_edx_1c() {
+  __asm {
+    mov eax, dword ptr [esp + 1Ch]
+    push eax
+    call ra3_safe_player_slot
+    add esp, 4
+    mov edx, eax
+    jmp dword ptr [g_slot_resume_db]
+  }
+}
+
+extern "C" void __declspec(naked) ra3_slot_edx_0c() {
+  __asm {
+    mov eax, dword ptr [esp + 0Ch]
+    push eax
+    call ra3_safe_player_slot
+    add esp, 4
+    mov edx, eax
+    jmp dword ptr [g_slot_resume_e4]
   }
 }
 
@@ -314,6 +414,109 @@ void install_pool_null_guard() {
   log("pool null guard at %p", site);
 }
 
+void install_ai_power_null_guard() {
+  if (!g_module) return;
+  auto* site = reinterpret_cast<uint8_t*>(g_module + (0x8C0A52u - kModBase));
+  const uint8_t expect[] = {0x8B, 0x50, 0x04, 0x8B, 0x42, 0x18};
+  if (std::memcmp(site, expect, sizeof(expect)) != 0) {
+    log("ai power guard skipped, lookup bytes differ");
+    return;
+  }
+  auto* child = reinterpret_cast<uint8_t*>(g_module + (0x8C0A7Bu - kModBase));
+  const uint8_t child_expect[] = {0x8B, 0x4F, 0x10, 0x8B, 0x01};
+  if (std::memcmp(child, child_expect, sizeof(child_expect)) != 0) {
+    log("ai power guard skipped, child bytes differ");
+    return;
+  }
+  g_ai_power_resume = site + 6;
+  g_ai_power_miss = child;
+  g_ai_child_resume = child + 5;
+  g_ai_child_skip = reinterpret_cast<uint8_t*>(g_module + (0x8C0A86u - kModBase));
+
+  const auto child_stub = reinterpret_cast<uintptr_t>(&ra3_ai_child_stub);
+  const int32_t child_rel = static_cast<int32_t>(child_stub - (reinterpret_cast<uintptr_t>(child) + 5));
+  uint8_t child_patch[5] = {0xE9, 0, 0, 0, 0};
+  std::memcpy(child_patch + 1, &child_rel, 4);
+  if (!write_code(child, child_patch, sizeof(child_patch))) {
+    log("ai power child guard write failed");
+    return;
+  }
+
+  const auto stub = reinterpret_cast<uintptr_t>(&ra3_ai_power_stub);
+  const int32_t rel = static_cast<int32_t>(stub - (reinterpret_cast<uintptr_t>(site) + 5));
+  uint8_t patch[6] = {0xE9, 0, 0, 0, 0, 0x90};
+  std::memcpy(patch + 1, &rel, 4);
+  if (!write_code(site, patch, sizeof(patch))) {
+    log("ai power guard write failed");
+    return;
+  }
+  log("ai power null guard at %p", site);
+}
+
+void install_script_player_guard() {
+  if (!g_module) return;
+  auto* site = reinterpret_cast<uint8_t*>(g_module + (0x892DC1u - kModBase));
+  const uint8_t expect[] = {0x8B, 0x44, 0x24, 0x18, 0x8B, 0x0D, 0x2C, 0xDE,
+                            0xCE, 0x00, 0x8B, 0x7C, 0x81, 0x30};
+  if (std::memcmp(site, expect, sizeof(expect)) != 0) {
+    log("script player guard skipped, bytes differ");
+    return;
+  }
+  g_player_list_global = g_module + (0xCEDE2Cu - kModBase);
+  g_script_player_resume = site + sizeof(expect);
+  g_script_player_miss = reinterpret_cast<uint8_t*>(g_module + (0x892E16u - kModBase));
+
+  const auto stub = reinterpret_cast<uintptr_t>(&ra3_script_player_stub);
+  const int32_t rel = static_cast<int32_t>(stub - (reinterpret_cast<uintptr_t>(site) + 5));
+  uint8_t patch[sizeof(expect)];
+  std::memset(patch, 0x90, sizeof(patch));
+  patch[0] = 0xE9;
+  std::memcpy(patch + 1, &rel, 4);
+  if (!write_code(site, patch, sizeof(patch))) {
+    log("script player guard write failed");
+    return;
+  }
+  log("script player guard at %p", site);
+}
+
+void install_player_list_read_guard() {
+  if (!g_module) return;
+  if (!g_player_list_global) g_player_list_global = g_module + (0xCEDE2Cu - kModBase);
+  struct Site {
+    uint32_t va;
+    uint8_t disp;
+    void* stub;
+    void** resume;
+  };
+  const Site sites[] = {
+      {0x88DB65u, 0x1C, reinterpret_cast<void*>(&ra3_slot_edx_1c), &g_slot_resume_db},
+      {0x88E4BEu, 0x0C, reinterpret_cast<void*>(&ra3_slot_edx_0c), &g_slot_resume_e4},
+  };
+  int patched = 0;
+  for (const Site& s : sites) {
+    auto* site = reinterpret_cast<uint8_t*>(g_module + (s.va - kModBase));
+    const uint8_t expect[] = {0x8B, 0x0D, 0x2C, 0xDE, 0xCE, 0x00, 0x8B, 0x44,
+                              0x24, s.disp, 0x8B, 0x54, 0x81, 0x30};
+    if (std::memcmp(site, expect, sizeof(expect)) != 0) {
+      log("player slot guard skipped at %08X", s.va);
+      continue;
+    }
+    *s.resume = site + sizeof(expect);
+    const auto stub = reinterpret_cast<uintptr_t>(s.stub);
+    const int32_t rel = static_cast<int32_t>(stub - (reinterpret_cast<uintptr_t>(site) + 5));
+    uint8_t patch[sizeof(expect)];
+    std::memset(patch, 0x90, sizeof(patch));
+    patch[0] = 0xE9;
+    std::memcpy(patch + 1, &rel, 4);
+    if (!write_code(site, patch, sizeof(patch))) {
+      log("player slot guard write failed at %08X", s.va);
+      continue;
+    }
+    ++patched;
+  }
+  log("player slot guard sites=%d", patched);
+}
+
 }  // namespace
 
 void install_roster_hooks();
@@ -335,6 +538,9 @@ void init() {
     log("module base 0x%X", g_module);
   }
   install_pool_null_guard();
+  install_ai_power_null_guard();
+  install_script_player_guard();
+  install_player_list_read_guard();
   install_roster_hooks();
 }
 

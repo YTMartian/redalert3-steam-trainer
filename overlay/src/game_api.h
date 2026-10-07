@@ -73,6 +73,13 @@ struct UnitInspect {
 // Power:  [player+0x74]+0x08 used / +0x04 total  (MustCode Power hook fields)
 constexpr int kMaxEconPlayers = 16;
 constexpr int kMaxRosterTypes = 64;
+constexpr int kMaxProtocols = 16;
+
+struct ProtocolStatus {
+  char key[96] = {};
+  char name[64] = {};
+  int remain_sec = 0;
+};
 
 struct RosterType {
   char key[96] = {};   // stable type id (for order / identity)
@@ -112,6 +119,9 @@ struct PlayerEconomy {
   RosterType roster[kMaxRosterTypes] = {};
   // Plain text: "征召兵 5  防空部队 3"
   char roster_text[768] = {};
+  // Protocols and superweapons this seat currently has. remain_sec > 0 is a countdown.
+  int protocol_count = 0;
+  ProtocolStatus protocols[kMaxProtocols] = {};
 };
 
 struct MatchEconomy {
@@ -146,6 +156,8 @@ const BuildLockEntry* build_lock_catalog(int* count);
 bool build_lock_set(const char* type_id, bool locked, std::string* out_msg);
 bool build_lock_selected(bool locked, std::string* out_msg);
 void build_lock_tick();
+// 协议无冷却 / 超级武器：清掉己方超级武器计时表里的每一项（含超能波毁灭装置）。
+void refresh_power_cooldowns();
 void build_lock_sync_disable_superweapon();
 // 消散战争迷雾：未探索格子按观战的方式画成可见，关掉后按原探索结果恢复。
 void sync_dispel_shroud();

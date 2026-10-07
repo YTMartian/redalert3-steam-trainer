@@ -24,6 +24,7 @@ constexpr uint32_t kLocalPlayerRva = 0x8EDE2C;
 constexpr uint32_t kFnAddXp = 0x005173F0;
 constexpr uint32_t kFnDestroy = 0x007DCDF0;
 constexpr uint32_t kFnCreateUnit = 0x006440F0;
+constexpr uint32_t kFnFindTemplate = 0x00822510;
 constexpr uint32_t kFnGetMouseXyz = 0x0062C500;
 
 uint32_t va_of(uint32_t va) { return module_base() + (va - kModBase); }
@@ -144,6 +145,15 @@ static bool safe_read_u32(uint32_t addr, uint32_t* out) {
   if (!out) return false;
   __try {
     *out = *reinterpret_cast<uint32_t*>(addr);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
+static bool safe_write_u32(uint32_t addr, uint32_t v) {
+  __try {
+    *reinterpret_cast<uint32_t*>(addr) = v;
     return true;
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     return false;
@@ -2187,6 +2197,33 @@ static void forget_live_ent(uint32_t ent) {
   if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
 }
 
+static bool key_is_nano_egg(const char* key) {
+  if (!key || !key[0]) return false;
+  for (const char* p = key; p[2]; ++p) {
+    const unsigned char a = (unsigned char)p[0];
+    const unsigned char b = (unsigned char)p[1];
+    const unsigned char c = (unsigned char)p[2];
+    if ((a == 'E' || a == 'e') && (b == 'G' || b == 'g') && (c == 'G' || c == 'g')) return true;
+  }
+  return false;
+}
+
+// An unpacked nanocore keeps the egg id until its template is replaced. Re-read
+// it here, and drop the core once it is dead so the finished weapon is the row.
+static void refresh_core_identity(uint32_t ent, LiveEnt* rec) {
+  if (!rec || !key_is_nano_egg(rec->key)) return;
+  uint32_t unit_data = 0;
+  if (!safe_read_u32(ent + 4, &unit_data) || !is_ptr(unit_data)) return;
+  char type_id[96] = {};
+  if (!resolve_primary_catalog_id(unit_data, type_id, sizeof(type_id))) return;
+  if (std::strcmp(rec->key, type_id) == 0) return;
+  const char* zh = lookup_zh_name(type_id);
+  if (!zh || !zh[0]) return;
+  std::snprintf(rec->key, sizeof(rec->key), "%s", type_id);
+  std::snprintf(rec->name, sizeof(rec->name), "%s", zh);
+  rec->building = type_id_is_building(type_id);
+}
+
 static void publish_live_roster(MatchEconomy* out) {
   if (!out) return;
   uint32_t adds[256];
@@ -2228,6 +2265,11 @@ static void publish_live_roster(MatchEconomy* out) {
   copy.reserve(g_live.size());
   for (auto it = g_live.begin(); it != g_live.end();) {
     if (!looks_like_entity(it->first)) {
+      it = g_live.erase(it);
+      continue;
+    }
+    refresh_core_identity(it->first, &it->second);
+    if (key_is_nano_egg(it->second.key) && !entity_alive(it->first)) {
       it = g_live.erase(it);
       continue;
     }
@@ -2643,6 +2685,565 @@ static void apply_seat_labels(MatchEconomy* out) {
 static uint32_t g_battle_logic = 0;
 static float g_battle_seconds = -1.f;
 
+struct ProtocolFace {
+  const char* id;
+  const char* name;
+};
+
+// Runtime object names are usually PlayerPower*. SpecialPower* is the template id.
+static const ProtocolFace kProtocolFaces[] = {
+    {"AbilityParadrop", u8"一级伞兵空降"},
+    {"PlayerPowerCryoSatelliteLvl1", u8"一级冷冻射击"},
+    {"SpecialPowerCryoSatelliteLvl1", u8"一级冷冻射击"},
+    {"PlayerPowerCryoSatelliteLvl2", u8"二级冷冻射击"},
+    {"SpecialPowerCryoSatelliteLvl2", u8"二级冷冻射击"},
+    {"PlayerPowerCryoSatelliteLvl3", u8"三级冷冻射击"},
+    {"SpecialPowerCryoSatelliteLvl3", u8"三级冷冻射击"},
+    {"PlayerPowerChronoRiftLvl1", u8"一级时空裂缝"},
+    {"SpecialPowerChronoRiftSelectLvl1", u8"一级时空裂缝"},
+    {"SpecialPowerChronoRiftTeleportLvl1", u8"一级时空裂缝"},
+    {"PlayerPowerChronoRiftLvl2", u8"二级时空裂缝"},
+    {"SpecialPowerChronoRiftSelectLvl2", u8"二级时空裂缝"},
+    {"SpecialPowerChronoRiftTeleportLvl2", u8"二级时空裂缝"},
+    {"PlayerPowerChronoRiftLvl3", u8"三级时空裂缝"},
+    {"SpecialPowerChronoRiftSelectLvl3", u8"三级时空裂缝"},
+    {"SpecialPowerChronoRiftTeleportLvl3", u8"三级时空裂缝"},
+    {"PlayerPowerTimeBombLvl1", u8"一级超时空炸弹"},
+    {"SpecialPowerTimeBombLvl1", u8"一级超时空炸弹"},
+    {"PlayerPowerTimeBombLvl2", u8"二级超时空炸弹"},
+    {"SpecialPowerTimeBombLvl2", u8"二级超时空炸弹"},
+    {"PlayerPowerTimeBombLvl3", u8"三级超时空炸弹"},
+    {"SpecialPowerTimeBombLvl3", u8"三级超时空炸弹"},
+    {"PlayerPowerSatelliteSweep", u8"侦查扫描"},
+    {"SpecialPowerSatelliteSweep", u8"侦查扫描"},
+    {"PlayerPowerAirPower", u8"先进航空学"},
+    {"SpecialPowerAirPower", u8"先进航空学"},
+    {"PlayerPowerPrecisionStrike", u8"精准轰炸"},
+    {"SpecialPowerPrecisionStrike", u8"精准轰炸"},
+    {"PlayerPowerAlliedFreeTrade", u8"自由贸易"},
+    {"SpecialPowerAlliedFreeTrade", u8"自由贸易"},
+    {"PlayerPowerChronoSwap", u8"超时空互换"},
+    {"SpecialPowerChronoSwapSelect", u8"超时空互换"},
+    {"SpecialPowerChronoSwapTeleport", u8"超时空互换"},
+    {"PlayerPowerHighTechnology", u8"高科技"},
+    {"SpecialPowerHighTechnology", u8"高科技"},
+    {"PlayerPowerChronosphere", u8"超时空传送仪协议"},
+    {"SpecialPowerChrono_Base", u8"超时空传送仪协议"},
+    {"SpecialPowerChronosphereObjectSelect", u8"超时空传送仪协议"},
+    {"SpecialPowerChronosphereObjectSpawn", u8"超时空传送仪协议"},
+    {"PlayerPowerParticleCannon", u8"质子撞击炮协议"},
+    {"SpecialPowerParticleCannon", u8"质子撞击炮协议"},
+    {"SpecialPowerParticleCannonControlParticleCannon", u8"质子撞击炮协议"},
+    {"SuperweaponTimerParticleCannon", u8"质子撞击炮协议"},
+    {"PlayerPowerDesolatorBomb_Level1", u8"一级毁灭空袭"},
+    {"SpecialPowerDesolatorBomb_Level1", u8"一级毁灭空袭"},
+    {"PlayerPowerDesolatorBomb_Level2", u8"二级毁灭空袭"},
+    {"SpecialPowerDesolatorBomb_Level2", u8"二级毁灭空袭"},
+    {"PlayerPowerDesolatorBomb_Level3", u8"三级毁灭空袭"},
+    {"SpecialPowerDesolatorBomb_Level3", u8"三级毁灭空袭"},
+    {"PlayerPowerMagneticSatelliteLvl1", u8"一级磁力卫星"},
+    {"SpecialPowerMagneticSatelliteLvl1", u8"一级磁力卫星"},
+    {"PlayerPowerMagneticSatelliteLvl2", u8"二级磁力卫星"},
+    {"SpecialPowerMagneticSatelliteLvl2", u8"二级磁力卫星"},
+    {"PlayerPowerMagneticSatelliteLvl3", u8"三级磁力卫星"},
+    {"SpecialPowerMagneticSatelliteLvl3", u8"三级磁力卫星"},
+    {"PlayerPowerOrbitalRefuse_Rank1", u8"一级轨道抛掷"},
+    {"SpecialPowerOrbitalRefuse_Rank1", u8"一级轨道抛掷"},
+    {"PlayerPowerOrbitalRefuse_Rank2", u8"二级轨道抛掷"},
+    {"SpecialPowerOrbitalRefuse_Rank2", u8"二级轨道抛掷"},
+    {"PlayerPowerOrbitalRefuse_Rank3", u8"三级轨道抛掷"},
+    {"SpecialPowerOrbitalRefuse_Rank3", u8"三级轨道抛掷"},
+    {"PlayerPowerTerrorDroneEggs", u8"恐怖机器人奇袭"},
+    {"SpecialPowerTerrorDroneEggs", u8"恐怖机器人奇袭"},
+    {"PlayerPowerSovietMassProduction", u8"大生产"},
+    {"SpecialPowerSovietMassProduction", u8"大生产"},
+    {"PlayerPowerIrradiateTarget", u8"毒质腐蚀"},
+    {"SpecialPower_IrradiateTarget", u8"毒质腐蚀"},
+    {"PlayerPowerIronCurtain", u8"铁幕协议"},
+    {"SpecialPowerIronCurtain", u8"铁幕协议"},
+    {"SuperweaponTimerIronCurtain", u8"铁幕协议"},
+    {"PlayerPowerProductionKickbacks", u8"现金奖励"},
+    {"SpecialPower_ProductionKickbacks", u8"现金奖励"},
+    {"PlayerPowerMagneticSingularity", u8"磁力奇点"},
+    {"SpecialPowerMagneticSingularity", u8"磁力奇点"},
+    {"PlayerPowerCrushPuppies", u8"重机碾压"},
+    {"SpecialPowerCrushPuppies", u8"重机碾压"},
+    {"PlayerPowerVacuumBomb", u8"真空内爆弹协议"},
+    {"SpecialPowerVacuumBomb", u8"真空内爆弹协议"},
+    {"PlayerPowerJapanEmperorsResolve_L1", u8"一级天皇之怒"},
+    {"SpecialPowerJapanEmperorsResolve_L1", u8"一级天皇之怒"},
+    {"PlayerPowerJapanEmperorsResolve_L2", u8"二级天皇之怒"},
+    {"SpecialPowerJapanEmperorsResolve_L2", u8"二级天皇之怒"},
+    {"PlayerPowerJapanEmperorsResolve_L3", u8"三级天皇之怒"},
+    {"SpecialPowerJapanEmperorsResolve_L3", u8"三级天皇之怒"},
+    {"PlayerPowerJapanBalloonAttack_L1", u8"一级气球炸弹"},
+    {"SpecialPowerJapanBalloonAttack_L1", u8"一级气球炸弹"},
+    {"PlayerPowerJapanBalloonAttack_L2", u8"二级气球炸弹"},
+    {"SpecialPowerJapanBalloonAttack_L2", u8"二级气球炸弹"},
+    {"PlayerPowerJapanBalloonAttack_L3", u8"三级气球炸弹"},
+    {"SpecialPowerJapanBalloonAttack_L3", u8"三级气球炸弹"},
+    {"PlayerPowerFinalSquadron_L1", u8"一级决胜中队"},
+    {"SpecialPowerFinalSquadron_L1", u8"一级决胜中队"},
+    {"PlayerPowerFinalSquadron_L2", u8"二级决胜中队"},
+    {"SpecialPowerFinalSquadron_L2", u8"二级决胜中队"},
+    {"PlayerPowerFinalSquadron_L3", u8"三级决胜中队"},
+    {"SpecialPowerFinalSquadron_L3", u8"三级决胜中队"},
+    {"PlayerPowerJapanNavalPower", u8"强化舰队"},
+    {"SpecialPowerJapanNavalPower", u8"强化舰队"},
+    {"PlayerPowerJapanEnhancedKamikaze", u8"光荣自爆"},
+    {"SpecialPowerJapanEnhancedKamikaze", u8"光荣自爆"},
+    {"PlayerPowerJapanAdvancedMissilePacks", u8"先进导弹匣"},
+    {"SpecialPowerJapanAdvancedMissilePacks", u8"先进导弹匣"},
+    {"PlayerPowerJapanAmbush", u8"惊骇伏击"},
+    {"SpecialPowerJapanAmbush", u8"惊骇伏击"},
+    {"PlayerPowerJapanRoboticAssembly", u8"机械化组装"},
+    {"SpecialPowerJapanRoboticAssembly", u8"机械化组装"},
+    {"PlayerPowerPointDefenseDrones", u8"点防御无人机"},
+    {"SpecialPower_PointDefenseDrones", u8"点防御无人机"},
+    {"PlayerPowerNanoSwarmHive", u8"纳米虫群协议"},
+    {"SpecialPowerNanoSwarmHive", u8"纳米虫群协议"},
+    {"PlayerPowerTelekineticProjectorDevice", u8"超能波毁灭装置协议"},
+    {"SpecialPowerTelekineticProjectorDevice", u8"超能波毁灭装置协议"},
+    {"PsyonicBlastSpecialPower", u8"超能波毁灭装置协议"},
+    {"SpecialPower_PsyonicBlast", u8"超能波毁灭装置协议"},
+    // Sidebar / science ids. These are the names stored on the player, not the template ids above.
+    {"PlayerPower_AdvMissilePacks", u8"先进导弹匣"},
+    {"PlayerPower_AirPower", u8"先进航空学"},
+    {"PlayerPower_Ambush", u8"惊骇伏击"},
+    {"PlayerPower_BalloonAttack1", u8"一级气球炸弹"},
+    {"PlayerPower_BalloonAttack2", u8"二级气球炸弹"},
+    {"PlayerPower_BalloonAttack3", u8"三级气球炸弹"},
+    {"PlayerPower_ChronoRift1", u8"一级时空裂缝"},
+    {"PlayerPower_ChronoRift2", u8"二级时空裂缝"},
+    {"PlayerPower_ChronoRift3", u8"三级时空裂缝"},
+    {"PlayerPower_ChronoSwap", u8"超时空互换"},
+    {"PlayerPower_Chronosphere", u8"超时空传送仪协议"},
+    {"PlayerPower_CrushPuppies", u8"重机碾压"},
+    {"PlayerPower_CryoSatellite1", u8"一级冷冻射击"},
+    {"PlayerPower_CryoSatellite2", u8"二级冷冻射击"},
+    {"PlayerPower_CryoSatellite3", u8"三级冷冻射击"},
+    {"PlayerPower_DesolatorBomb1", u8"一级毁灭空袭"},
+    {"PlayerPower_DesolatorBomb2", u8"二级毁灭空袭"},
+    {"PlayerPower_DesolatorBomb3", u8"三级毁灭空袭"},
+    {"PlayerPower_EmperorRage1", u8"一级天皇之怒"},
+    {"PlayerPower_EmperorRage2", u8"二级天皇之怒"},
+    {"PlayerPower_EmperorRage3", u8"三级天皇之怒"},
+    {"PlayerPower_EnhancedKamikaze", u8"光荣自爆"},
+    {"PlayerPower_FinalSquadron1", u8"一级决胜中队"},
+    {"PlayerPower_FinalSquadron2", u8"二级决胜中队"},
+    {"PlayerPower_FinalSquadron3", u8"三级决胜中队"},
+    {"PlayerPower_FreeTrade", u8"自由贸易"},
+    {"PlayerPower_HighTechnology", u8"高科技"},
+    {"PlayerPower_IronCurtain", u8"铁幕协议"},
+    {"PlayerPower_IrradiateTarget", u8"毒质腐蚀"},
+    {"PlayerPower_MagneticSatellite1", u8"一级磁力卫星"},
+    {"PlayerPower_MagneticSatellite2", u8"二级磁力卫星"},
+    {"PlayerPower_MagneticSatellite3", u8"三级磁力卫星"},
+    {"PlayerPower_MagneticSingularity", u8"磁力奇点"},
+    {"PlayerPower_MassProduction", u8"大生产"},
+    {"PlayerPower_Nanoswarm", u8"纳米虫群协议"},
+    {"PlayerPower_NavalPower", u8"强化舰队"},
+    {"PlayerPower_OrbitalRefuse1", u8"一级轨道抛掷"},
+    {"PlayerPower_OrbitalRefuse2", u8"二级轨道抛掷"},
+    {"PlayerPower_OrbitalRefuse3", u8"三级轨道抛掷"},
+    {"PlayerPower_Paradrop1", u8"一级伞兵空降"},
+    {"PlayerPower_Paradrop2", u8"二级伞兵空降"},
+    {"PlayerPower_Paradrop3", u8"三级伞兵空降"},
+    {"PlayerPower_ParticleCannon", u8"质子撞击炮协议"},
+    {"PlayerPower_PointDefenseDrones", u8"点防御无人机"},
+    {"PlayerPower_PrecisionStrike", u8"精准轰炸"},
+    {"PlayerPower_ProductionKickback", u8"现金奖励"},
+    {"PlayerPower_RoboticAssembly", u8"机械化组装"},
+    {"PlayerPower_SatelliteSweep", u8"侦查扫描"},
+    {"PlayerPower_TerrorDroneEggs", u8"恐怖机器人奇袭"},
+    {"PlayerPower_TimeBomb1", u8"一级超时空炸弹"},
+    {"PlayerPower_TimeBomb2", u8"二级超时空炸弹"},
+    {"PlayerPower_TimeBomb3", u8"三级超时空炸弹"},
+    {"PlayerPower_VacuumBomb", u8"真空内爆弹协议"},
+};
+
+static const ProtocolFace* match_protocol_text(const char* s) {
+  if (!s || !s[0]) return nullptr;
+  for (const ProtocolFace& face : kProtocolFaces) {
+    if (std::strcmp(s, face.id) == 0) return &face;
+  }
+  // Button art ids are Button_PlayerPower_CryoSatellite1 and the same tail is the science id.
+  if (std::strncmp(s, "Button_", 7) == 0) {
+    for (const ProtocolFace& face : kProtocolFaces) {
+      if (std::strcmp(s + 7, face.id) == 0) return &face;
+    }
+  }
+  return nullptr;
+}
+
+static const ProtocolFace* protocol_at_cstr(uint32_t addr) {
+  char buf[96] = {};
+  if (!safe_read_bytes(addr, buf, sizeof(buf) - 1)) return nullptr;
+  buf[sizeof(buf) - 1] = 0;
+  size_t n = 0;
+  while (n < 80 && buf[n]) {
+    const unsigned char c = (unsigned char)buf[n];
+    const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9') || c == '_';
+    if (!ok) return nullptr;
+    ++n;
+  }
+  if (n < 8 || buf[n] != 0) return nullptr;
+  return match_protocol_text(buf);
+}
+
+static const ProtocolFace* protocol_from_object(uint32_t obj) {
+  if (!is_ptr(obj)) return nullptr;
+  const ProtocolFace* hit = protocol_at_cstr(obj);
+  if (hit) return hit;
+  for (uint32_t off = 0; off <= 0x180; off += 4) {
+    hit = protocol_at_cstr(obj + off);
+    if (hit) return hit;
+    uint32_t p = 0;
+    if (!safe_read_u32(obj + off, &p) || !is_ptr(p)) continue;
+    hit = protocol_at_cstr(p);
+    if (hit) return hit;
+    uint32_t p2 = 0;
+    if (safe_read_u32(p, &p2) && is_ptr(p2)) {
+      hit = protocol_at_cstr(p2);
+      if (hit) return hit;
+    }
+    if (safe_read_u32(p + 4, &p2) && is_ptr(p2)) {
+      hit = protocol_at_cstr(p2);
+      if (hit) return hit;
+    }
+  }
+  return nullptr;
+}
+
+static int protocol_remain_sec(uint32_t ready, uint32_t now, uint32_t dur) {
+  if (ready <= now) return 0;
+  const uint32_t left = ready - now;
+  if (left > 15u * 900u) return 0;
+  if (dur >= 15 && dur <= 15u * 900u && left > dur + 15u * 8u) return 0;
+  int sec = (int)((left + 14u) / 15u);
+  if (sec < 1) sec = 1;
+  return sec;
+}
+
+static void note_protocol(PlayerEconomy* pe, const ProtocolFace* face, int remain) {
+  if (!pe || !face) return;
+  for (int i = 0; i < pe->protocol_count; ++i) {
+    if (std::strcmp(pe->protocols[i].name, face->name) == 0) {
+      if (remain > pe->protocols[i].remain_sec) pe->protocols[i].remain_sec = remain;
+      return;
+    }
+  }
+  if (pe->protocol_count >= kMaxProtocols) return;
+  ProtocolStatus& row = pe->protocols[pe->protocol_count++];
+  std::snprintf(row.key, sizeof(row.key), "%s", face->id);
+  std::snprintf(row.name, sizeof(row.name), "%s", face->name);
+  row.remain_sec = remain;
+}
+
+// Special-power templates keep the interned name at [[[obj+8]]+4].
+static const ProtocolFace* face_from_name_chain(uint32_t obj) {
+  if (!is_ptr(obj)) return nullptr;
+  uint32_t a = 0, b = 0, s = 0;
+  if (safe_read_u32(obj + 8, &a) && is_ptr(a) && safe_read_u32(a, &b) && is_ptr(b) &&
+      safe_read_u32(b + 4, &s) && is_ptr(s)) {
+    if (const ProtocolFace* face = protocol_at_cstr(s)) return face;
+  }
+  if (safe_read_u32(obj, &a) && is_ptr(a)) {
+    if (safe_read_u32(a + 4, &s) && is_ptr(s)) {
+      if (const ProtocolFace* face = protocol_at_cstr(s)) return face;
+    }
+    if (safe_read_u32(a, &b) && is_ptr(b) && safe_read_u32(b + 4, &s) && is_ptr(s)) {
+      if (const ProtocolFace* face = protocol_at_cstr(s)) return face;
+    }
+  }
+  return nullptr;
+}
+
+static const ProtocolFace* face_from_ptr(uint32_t obj) {
+  if (!is_ptr(obj)) return nullptr;
+  if (const ProtocolFace* face = protocol_at_cstr(obj)) return face;
+  if (const ProtocolFace* face = face_from_name_chain(obj)) return face;
+  if (const ProtocolFace* face = protocol_from_object(obj)) return face;
+  uint32_t inner = 0;
+  if (safe_read_u32(obj + 4, &inner) && is_ptr(inner) && inner != obj) {
+    if (const ProtocolFace* face = protocol_at_cstr(inner)) return face;
+    if (const ProtocolFace* face = face_from_name_chain(inner)) return face;
+    if (const ProtocolFace* face = protocol_from_object(inner)) return face;
+  }
+  return nullptr;
+}
+
+// The player bag stores [template+0xDC], and command slots store the interned
+// key that logic+0xBC maps back to that template. Neither value is the template
+// pointer, so the name has to be recovered from the factory first.
+struct ProtoKey {
+  uint32_t key = 0;
+  const ProtocolFace* face = nullptr;
+};
+static ProtoKey g_proto_keys[640];
+static int g_proto_key_n = 0;
+static uint32_t g_proto_factory = 0;
+static DWORD g_proto_try_at = 0;
+
+static void remember_proto_key(uint32_t key, const ProtocolFace* face) {
+  if (key == 0 || !face) return;
+  for (int i = 0; i < g_proto_key_n; ++i) {
+    if (g_proto_keys[i].key != key) continue;
+    if (g_proto_keys[i].face && std::strcmp(g_proto_keys[i].face->name, face->name) != 0) {
+      g_proto_keys[i].face = nullptr;
+    }
+    return;
+  }
+  if (g_proto_key_n >= 640) return;
+  g_proto_keys[g_proto_key_n].key = key;
+  g_proto_keys[g_proto_key_n].face = face;
+  ++g_proto_key_n;
+}
+
+static const ProtocolFace* face_from_proto_key(uint32_t key) {
+  if (key == 0) return nullptr;
+  for (int i = 0; i < g_proto_key_n; ++i) {
+    if (g_proto_keys[i].key == key) return g_proto_keys[i].face;
+  }
+  return nullptr;
+}
+
+static bool buf_is_protocol_prefix(const char* buf) {
+  return std::memcmp(buf, "PlayerPower", 11) == 0 || std::memcmp(buf, "SpecialPower", 12) == 0 ||
+         std::memcmp(buf, "Superweapon", 11) == 0 || std::memcmp(buf, "AbilityParadrop", 15) == 0 ||
+         std::memcmp(buf, "PsyonicBlast", 12) == 0;
+}
+
+static bool template_might_be_protocol(uint32_t tmpl) {
+  char buf[20] = {};
+  auto hit_at = [&](uint32_t addr) {
+    if (!safe_read_bytes(addr, buf, 16)) return false;
+    buf[16] = 0;
+    return buf_is_protocol_prefix(buf);
+  };
+  for (uint32_t off = 0; off <= 0x80; off += 4) {
+    if (hit_at(tmpl + off)) return true;
+    uint32_t p = 0;
+    if (!safe_read_u32(tmpl + off, &p) || !is_ptr(p)) continue;
+    if (hit_at(p)) return true;
+    uint32_t p2 = 0;
+    if (safe_read_u32(p + 4, &p2) && is_ptr(p2) && hit_at(p2)) return true;
+  }
+  uint32_t a = 0, b = 0, s = 0;
+  if (safe_read_u32(tmpl + 8, &a) && is_ptr(a) && safe_read_u32(a, &b) && is_ptr(b) &&
+      safe_read_u32(b + 4, &s) && is_ptr(s) && hit_at(s)) {
+    return true;
+  }
+  return false;
+}
+
+static void rebuild_protocol_keys() {
+  g_proto_key_n = 0;
+  g_proto_factory = 0;
+  if (!module_base()) return;
+  uint32_t factory = 0;
+  if (!safe_read_u32(module_base() + 0x008EBDE8, &factory) || !is_ptr(factory)) return;
+  g_proto_factory = factory;
+  uint32_t tmpl = 0;
+  if (safe_read_u32(factory + 0x24, &tmpl)) {
+    for (int n = 0; n < 8192 && is_ptr(tmpl); ++n) {
+      uint32_t vt = 0;
+      if (!safe_read_u32(tmpl, &vt) || !is_ptr(vt)) break;
+      if (template_might_be_protocol(tmpl)) {
+        if (const ProtocolFace* face = face_from_ptr(tmpl)) {
+          remember_proto_key(tmpl, face);
+          uint32_t dc = 0;
+          uint32_t sci = 0;
+          if (safe_read_u32(tmpl + 0xDC, &dc)) remember_proto_key(dc, face);
+          if (safe_read_u32(tmpl + 0x134, &sci)) remember_proto_key(sci, face);
+        }
+      }
+      uint32_t next = 0;
+      if (!safe_read_u32(tmpl + 0xC, &next) || next == tmpl) break;
+      tmpl = next;
+    }
+  }
+  uint32_t logic = 0;
+  if (!safe_read_u32(module_base() + 0x8DDE84, &logic) || !is_ptr(logic)) return;
+  uint32_t buckets = 0;
+  uint32_t count = 0;
+  if (!safe_read_u32(logic + 0xBC + 4, &buckets) || !is_ptr(buckets)) return;
+  if (!safe_read_u32(logic + 0xBC + 8, &count) || count == 0 || count > 20000) return;
+  for (uint32_t i = 0; i < count; ++i) {
+    uint32_t node = 0;
+    if (!safe_read_u32(buckets + i * 4u, &node)) continue;
+    for (int guard = 0; is_ptr(node) && guard < 32; ++guard) {
+      uint32_t key = 0, val = 0, next = 0;
+      if (!safe_read_u32(node, &key)) break;
+      safe_read_u32(node + 4, &val);
+      const ProtocolFace* face = face_from_proto_key(val);
+      if (!face && is_ptr(val)) {
+        uint32_t dc = 0;
+        if (safe_read_u32(val + 0xDC, &dc)) face = face_from_proto_key(dc);
+      }
+      if (!face) face = protocol_at_cstr(key);
+      if (face) {
+        remember_proto_key(key, face);
+        if (is_ptr(val)) remember_proto_key(val, face);
+      }
+      if (!safe_read_u32(node + 8, &next) || next == node) break;
+      node = next;
+    }
+  }
+}
+
+static void ensure_protocol_keys() {
+  uint32_t factory = 0;
+  if (module_base()) safe_read_u32(module_base() + 0x008EBDE8, &factory);
+  if (g_proto_key_n > 0 && factory == g_proto_factory && is_ptr(factory)) return;
+  const DWORD now = GetTickCount();
+  if (g_proto_key_n == 0 && factory == g_proto_factory && is_ptr(factory) &&
+      now - g_proto_try_at < 2000) {
+    return;
+  }
+  g_proto_try_at = now;
+  rebuild_protocol_keys();
+}
+
+static bool read_ptr_span(uint32_t begin_addr, uint32_t end_addr, uint32_t* begin, uint32_t* end,
+                          uint32_t max_n) {
+  if (!begin || !end) return false;
+  *begin = 0;
+  *end = 0;
+  if (!safe_read_u32(begin_addr, begin) || !safe_read_u32(end_addr, end)) return false;
+  if (!is_ptr(*begin) || !is_ptr(*end) || *end < *begin) return false;
+  if (((*end - *begin) % 4u) != 0) return false;
+  const uint32_t n = (*end - *begin) / 4u;
+  return n > 0 && n <= max_n;
+}
+
+static void fill_player_protocols(PlayerEconomy* pe) {
+  if (!pe || !is_ptr(pe->player)) return;
+  pe->protocol_count = 0;
+  ensure_protocol_keys();
+  uint32_t logic = 0;
+  uint32_t now = 0;
+  if (safe_read_u32(module_base() + 0x8DDE84, &logic) && is_ptr(logic)) {
+    safe_read_u32(logic + 0x50, &now);
+  }
+
+  struct TimerHit {
+    uint32_t key = 0;
+    int remain = 0;
+    const ProtocolFace* face = nullptr;
+  };
+  TimerHit timers[24] = {};
+  int timer_n = 0;
+  const uint32_t head = pe->player + 0x218;
+  uint32_t node = 0;
+  if (safe_read_u32(head, &node)) {
+    for (int n = 0; n < 24 && is_ptr(node) && node != head; ++n) {
+      uint32_t key = 0, ready = 0, dur = 0, next = 0;
+      safe_read_u32(node + 8, &key);
+      safe_read_u32(node + 0x0C, &ready);
+      safe_read_u32(node + 0x10, &dur);
+      const ProtocolFace* face = face_from_ptr(key);
+      if (!face) face = face_from_proto_key(key);
+      const int remain = protocol_remain_sec(ready, now, dur);
+      if (timer_n < 24 && key != 0) {
+        timers[timer_n].key = key;
+        timers[timer_n].remain = remain;
+        timers[timer_n].face = face;
+        ++timer_n;
+      }
+      if (!safe_read_u32(node, &next) || next == node) break;
+      node = next;
+    }
+  }
+
+  auto remain_for = [&](const ProtocolFace* face, uint32_t key) -> int {
+    int best = 0;
+    if (key != 0) {
+      for (int i = 0; i < timer_n; ++i) {
+        if (timers[i].key == key && timers[i].remain > best) best = timers[i].remain;
+      }
+    }
+    if (!face) return best;
+    for (int i = 0; i < timer_n; ++i) {
+      if (!timers[i].face) continue;
+      if (std::strcmp(timers[i].face->name, face->name) != 0) continue;
+      if (timers[i].remain > best) best = timers[i].remain;
+    }
+    return best;
+  };
+
+  auto note_value = [&](uint32_t v) {
+    if (v == 0) return;
+    const ProtocolFace* face = nullptr;
+    if (is_ptr(v)) face = face_from_ptr(v);
+    if (!face) face = face_from_proto_key(v);
+    if (!face && is_ptr(v)) {
+      uint32_t dc = 0;
+      if (safe_read_u32(v + 0xDC, &dc)) face = face_from_proto_key(dc);
+      if (!face) {
+        uint32_t sci = 0;
+        if (safe_read_u32(v + 0x134, &sci)) face = face_from_proto_key(sci);
+      }
+    }
+    if (!face) return;
+    note_protocol(pe, face, remain_for(face, v));
+  };
+
+  auto note_span = [&](uint32_t begin, uint32_t end) {
+    const uint32_t n = (end - begin) / 4u;
+    for (uint32_t i = 0; i < n; ++i) {
+      uint32_t obj = 0;
+      if (!safe_read_u32(begin + i * 4u, &obj) || obj == 0) continue;
+      note_value(obj);
+    }
+  };
+
+  // Command-bar slots. Each chosen protocol and each built superweapon sits here.
+  for (uint32_t i = 0; i < 0x55u; ++i) {
+    const uint32_t slot = pe->player + 0x248u + i * 0x30u;
+    uint32_t begin = 0, end = 0;
+    if (read_ptr_span(slot + 8, slot + 0xC, &begin, &end, 8)) note_span(begin, end);
+    if (read_ptr_span(slot + 0x1C, slot + 0x20, &begin, &end, 8)) note_span(begin, end);
+  }
+
+  uint32_t bag = 0;
+  if (safe_read_u32(pe->player + 0x1238, &bag) && is_ptr(bag)) {
+    uint32_t begin = 0, end = 0;
+    if (read_ptr_span(bag + 8, bag + 0xC, &begin, &end, 24)) note_span(begin, end);
+  }
+
+  uint32_t sci = 0;
+  if (safe_read_u32(pe->player + 0x1320, &sci) && is_ptr(sci)) {
+    uint32_t begin = 0, end = 0;
+    if (read_ptr_span(sci + 0x18, sci + 0x1C, &begin, &end, 24)) note_span(begin, end);
+    if (read_ptr_span(sci + 0x44, sci + 0x48, &begin, &end, 24)) note_span(begin, end);
+  }
+
+  for (int i = 0; i < timer_n; ++i) {
+    if (timers[i].face) note_protocol(pe, timers[i].face, timers[i].remain);
+  }
+}
+
+static void clear_local_superweapon_cooldowns() {
+  if (get_flag(0x0D) == 0) return;
+  uint32_t list = 0;
+  if (!safe_read_u32(module_base() + kLocalPlayerRva, &list) || !is_ptr(list)) return;
+  uint32_t player = 0;
+  if (!safe_read_u32(list + kPlayerListLocalOff, &player) || !is_ptr(player)) return;
+  const uint32_t head = player + 0x218;
+  uint32_t node = 0;
+  if (!safe_read_u32(head, &node)) return;
+  for (int n = 0; n < 32 && is_ptr(node) && node != head; ++n) {
+    uint32_t dur = 0, next = 0;
+    if (safe_read_u32(node + 0x10, &dur) && dur <= 15u * 1200u) {
+      safe_write_u32(node + 0x0C, 0);
+    }
+    if (!safe_read_u32(node, &next) || next == node) break;
+    node = next;
+  }
+}
+
 static bool read_battle_clock(uint32_t* logic_out, float* seconds_out) {
   if (logic_out) *logic_out = 0;
   if (seconds_out) *seconds_out = 0.f;
@@ -2813,6 +3414,8 @@ bool collect_match_economy_impl(MatchEconomy* out) {
       }
     }
   }
+
+  for (int i = 0; i < out->player_count; ++i) fill_player_protocols(&out->players[i]);
 
   out->valid = out->player_count > 0;
   if (!out->valid) {
@@ -3384,7 +3987,7 @@ static void lock_face_of(const char* id, const char* fallback_name, LockFace* ou
                egg ? 1 : 0, true, false);
     } else {
       // The hive itself stays in the lock, but the icon is the nanocore.
-      face_set(out, "sw_jp_nano", u8"纳米虫群核心", "JapanSuperWeapon", u8"纳米虫群", egg ? 0 : 1,
+      face_set(out, "sw_jp_nano", u8"纳米虫群核心", "JapanSuperWeapon", u8"纳米虫群巢穴", egg ? 0 : 1,
                true, false);
     }
     return;
@@ -3678,21 +4281,109 @@ static bool template_has_exact_id(uint32_t tmpl, const char* want) {
   return false;
 }
 
+static uint32_t call_find_template(uint32_t factory, const char* interned) {
+  using Fn = uint32_t(__thiscall*)(uint32_t, const char*);
+  uint32_t tmpl = 0;
+  __try {
+    tmpl = reinterpret_cast<Fn>(va_of(kFnFindTemplate))(factory, interned);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    tmpl = 0;
+  }
+  return is_ptr(tmpl) ? tmpl : 0;
+}
+
+// The finder hashes the exact string pointer it stored at load time.
+// Search process memory for that copy and look the pointer up.
+static uint32_t find_template_by_interned_name(uint32_t factory, const char* id) {
+  const size_t n = std::strlen(id);
+  if (n < 4 || n > 80) return 0;
+  SYSTEM_INFO si{};
+  GetSystemInfo(&si);
+  auto* p = static_cast<uint8_t*>(si.lpMinimumApplicationAddress);
+  auto* end = static_cast<uint8_t*>(si.lpMaximumApplicationAddress);
+  int tried = 0;
+  while (p < end && tried < 24) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi)) break;
+    auto* base = static_cast<uint8_t*>(mbi.BaseAddress);
+    const size_t size = mbi.RegionSize;
+    const DWORD prot = mbi.Protect & 0xFFu;
+    const bool readable = mbi.State == MEM_COMMIT &&
+                          (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0 &&
+                          (prot == PAGE_READONLY || prot == PAGE_READWRITE || prot == PAGE_WRITECOPY ||
+                           prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE ||
+                           prot == PAGE_EXECUTE_WRITECOPY);
+    if (readable && size >= n + 1 && size <= 32u * 1024u * 1024u) {
+      const uint8_t* lim = base + size - (n + 1);
+      for (const uint8_t* q = base; q <= lim && tried < 24;) {
+        const void* hit = std::memchr(q, id[0], static_cast<size_t>(lim - q) + 1);
+        if (!hit) break;
+        const auto* c = static_cast<const uint8_t*>(hit);
+        if (std::memcmp(c, id, n) == 0 && c[n] == 0) {
+          const uint32_t tmpl = call_find_template(factory, reinterpret_cast<const char*>(c));
+          ++tried;
+          if (tmpl) return tmpl;
+        }
+        q = c + 1;
+      }
+    }
+    auto* next = base + size;
+    if (next <= p) break;
+    p = next;
+  }
+  if (!tried) log("summon name %s is not loaded", id);
+  else log("summon name %s loaded %d times but not registered", id, tried);
+  return 0;
+}
+
+// The game's finder hashes the string pointer, not the characters. Walk the
+// buckets and compare the names it stored.
+static uint32_t lookup_template_official(uint32_t factory, const char* id) {
+  uint32_t buckets = 0;
+  uint32_t count = 0;
+  if (!safe_read_u32(factory + 0x2C, &buckets) || !is_ptr(buckets)) return 0;
+  if (!safe_read_u32(factory + 0x30, &count) || count == 0 || count > 100000) return 0;
+  const size_t n = std::strlen(id);
+  if (n < 4 || n > 80) return 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    uint32_t node = 0;
+    if (!safe_read_u32(buckets + i * 4, &node)) continue;
+    for (int guard = 0; is_ptr(node) && guard < 64; ++guard) {
+      uint32_t key = 0;
+      uint32_t val = 0;
+      uint32_t next = 0;
+      if (!safe_read_u32(node, &key)) break;
+      if (is_ptr(key)) {
+        char buf[96] = {};
+        if (safe_read_bytes(key, buf, n + 1) && buf[n] == 0 && std::memcmp(buf, id, n) == 0) {
+          if (safe_read_u32(node + 4, &val) && is_ptr(val)) return val;
+        }
+      }
+      if (!safe_read_u32(node + 8, &next) || next == node) break;
+      node = next;
+    }
+  }
+  return 0;
+}
+
 static uint32_t find_template_by_id(const char* id) {
   if (!module_base() || !id || !id[0]) return 0;
   uint32_t factory = 0;
   if (!safe_read_u32(module_base() + kThingFactoryRva, &factory) || !is_ptr(factory)) return 0;
+  const uint32_t named = lookup_template_official(factory, id);
+  if (is_ptr(named)) return named;
   uint32_t tmpl = 0;
-  if (!safe_read_u32(factory + 0x24, &tmpl) || !is_ptr(tmpl)) return 0;
-  for (int n = 0; n < 4096 && is_ptr(tmpl); ++n) {
-    uint32_t vt = 0;
-    if (!safe_read_u32(tmpl, &vt) || !is_ptr(vt)) break;
-    if (template_has_exact_id(tmpl, id)) return tmpl;
-    uint32_t next = 0;
-    if (!safe_read_u32(tmpl + 0xC, &next) || next == tmpl) break;
-    tmpl = next;
+  if (safe_read_u32(factory + 0x24, &tmpl) && is_ptr(tmpl)) {
+    for (int n = 0; n < 4096 && is_ptr(tmpl); ++n) {
+      uint32_t vt = 0;
+      if (!safe_read_u32(tmpl, &vt) || !is_ptr(vt)) break;
+      if (template_has_exact_id(tmpl, id)) return tmpl;
+      uint32_t next = 0;
+      if (!safe_read_u32(tmpl + 0xC, &next) || next == tmpl) break;
+      tmpl = next;
+    }
   }
-  return 0;
+  return find_template_by_interned_name(factory, id);
 }
 
 static const char* mcv_type_id(int faction) {
@@ -3885,7 +4576,10 @@ static bool summon_troops_impl(std::string* out_msg) {
   int missing = 0;
   for (int i = 0; i < snap.n; ++i) {
     tmpls[i] = find_template_by_id(snap.ids[i]);
-    if (!is_ptr(tmpls[i])) ++missing;
+    if (!is_ptr(tmpls[i])) {
+      ++missing;
+      log("summon no template: %s", snap.ids[i]);
+    }
     else planned += snap.count;
   }
   log("summon player=%08X info=%08X types=%d each=%d planned=%d", owner, owner_info, snap.n,
@@ -4213,6 +4907,8 @@ bool build_lock_selected(bool locked, std::string* out_msg) {
 }
 
 void build_lock_tick() { build_lock_tick_impl(); }
+
+void refresh_power_cooldowns() { clear_local_superweapon_cooldowns(); }
 
 bool disable_superweapon_held() { return g_sw_flag_held; }
 
