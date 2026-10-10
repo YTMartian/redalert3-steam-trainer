@@ -404,13 +404,28 @@ def inject(dll_path, pid=None):
     dll_path = os.path.normpath(dll_path)
     wrong_version = None
     if pid is None:
-        games = find_ra3_game_processes()
-        for game_pid, game_name in games:
-            if game_name.lower() == 'ra3_1.12.game':
-                pid = game_pid
-                break
-        if not pid and games:
-            wrong_version = games[0][1]
+        retail_112 = None
+        retail_other = None
+        uprising_10 = None
+        uprising_other = None
+        for game_pid, game_name in find_ra3_game_processes():
+            low = game_name.lower()
+            if low == 'ra3ep1_1.0.game':
+                uprising_10 = (game_pid, game_name)
+            elif low.startswith('ra3ep1'):
+                uprising_other = (game_pid, game_name)
+            elif low == 'ra3_1.12.game':
+                retail_112 = (game_pid, game_name)
+            else:
+                retail_other = (game_pid, game_name)
+        if uprising_10:
+            pid = uprising_10[0]
+        elif uprising_other:
+            return False, u'__WRONG_UPRISING__:' + uprising_other[1]
+        elif retail_112:
+            pid = retail_112[0]
+        elif retail_other:
+            wrong_version = retail_other[1]
     if wrong_version:
         return False, u'__WRONG_VERSION__:' + wrong_version
     if not pid:
@@ -498,17 +513,17 @@ def inject(dll_path, pid=None):
     ) % pid
 
 
-def guide_image_paths():
-    """The two Steam screenshots that show how to set -runver 1.12."""
+def guide_image_paths(folder):
+    """Two Steam screenshots for a launch-option change."""
     names = ('image_1.png', 'image_2.png')
     roots = []
     if getattr(sys, 'frozen', False):
         meipass = getattr(sys, '_MEIPASS', '')
-        roots.append(os.path.join(meipass, 'v1.12_change_method'))
-        roots.append(os.path.join(os.path.dirname(sys.executable), 'v1.12_change_method'))
+        roots.append(os.path.join(meipass, folder))
+        roots.append(os.path.join(os.path.dirname(sys.executable), folder))
     here = os.path.dirname(os.path.abspath(__file__))
-    roots.append(os.path.normpath(os.path.join(here, '..', '..', 'v1.12_change_method')))
-    roots.append(os.path.normpath(os.path.join(here, '..', 'bin', 'v1.12_change_method')))
+    roots.append(os.path.normpath(os.path.join(here, '..', '..', folder)))
+    roots.append(os.path.normpath(os.path.join(here, '..', 'bin', folder)))
     for root in roots:
         paths = [os.path.normpath(os.path.join(root, name)) for name in names]
         if all(os.path.isfile(path) for path in paths):
@@ -526,10 +541,21 @@ def _guide_text(running_name):
     ) % running_name
 
 
-def show_runver_guide(running_name):
+def _uprising_guide_text(running_name):
+    return (
+        u'注入失败。当前运行的是 %s，不是起义时刻 1.0。\n'
+        u'请按下面两步把启动版本改成 1.0，然后完全退出并重新启动游戏，再运行本修改器。\n'
+        u'\n'
+        u'1. 在 Steam 库中右键《命令与征服：红色警戒 3》起义，选择「属性」。\n'
+        u'2. 打开「通用」，在启动选项中填入 -runver 1.0。'
+    ) % running_name
+
+
+def show_runver_guide(running_name, uprising=False):
     """Popup with the two setup screenshots. Falls back to a text box."""
-    paths = guide_image_paths()
-    text = _guide_text(running_name)
+    folder = 'uprising_v1.0_change_method' if uprising else 'v1.12_change_method'
+    paths = guide_image_paths(folder)
+    text = _uprising_guide_text(running_name) if uprising else _guide_text(running_name)
     if not paths or not _show_guide_window(text, paths):
         _msg(False, text)
         return False
@@ -968,6 +994,11 @@ def main():
         default_dll = candidates[0]
     dll = sys.argv[1] if len(sys.argv) > 1 else default_dll
     ok, msg = inject(dll)
+    if (not ok) and msg.startswith(u'__WRONG_UPRISING__:'):
+        running = msg.split(u':', 1)[1]
+        print(u'注入失败\n' + _uprising_guide_text(running))
+        show_runver_guide(running, uprising=True)
+        return 1
     if (not ok) and msg.startswith(u'__WRONG_VERSION__:'):
         running = msg.split(u':', 1)[1]
         print(u'注入失败\n' + _guide_text(running))

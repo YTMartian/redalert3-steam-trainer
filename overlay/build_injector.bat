@@ -49,7 +49,7 @@ if not exist "%REPO%\overlay\bin\unit_names_csf.txt" (
 echo [3/4] packaging main.exe ...
 set ADD_NAMES=
 if exist "%REPO%\overlay\bin\unit_names.txt" set ADD_NAMES=--add-data "%REPO%\overlay\bin\unit_names.txt;."
-"%PY%" -m PyInstaller --noconfirm --onefile --noconsole --uac-admin --name main --icon "%ICON%" --distpath "%REPO%\overlay\bin" --workpath "%REPO%\overlay\build\pyi_inject" --specpath "%REPO%\overlay\build" --add-binary "%REPO%\overlay\bin\ra3_overlay_v4.dll;." --add-binary "%REPO%\overlay\bin\arm_mustcode.dll;." --add-data "%REPO%\overlay\bin\unit_names_csf.txt;." %ADD_NAMES% --add-data "%REPO%\v1.12_change_method;v1.12_change_method" "%REPO%\overlay\tools\inject.py"
+"%PY%" -m PyInstaller --noconfirm --onefile --noconsole --uac-admin --name main --icon "%ICON%" --distpath "%REPO%\overlay\bin" --workpath "%REPO%\overlay\build\pyi_inject" --specpath "%REPO%\overlay\build" --add-binary "%REPO%\overlay\bin\ra3_overlay_v4.dll;." --add-binary "%REPO%\overlay\bin\arm_mustcode.dll;." --add-data "%REPO%\overlay\bin\unit_names_csf.txt;." %ADD_NAMES% --add-data "%REPO%\v1.12_change_method;v1.12_change_method" --add-data "%REPO%\uprising_v1.0_change_method;uprising_v1.0_change_method" "%REPO%\overlay\tools\inject.py"
 if errorlevel 1 goto :err
 
 echo [4/4] done

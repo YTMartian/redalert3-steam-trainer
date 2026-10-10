@@ -51,7 +51,13 @@ gui_check.png
 # ---------------------------------------------------------------
 _find_mouse*.py
 _find_create*.py
+overlay/_*.py
+_*.txt
 ra3_image.json
+
+# 运行期生成的界面配置与日志
+overlay_ui.ini
+ra3_overlay.log
 
 # 编辑器 / 系统
 .vscode/

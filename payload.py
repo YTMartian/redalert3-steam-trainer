@@ -10,3 +10,91 @@ LABELS = {'MC': {'mc_0': 0, 'mc_29': 41, 'mc_6c': 108, 'mc_9f': 159, 'mc_c8': 20
 CORE_HOOKS = [('PlayerID', 5509531, '8b50288b4220', 4608), ('Money', 10899102, '0378048b11', 41), ('Power', 10898861, '8b40048b8eb0030000', 108), ('SCPoint', 10899212, '8b78348b4e3c', 159), ('HaveAllSC', 10899285, 'f30f10472c', 200), ('FastBuild1', 7657502, 'f30f2c461c', 240), ('FastBuild2', 7657340, 'd9461c89465c', 280), ('FastBuild3', 7557407, 'd986bc010000', 321), ('SuperPower', 7511833, '8b9818040000', 373), ('SuperPower2', 8899465, '8b70508b01', 458), ('DisableAllSP', 8899606, '8b51503b500c', 592), ('DisableAllSP2', 7637510, '8b48503b4e20', 660), ('Map', 8390076, 'f30f118560020000', 761), ('UnitAmmo', 5676421, '8b0cba85c9', 807), ('DangerLevel', 8876144, '8b8178120000', 859), ('OreMine', 7417523, '8b40082b4114', 916), ('EnemyCantBuild', 7657760, '0350043bd7', 976)]
 
 DATA_GLOBALS = [('GetUnitDataBase', 9308380), ('GetUnitData2This', 9333848), ('GetMouseXYZinMapBase', 9285372), ('UnitIDMagic', 9345080)]
+
+# ra3ep1_1.0.game. Same stub offsets as retail. Resume VA is hook + stolen length.
+# OreMine is omitted until its site is unique. SuperPower sits at 0x73BB19 and is
+# byte-identical to retail 0x729F19 apart from the owner field ([eax+0x428]).
+_EP1_BACK = {
+    'PlayerID': '_BackPlayerID',
+    'Money': '_BackPlayerMoney',
+    'Power': '_BackPlayerPower',
+    'SCPoint': '_BackPlayerSCPoint',
+    'HaveAllSC': '_BackPlayerHaveAllSC',
+    'FastBuild1': '_BackPlayerFastBuild',
+    'FastBuild2': '_BackPlayerFastBuild2',
+    'FastBuild3': '_BackPlayerFastBuild3',
+    'SuperPower': '_BackPlayerSuperPower',
+    'SuperPower2': '_BackPlayerSuperPower2',
+    'DisableAllSP': '_BackDisableAllSuperPower',
+    'DisableAllSP2': '_BackDisableAllSuperPower2',
+    'Map': '_BackPlayerMap',
+    'UnitAmmo': '_BackSelectUnitAmmo',
+    'DangerLevel': '_BackDangerLevel',
+    'EnemyCantBuild': '_BackEnemyCantBuild',
+}
+
+EP1_CORE_HOOKS = [
+    ('PlayerID', 0x54915B, '8b50288b4220', 4608),
+    ('Money', 0xA7C7FA, '0378048b11', 41),
+    ('Power', 0xA7C6F8, '8b40048b8ee0030000', 108),
+    ('SCPoint', 0xA7C868, '8b78348b4e3c', 159),
+    ('HaveAllSC', 0xA7C8B1, 'f30f10472c', 200),
+    ('FastBuild1', 0x76090E, 'f30f2c461c', 240),
+    ('FastBuild2', 0x76086C, 'd9461c89465c', 280),
+    ('FastBuild3', 0x74221F, 'd986bc010000', 321),
+    ('SuperPower', 0x73BB19, '8b9828040000', 373),
+    ('SuperPower2', 0x88C3C9, '8b70508b01', 458),
+    ('DisableAllSP', 0x88C456, '8b51503b500c', 592),
+    ('DisableAllSP2', 0x75BC06, '8b48503b4e20', 660),
+    ('Map', 0x80B9DF, 'f30f118564020000', 761),
+    ('UnitAmmo', 0x571525, '8b0cba85c9', 807),
+    ('DangerLevel', 0x886940, '8b8178120000', 859),
+    ('EnemyCantBuild', 0x760A1D, '0350043bd7', 976),
+]
+
+
+def ep1_asm_and_symbols():
+    """Retail shellcode with the uprising field sizes that differ.
+
+    Power display is [esi+0x3E0], not [esi+0x3B0]. The fast-build job's
+    timestamp is [edi+0x34], not [edi+0x3C]. The special-power module's owner
+    player lives at [eax+0x428], not [eax+0x418] (that module gained 0x10
+    bytes in uprising). Every replacement keeps the same instruction length,
+    so the stub layout does not move. Retail ASM_TEXT is untouched.
+    """
+    old = 'mov ecx,[esi+0x000003B0]'
+    new = 'mov ecx,[esi+0x000003E0]'
+    build_old = 'mov eax,[edi+0x3c]'
+    build_new = 'mov eax,[edi+0x34]'
+    owner_old = '[eax+0x00000418]'
+    owner_new = '[eax+0x00000428]'
+    # The zoom/view object also grew by 4 bytes: retail stores the camera
+    # distance at [ebp+0x260], uprising at [ebp+0x264] (retail's 0x25C "1.0f"
+    # default is the uprising 0x260 slot, which is what our old wrong hook site
+    # was clobbering). Same instruction length, so the stub layout holds.
+    zoom_old = '[ebp+0x00000260]'
+    zoom_new = '[ebp+0x00000264]'
+    if ASM_TEXT.count(old) != 1:
+        raise RuntimeError('power offset marker missing')
+    if ASM_TEXT.count(build_old) != 1:
+        raise RuntimeError('fastbuild3 offset marker missing')
+    asm = ASM_TEXT.replace(old, new, 1).replace(build_old, build_new, 1)
+    # Only the SuperPower stub (MC+0x175) may use the owner field: patch that
+    # slice, leaving every other box untouched.
+    start = asm.index('MC+0x175:')
+    end = asm.index('jmp _BackPlayerSuperPower', start)
+    box = asm[start:end]
+    if box.count(owner_old) != 3:
+        raise RuntimeError('superpower owner marker missing (%d)' % box.count(owner_old))
+    asm = asm[:start] + box.replace(owner_old, owner_new) + asm[end:]
+    # Only the Map stub (MC+0x2F9) stores into the zoom/view object.
+    start = asm.index('MC+0x2f9:')
+    end = asm.index('jmp _BackPlayerMap', start)
+    box = asm[start:end]
+    if box.count(zoom_old) != 2:
+        raise RuntimeError('map zoom marker missing (%d)' % box.count(zoom_old))
+    asm = asm[:start] + box.replace(zoom_old, zoom_new) + asm[end:]
+    sym = dict(SYMBOLS)
+    for name, va, aob, _off in EP1_CORE_HOOKS:
+        sym[_EP1_BACK[name]] = va + len(aob) // 2
+    return asm, sym

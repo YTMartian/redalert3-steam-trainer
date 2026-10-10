@@ -242,6 +242,9 @@ bool g_cs_ready = false;
 char g_log_path[MAX_PATH] = {};
 
 uint32_t g_module = 0;
+bool g_uprising = false;
+const OverlayHookDef* g_hook_defs = kOverlayHooks;
+int g_hook_def_count = kOverlayHookCount;
 uint8_t* g_mc = nullptr;
 uint8_t* g_mc2 = nullptr;
 uint8_t* g_flags = nullptr;
@@ -321,9 +324,20 @@ bool hook_installed(const char* name) {
   return false;
 }
 
+void select_hook_table(bool uprising) {
+  g_uprising = uprising;
+  if (uprising) {
+    g_hook_defs = kOverlayHooksEp1;
+    g_hook_def_count = kOverlayHookEp1Count;
+  } else {
+    g_hook_defs = kOverlayHooks;
+    g_hook_def_count = kOverlayHookCount;
+  }
+}
+
 const OverlayHookDef* find_hook_def(const char* name) {
-  for (int i = 0; i < kOverlayHookCount; ++i) {
-    if (std::strcmp(kOverlayHooks[i].name, name) == 0) return &kOverlayHooks[i];
+  for (int i = 0; i < g_hook_def_count; ++i) {
+    if (std::strcmp(g_hook_defs[i].name, name) == 0) return &g_hook_defs[i];
   }
   return nullptr;
 }
@@ -517,6 +531,31 @@ void install_player_list_read_guard() {
   log("player slot guard sites=%d", patched);
 }
 
+enum class GameKind { None, Retail112, Uprising };
+
+struct GameModule {
+  GameKind kind = GameKind::None;
+  uint32_t base = 0;
+};
+
+GameModule detect_game_module() {
+  GameModule game;
+  if (HMODULE retail = GetModuleHandleW(L"ra3_1.12.game")) {
+    game.kind = GameKind::Retail112;
+    game.base = reinterpret_cast<uint32_t>(retail);
+    return game;
+  }
+  if (HMODULE ep = GetModuleHandleW(L"ra3ep1_1.0.game")) {
+    game.kind = GameKind::Uprising;
+    game.base = reinterpret_cast<uint32_t>(ep);
+    return game;
+  }
+  if (GetModuleHandleW(L"ra3ep1_1.1.game")) {
+    game.kind = GameKind::Uprising;
+  }
+  return game;
+}
+
 }  // namespace
 
 void install_roster_hooks();
@@ -530,13 +569,24 @@ void init() {
   DeleteFileA(g_log_path);
   log("DLL attached, log=%s", g_log_path);
   install_crash_filter();
-  g_module = reinterpret_cast<uint32_t>(GetModuleHandleW(L"ra3_1.12.game"));
-  if (!g_module) {
-    g_module = kModBase;
-    log("GetModuleHandle(ra3_1.12.game) failed — assuming 0x%X", kModBase);
-  } else {
-    log("module base 0x%X", g_module);
+  const GameModule game = detect_game_module();
+  if (game.kind == GameKind::Uprising) {
+    if (!game.base) {
+      log("uprising module is not 1.0, patches skipped");
+      return;
+    }
+    g_module = game.base;
+    select_hook_table(true);
+    log("uprising 1.0 base 0x%X, retail guards skipped", g_module);
+    return;
   }
+  if (game.kind != GameKind::Retail112 || !game.base) {
+    g_module = 0;
+    log("ra3_1.12.game not loaded, patches skipped");
+    return;
+  }
+  g_module = game.base;
+  log("module base 0x%X", g_module);
   install_pool_null_guard();
   install_ai_power_null_guard();
   install_script_player_guard();
@@ -751,6 +801,8 @@ bool hooks_armed() { return g_hooked; }
 
 bool is_spectator() {
   if (!g_module) return true;
+  // Observer bytes are only mapped for retail. Uprising must not read that global.
+  if (g_uprising) return false;
   uint32_t player = *reinterpret_cast<uint32_t*>(g_module + kLocalPlayerRva);
   if (!is_ptr(player)) return true;
   uint32_t tmpl = *reinterpret_cast<uint32_t*>(player + 0x28);
@@ -909,9 +961,20 @@ bool inject(bool spectate_mode) {
   g_spectate_mode = spectate_mode;
   g_auto_spec = false;
 
-  if (!g_module) {
-    g_module = reinterpret_cast<uint32_t>(GetModuleHandleW(L"ra3_1.12.game"));
-    if (!g_module) g_module = kModBase;
+  const GameModule game = detect_game_module();
+  if (game.kind == GameKind::Uprising) {
+    if (!game.base) {
+      set_status(u8"起义时刻请把启动选项改成 -runver 1.0");
+      return false;
+    }
+    g_module = game.base;
+    select_hook_table(true);
+  } else if (game.kind == GameKind::Retail112 && game.base) {
+    g_module = game.base;
+    select_hook_table(false);
+  } else {
+    set_status(u8"没有找到 ra3_1.12.game");
+    return false;
   }
 
   if (g_hooked) {
@@ -976,8 +1039,8 @@ bool arm_hooks() {
 
   // Track installed hooks for detach/restore (same set Python patched).
   g_installed.clear();
-  for (int i = 0; i < kOverlayHookCount; ++i) {
-    const auto& def = kOverlayHooks[i];
+  for (int i = 0; i < g_hook_def_count; ++i) {
+    const auto& def = g_hook_defs[i];
     if (g_spectate_mode &&
         name_in_list(def.name, kPlayerHookNames, kPlayerHookNameCount)) {
       continue;
@@ -1021,22 +1084,41 @@ static void patch_site(uint32_t va, const uint8_t* orig, const uint8_t* repl, in
   write_code(site, want, n);
 }
 
+struct ShroudSites {
+  uint32_t filter_cell;
+  uint32_t filter_lo;
+  uint32_t filter_hi;
+  uint32_t reveal_fn;
+  uint32_t cell_fn;
+  uint32_t mgr_va;
+  uint32_t player_list_va;
+};
+
+static ShroudSites shroud_sites() {
+  if (g_uprising) {
+    return {0xB2D579u, 0x74D1A0u, 0x74D25Du, 0xB2DFC0u, 0xB2D6E0u, 0xCFAB30u, 0xD009C4u};
+  }
+  return {0xB21AB9u, 0x73AEFDu, 0x73AFBDu, 0xB22500u, 0xB21C20u, 0xCE8130u, 0xCEDE2Cu};
+}
+
 static void patch_shroud_filters(bool on) {
+  const ShroudSites s = shroud_sites();
   const uint8_t jbe_cell[] = {0x76, 0x08};
   const uint8_t nop_cell[] = {0x90, 0x90};
   const uint8_t jbe_lo[] = {0x76, 0x49};
   const uint8_t jmp_lo[] = {0xEB, 0x49};
   const uint8_t jbe_hi[] = {0x76, 0x4B};
   const uint8_t jmp_hi[] = {0xEB, 0x4B};
-  patch_site(0xB21AB9, jbe_cell, nop_cell, 2, on);
-  patch_site(0x73AEFD, jbe_lo, jmp_lo, 2, on);
-  patch_site(0x73AFBD, jbe_hi, jmp_hi, 2, on);
+  patch_site(s.filter_cell, jbe_cell, nop_cell, 2, on);
+  patch_site(s.filter_lo, jbe_lo, jmp_lo, 2, on);
+  patch_site(s.filter_hi, jbe_hi, jmp_hi, 2, on);
 }
 
 static int viewed_shroud_player(uint32_t inner) {
   int player = *reinterpret_cast<int*>(inner + 0x80);
   if (player >= 0 && player < 0x14) return player;
-  uint32_t list = *reinterpret_cast<uint32_t*>(va_of(0xCEDE2C));
+  const ShroudSites s = shroud_sites();
+  uint32_t list = *reinterpret_cast<uint32_t*>(va_of(s.player_list_va));
   if (!is_ptr(list)) return -1;
   uint32_t local = *reinterpret_cast<uint32_t*>(list + 0x28);
   if (!is_ptr(local)) return -1;
@@ -1078,7 +1160,7 @@ static int copy_shroud_words(uint8_t* cells, uint32_t count, int player, uint16_
 static int force_reveal_grid(uint8_t* cells, uint32_t count, uint32_t inner, int player) {
   __try {
     for (uint32_t i = 0; i < count; ++i) *shroud_word(cells, i, player) = 0;
-    auto fn = reinterpret_cast<void(__thiscall*)(void*, int)>(va_of(0xB22500));
+    auto fn = reinterpret_cast<void(__thiscall*)(void*, int)>(va_of(shroud_sites().reveal_fn));
     fn(reinterpret_cast<void*>(inner), player);
     return 1;
   } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1087,7 +1169,8 @@ static int force_reveal_grid(uint8_t* cells, uint32_t count, uint32_t inner, int
 }
 
 static int top_up_reveal(uint8_t* cells, uint32_t count, uint32_t inner, int player) {
-  auto fn = reinterpret_cast<void(__thiscall*)(void*, void*, int)>(va_of(0xB21C20));
+  auto fn =
+      reinterpret_cast<void(__thiscall*)(void*, void*, int)>(va_of(shroud_sites().cell_fn));
   __try {
     for (uint32_t i = 0; i < count; ++i) {
       uint16_t* word = shroud_word(cells, i, player);
@@ -1125,7 +1208,8 @@ void sync_dispel_shroud() {
   static uint32_t next_pass = 0;
   static std::vector<uint16_t> snap;
 
-  uint32_t mgr = *reinterpret_cast<uint32_t*>(va_of(0xCE8130));
+  const ShroudSites sites = shroud_sites();
+  uint32_t mgr = *reinterpret_cast<uint32_t*>(va_of(sites.mgr_va));
   uint32_t inner = 0;
   uint32_t cells = 0;
   uint32_t count = 0;
@@ -1772,6 +1856,11 @@ static void publish_power_flags() {
   else set_flag(0x0E, 1);
 }
 
+void sync_power_flags_from_toggles() {
+  if (!g_flags) return;
+  publish_power_flags();
+}
+
 bool toggle_feature(const char* key, bool enabled, std::string* out_msg) {
   const FeatureInfo* f = find_feature(key);
   if (!f || std::strcmp(f->type, "toggle") != 0) {
@@ -1786,6 +1875,8 @@ bool toggle_feature(const char* key, bool enabled, std::string* out_msg) {
     if (out_msg) *out_msg = u8"写 flag 失败";
     return false;
   }
+  log("toggle %s=%d flag[%02X]=%u derived 0x0D=%u 0x0E=%u", key, enabled ? 1 : 0, f->flag,
+      (unsigned)get_flag(f->flag), (unsigned)get_flag(0x0D), (unsigned)get_flag(0x0E));
   if (std::strcmp(key, "disableallsp") == 0) {
     note_disable_superweapon_toggle(enabled);
     build_lock_sync_disable_superweapon();
@@ -1867,7 +1958,9 @@ void set_mcv_faction(int faction) {
 uint8_t* flags_base() { return g_flags; }
 uint8_t* mc_base() { return g_mc; }
 uint8_t* idb_base() { return g_idb; }
-uint32_t module_base() { return g_module; }
+uint32_t module_base() { return g_uprising ? 0 : g_module; }
+uint32_t loaded_module() { return g_module; }
+bool uprising_active() { return g_uprising && g_module != 0; }
 bool hook_is_installed(const char* name) { return hook_installed(name); }
 
 }  // namespace game_api

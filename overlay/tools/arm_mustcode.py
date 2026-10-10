@@ -28,7 +28,9 @@ else:
     ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path.insert(0, ROOT)
 
-from payload import ASM_TEXT, SYMBOLS, LABELS, CORE_HOOKS  # noqa: E402
+from payload import (  # noqa: E402
+    ASM_TEXT, SYMBOLS, LABELS, CORE_HOOKS, EP1_CORE_HOOKS, ep1_asm_and_symbols,
+)
 from mustcode_asm import build, MOD_BASE, PLAYER_HOOK_NAMES  # noqa: E402
 
 import ctypes
@@ -92,6 +94,53 @@ def va_of(module_base, va):
     return module_base + (va - MOD_BASE)
 
 
+class MODULEENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ('dwSize', wintypes.DWORD),
+        ('th32ModuleID', wintypes.DWORD),
+        ('th32ProcessID', wintypes.DWORD),
+        ('GlblcntUsage', wintypes.DWORD),
+        ('ProccntUsage', wintypes.DWORD),
+        ('modBaseAddr', ctypes.c_void_p),
+        ('modBaseSize', wintypes.DWORD),
+        ('hModule', ctypes.c_void_p),
+        ('szModule', wintypes.WCHAR * 256),
+        ('szExePath', wintypes.WCHAR * 260),
+    ]
+
+
+def process_module_names(pid):
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.Module32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
+    kernel32.Module32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
+    snap = kernel32.CreateToolhelp32Snapshot(0x00000008 | 0x00000010, pid)
+    if not snap or snap == wintypes.HANDLE(-1).value:
+        return []
+    me = MODULEENTRY32W()
+    me.dwSize = ctypes.sizeof(MODULEENTRY32W)
+    names = []
+    if kernel32.Module32FirstW(snap, ctypes.byref(me)):
+        while True:
+            names.append(me.szModule.lower())
+            if not kernel32.Module32NextW(snap, ctypes.byref(me)):
+                break
+    kernel32.CloseHandle(snap)
+    return names
+
+
+def select_profile(pid):
+    names = process_module_names(pid)
+    if 'ra3ep1_1.0.game' in names:
+        asm, sym = ep1_asm_and_symbols()
+        return asm, sym, EP1_CORE_HOOKS, 'ra3ep1_1.0.game'
+    if 'ra3_1.12.game' in names:
+        return ASM_TEXT, SYMBOLS, CORE_HOOKS, 'ra3_1.12.game'
+    if any(n.startswith('ra3ep1') for n in names):
+        return None
+    return ASM_TEXT, SYMBOLS, CORE_HOOKS, 'assumed-1.12'
+
+
 def main():
     if len(sys.argv) < 6:
         return result(False, 'usage: arm_mustcode.py pid mc mc2 flags idb [spectate]')
@@ -108,9 +157,15 @@ def main():
     if not h:
         return result(False, 'OpenProcess failed err=%d' % ctypes.get_last_error())
 
+    profile = select_profile(pid)
+    if profile is None:
+        kernel32.CloseHandle(h)
+        return result(False, 'uprising build is not ra3ep1_1.0.game')
+    asm_text, symbols, hooks, game_name = profile
+
     try:
         mc_bytes, mc2_bytes = build(
-            ASM_TEXT, SYMBOLS, mc, mc2, flags, idb, module_base)
+            asm_text, symbols, mc, mc2, flags, idb, module_base)
         if not write_mem(h, mc, mc_bytes):
             return result(False, 'WriteProcessMemory MustCode failed')
         if not write_mem(h, mc2, mc2_bytes):
@@ -120,7 +175,7 @@ def main():
         write_mem(h, flags + 0x20, b'\x00\x00\x00\x00')
 
         # probe PlayerID
-        probe = next(x for x in CORE_HOOKS if x[0] == 'PlayerID')
+        probe = next(x for x in hooks if x[0] == 'PlayerID')
         probe_va, probe_aob = probe[1], probe[2]
         expect = bytes.fromhex(probe_aob)
         got = read_mem(h, va_of(module_base, probe_va), len(expect))
@@ -129,7 +184,7 @@ def main():
                 va_of(module_base, probe_va), got.hex(), expect.hex()))
 
         installed = 0
-        for name, hook_va_abs, aob, target_off in CORE_HOOKS:
+        for name, hook_va_abs, aob, target_off in hooks:
             if spectate and name in PLAYER_HOOK_NAMES:
                 continue
             if not spectate:
@@ -147,8 +202,8 @@ def main():
                 return result(False, 'patch %s failed' % name)
             installed += 1
 
-        return result(True, 'armed %d hooks mc=0x%X' % (
-            installed, mc))
+        return result(True, 'armed %d hooks for %s mc=0x%X' % (
+            installed, game_name, mc))
     except Exception as exc:
         return result(False, 'exception: %s' % exc)
     finally:

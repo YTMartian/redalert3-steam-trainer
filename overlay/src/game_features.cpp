@@ -21,13 +21,41 @@ namespace {
 
 constexpr uint32_t kModBase = 0x400000;
 constexpr uint32_t kLocalPlayerRva = 0x8EDE2C;
+
+// Defined below (Uprising uses a different ThePlayerList rva).
+static uint32_t player_list_rva();
+
+// Uprising moved the entity fields we touch: everything from the health object
+// (retail +0x33C) up to +0x450 grew by 0x10, and the unit-data sub object
+// (+0x374) gained another 0x0C at its own speed-control field. Fields below
+// +0x138 (owner list of the wrapper object, +0x138 itself, the template at +4)
+// are unchanged, verified against ra3ep1_1.0.game.
+static uint32_t ent_off(uint32_t retail, uint32_t ep1) {
+  return uprising_active() ? ep1 : retail;
+}
+constexpr uint32_t kEntUnitData = 0x374;   // speed tower lives behind this
+constexpr uint32_t kEntUnitDataEp1 = 0x384;
+constexpr uint32_t kEntHp = 0x33C;
+constexpr uint32_t kEntHpEp1 = 0x34C;
+constexpr uint32_t kEntOwner = 0x418;
+constexpr uint32_t kEntOwnerEp1 = 0x428;
+constexpr uint32_t kEntXp = 0x3CC;
+constexpr uint32_t kEntXpEp1 = 0x3DC;
+constexpr uint32_t kSpeedCtrl = 0x200;     // inside the unit-data object
+constexpr uint32_t kSpeedCtrlEp1 = 0x20C;
 constexpr uint32_t kFnAddXp = 0x005173F0;
 constexpr uint32_t kFnDestroy = 0x007DCDF0;
 constexpr uint32_t kFnCreateUnit = 0x006440F0;
 constexpr uint32_t kFnFindTemplate = 0x00822510;
 constexpr uint32_t kFnGetMouseXyz = 0x0062C500;
 
-uint32_t va_of(uint32_t va) { return module_base() + (va - kModBase); }
+// Retail virtual addresses are meaningless inside the Uprising build (its
+// functions live at different RVAs). Refuse the call instead of jumping into
+// an unrelated function; the SEH wrapper turns this into a "failed" result.
+uint32_t va_of(uint32_t va) {
+  if (!module_base()) return 0;
+  return module_base() + (va - kModBase);
+}
 
 bool is_ptr(uint32_t v) {
   return v >= 0x10000 && v < 0x7FFF0000u && (v & 3u) == 0;
@@ -45,7 +73,9 @@ bool write_u32(uint32_t addr, uint32_t v) {
 }
 
 uint32_t local_owner() {
-  uint32_t player = read_u32(module_base() + kLocalPlayerRva);
+  const uint32_t base = loaded_module();
+  if (!base) return 0;
+  uint32_t player = read_u32(base + player_list_rva());
   if (!is_ptr(player)) return 0;
   for (uint32_t off : {0x28u, 0x30u}) {
     uint32_t owner = read_u32(player + off);
@@ -68,18 +98,41 @@ struct SpeedNode {
   uint32_t addr;
 };
 
+// Uprising-only guards. They exist so that a wrong entity offset can never be
+// turned into a wild write into the game heap: if the object does not look like
+// the component we expect, the feature simply reports "nothing writable".
+static bool speed_node_sane(uint32_t node) {
+  if (!uprising_active()) return true;
+  const float cur = read_f32(node + 8);
+  const float backup = read_f32(node + 0x40);
+  if (!(cur >= 0.f && cur <= 5000.f)) return false;
+  if (!(backup >= 0.f && backup <= 5000.f)) return false;
+  return true;
+}
+
+static bool hp_object_sane(uint32_t hp) {
+  if (!uprising_active()) return true;
+  const float cur = read_f32(hp + 4);
+  const float mx = read_f32(hp + 0xC);
+  const float alt = read_f32(hp + 0x10);
+  if (!(cur >= 0.f && cur <= 1.0e7f)) return false;
+  if (!(mx >= 0.f && mx <= 1.0e7f)) return false;
+  if (!(alt >= 0.f && alt <= 1.0e7f)) return false;
+  return true;
+}
+
 std::vector<uint32_t> speed_nodes(uint32_t ent) {
   std::vector<uint32_t> nodes;
-  uint32_t vec = read_u32(ent + 0x374);
+  uint32_t vec = read_u32(ent + ent_off(kEntUnitData, kEntUnitDataEp1));
   if (!is_ptr(vec)) return nodes;
-  uint32_t ctrl = read_u32(vec + 0x200);
+  uint32_t ctrl = read_u32(vec + ent_off(kSpeedCtrl, kSpeedCtrlEp1));
   if (!is_ptr(ctrl)) return nodes;
   uint32_t first = read_u32(ctrl);
-  if (is_ptr(first)) nodes.push_back(first);
+  if (is_ptr(first) && speed_node_sane(first)) nodes.push_back(first);
   uint32_t second = read_u32(ctrl + 4);
   if (is_ptr(second)) {
     float flag = read_f32(second + 0x18);
-    if (std::fabs(flag - 1.0f) < 1e-6f) nodes.push_back(second);
+    if (std::fabs(flag - 1.0f) < 1e-6f && speed_node_sane(second)) nodes.push_back(second);
   }
   return nodes;
 }
@@ -114,8 +167,9 @@ bool restore_speed_node(uint32_t node) {
 }
 
 bool write_entity_hp(uint32_t ent, const char* mode) {
-  uint32_t hp = read_u32(ent + 0x33C);
+  uint32_t hp = read_u32(ent + ent_off(kEntHp, kEntHpEp1));
   if (!is_ptr(hp)) return false;
+  if (!hp_object_sane(hp)) return false;
   if (std::strcmp(mode, "max") == 0) {
     return write_f32(hp + 4, 9999999.f) && write_f32(hp + 0xC, 9999999.f);
   }
@@ -921,6 +975,10 @@ static uint32_t g_clone_seq = 0;
 
 bool clone_selected(bool as_mine, int copies, std::string* out_msg) {
   if (copies < 1) copies = 1;
+  if (uprising_active()) {
+    if (out_msg) *out_msg = u8"复制单位：起义时刻暂未适配";
+    return false;
+  }
   auto ents = selected_entities_stable();
   if (ents.empty()) {
     if (out_msg) *out_msg = u8"没读到选中单位（请先选中）";
@@ -959,7 +1017,8 @@ bool clone_selected(bool as_mine, int copies, std::string* out_msg) {
         return false;
       }
     } else {
-      if (!safe_read_u32(ent + 0x418, &owner) || !is_ptr(owner)) {
+      uint32_t owner_off = ent_off(kEntOwner, kEntOwnerEp1);
+      if (!safe_read_u32(ent + owner_off, &owner) || !is_ptr(owner)) {
         fail_n += copies;
         continue;
       }
@@ -1074,6 +1133,10 @@ bool apply_hp(const char* mode, const std::vector<uint32_t>* ents_in,
 }
 
 bool kill_selected(std::string* out_msg) {
+  if (uprising_active()) {
+    if (out_msg) *out_msg = u8"摧毁单位：起义时刻暂未适配";
+    return false;
+  }
   auto ents = selected_entities_stable();
   if (ents.empty()) {
     if (out_msg) *out_msg = u8"没读到选中单位（请先选中）";
@@ -1100,6 +1163,10 @@ bool kill_selected(std::string* out_msg) {
 }
 
 bool rank_up(std::string* out_msg) {
+  if (uprising_active()) {
+    if (out_msg) *out_msg = u8"单位晋升：起义时刻暂未适配";
+    return false;
+  }
   auto ents = selected_entities_stable();
   if (ents.empty()) {
     if (out_msg) *out_msg = u8"没读到选中单位（请先选中）";
@@ -1144,6 +1211,10 @@ bool rank_up(std::string* out_msg) {
 }
 
 bool convert_selected(std::string* out_msg) {
+  if (uprising_active()) {
+    if (out_msg) *out_msg = u8"收编单位：起义时刻暂未适配";
+    return false;
+  }
   auto ents = selected_entities_stable();
   if (ents.empty()) {
     if (out_msg) *out_msg = u8"没读到选中单位（请先选中）";
@@ -1172,6 +1243,10 @@ bool convert_selected(std::string* out_msg) {
 }
 
 bool apply_damage_mult(std::string* out_msg) {
+  if (uprising_active()) {
+    if (out_msg) *out_msg = u8"伤害倍率：起义时刻暂未适配";
+    return false;
+  }
   auto ents = selected_entities_stable();
   if (ents.empty()) {
     if (out_msg) *out_msg = u8"没读到选中单位（请先选中）";
@@ -1254,6 +1329,16 @@ constexpr uint32_t kPlayerListArrayOff = 0x30;
 constexpr uint32_t kPlayerListSlots = 0x14;
 constexpr uint32_t kPlayerMoneyTableOff = 0xE4;
 constexpr uint32_t kPlayerPowerObjOff = 0x74;
+
+// Uprising 1.0 keeps the player-list object (+0x28 local, +0x2C count, +0x30
+// array) and the battle-logic fields (+0x50 ticks, +0x148 mode). Only the
+// globals moved. Retail keeps the constants above.
+static uint32_t player_list_rva() {
+  return uprising_active() ? 0x9009C4u : kLocalPlayerRva;
+}
+static uint32_t battle_logic_rva() {
+  return uprising_active() ? 0x8F0808u : 0x8DDE84u;
+}
 
 static void read_player_display_name(uint32_t player, char* out, size_t out_len) {
   if (!out || out_len < 2) return;
@@ -1643,6 +1728,7 @@ struct FacCache {
   int faction = 0;  // 1 allied, 2 soviet, 3 empire
   int pending = 0;
   int pending_hits = 0;
+  uint32_t next_try = 0;  // throttle for the pointer walk when nothing matched
 };
 static FacCache g_fac_cache[16] = {};
 static int g_fac_cache_n = 0;
@@ -1671,6 +1757,8 @@ static void clear_live_ents() {
   if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
 }
 
+static void clear_seat_diag();
+
 static void clear_roster_caches() {
   g_ent_vec_off_count = 0;
   g_player_vec_cache_n = 0;
@@ -1691,6 +1779,7 @@ static void clear_roster_caches() {
   std::memset(g_ent_vec_offs, 0, sizeof(g_ent_vec_offs));
   std::memset(g_player_vec_cache, 0, sizeof(g_player_vec_cache));
   std::memset(g_roster_order, 0, sizeof(g_roster_order));
+  clear_seat_diag();
   clear_live_ents();
 }
 
@@ -2095,7 +2184,11 @@ static void fill_player_economy_basic(PlayerEconomy* pe, uint32_t player,
     return true;
   };
   if (!(safe_read_u32(player + 0x80, &argb) && take_color(argb))) {
-    if (safe_read_u32(player + 0x84, &argb)) take_color(argb);
+    if (!(safe_read_u32(player + 0x84, &argb) && take_color(argb))) {
+      // Uprising inserts one extra dword before the member block; fall back to
+      // the next slot so a shifted colour still renders. Retail is untouched.
+      if (uprising_active() && safe_read_u32(player + 0x88, &argb)) take_color(argb);
+    }
   }
 
   uint32_t money_table = 0, money_obj = 0, money = 0;
@@ -2401,6 +2494,122 @@ static void install_roster_hooks_impl() {
   log("roster hooks armed create=%p spawn=%p destroy=%p", create, spawn, destroy);
 }
 
+// ---------------------------------------------------------------------------
+// Uprising superweapon / protocol owner diagnostics.
+//
+// The engine resolves the cooldown container as [module + 0x428] and then walks
+// a circular list at owner + 0x218.  These two hooks record every distinct
+// owner that reaches the charge-ratio getter / ready predicate, together with
+// the node count of its +0x218 list and whether the pointer matches a seat in
+// ThePlayerList, so we can tell whether the object we read from the player list
+// really is the owner the engine uses.
+// ---------------------------------------------------------------------------
+static uint32_t g_sp_probe_owners[24];
+static int g_sp_probe_count = 0;
+
+static int sp_list_nodes(uint32_t owner) {
+  const uint32_t sentinel = owner + 0x218;
+  uint32_t node = 0;
+  if (!safe_read_u32(sentinel, &node)) return -1;
+  int n = 0;
+  for (int i = 0; i < 32 && is_ptr(node) && node != sentinel; ++i) {
+    ++n;
+    uint32_t next = 0;
+    if (!safe_read_u32(node, &next) || next == node) break;
+    node = next;
+  }
+  return n;
+}
+
+static void sp_probe_report(const char* tag, uint32_t self, uint32_t arg) {
+  if (!self) return;
+  for (int i = 0; i < g_sp_probe_count; ++i) {
+    if (g_sp_probe_owners[i] == self) return;
+  }
+  if (g_sp_probe_count >= 24) return;
+  const int idx = g_sp_probe_count;
+  g_sp_probe_owners[g_sp_probe_count++] = self;
+
+  uint32_t vt = 0, head = 0, local = 0, list = 0;
+  safe_read_u32(self, &vt);
+  safe_read_u32(self + 0x218, &head);
+  int seat = -1;
+  if (safe_read_u32(loaded_module() + player_list_rva(), &list) && is_ptr(list)) {
+    safe_read_u32(list + kPlayerListLocalOff, &local);
+    for (int i = 0; i < (int)kPlayerListSlots; ++i) {
+      uint32_t p = 0;
+      if (safe_read_u32(list + kPlayerListArrayOff + (uint32_t)i * 4u, &p) && p == self) {
+        seat = i;
+        break;
+      }
+    }
+  }
+  const int nodes = sp_list_nodes(self);
+  uint32_t n0 = 0, k0 = 0, r0 = 0, d0 = 0;
+  if (nodes > 0) {
+    safe_read_u32(head + 0, &n0);
+    safe_read_u32(head + 8, &k0);
+    safe_read_u32(head + 0x0C, &r0);
+    safe_read_u32(head + 0x10, &d0);
+  }
+  log("spowner[%s] #%d self=%08X vt=%08X seat=%d local=%08X isLocal=%d arg=%08X head=%08X "
+      "nodes=%d n0=[next=%08X k=%08X r=%08X d=%08X]",
+      tag, idx, self, vt, seat, local, self == local ? 1 : 0, arg, head, nodes, n0, k0, r0, d0);
+}
+
+typedef float(__fastcall* fn_sp_charge)(void* self, void* edx, void* arg);
+static fn_sp_charge g_orig_sp_charge = nullptr;
+static float __fastcall hk_sp_charge(void* self, void* edx, void* arg) {
+  __try {
+    sp_probe_report("charge", (uint32_t)(uintptr_t)self, (uint32_t)(uintptr_t)arg);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  if (g_orig_sp_charge) return g_orig_sp_charge(self, edx, arg);
+  return 0.f;
+}
+
+typedef unsigned char(__fastcall* fn_sp_ready)(void* self, void* edx, void* arg);
+static fn_sp_ready g_orig_sp_ready = nullptr;
+static unsigned char __fastcall hk_sp_ready(void* self, void* edx, void* arg) {
+  __try {
+    sp_probe_report("ready", (uint32_t)(uintptr_t)self, (uint32_t)(uintptr_t)arg);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  if (g_orig_sp_ready) return g_orig_sp_ready(self, edx, arg);
+  return 0;
+}
+
+static void install_sp_probe() {
+  static bool tried = false;
+  if (tried || !uprising_active() || !loaded_module()) return;
+  tried = true;
+  MH_STATUS st = MH_Initialize();
+  if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) {
+    log("sp probe MH_Initialize failed: %d", (int)st);
+    return;
+  }
+  void* charge = reinterpret_cast<void*>(loaded_module() + (0x88C3B0u - kModBase));
+  void* ready = reinterpret_cast<void*>(loaded_module() + (0x88C420u - kModBase));
+  st = MH_CreateHook(charge, reinterpret_cast<void*>(&hk_sp_charge),
+                     reinterpret_cast<void**>(&g_orig_sp_charge));
+  if (st == MH_OK) {
+    MH_EnableHook(charge);
+    log("sp probe charge hook armed at %p", charge);
+  } else {
+    log("sp probe charge hook failed: %d", (int)st);
+    g_orig_sp_charge = nullptr;
+  }
+  st = MH_CreateHook(ready, reinterpret_cast<void*>(&hk_sp_ready),
+                     reinterpret_cast<void**>(&g_orig_sp_ready));
+  if (st == MH_OK) {
+    MH_EnableHook(ready);
+    log("sp probe ready hook armed at %p", ready);
+  } else {
+    log("sp probe ready hook failed: %d", (int)st);
+    g_orig_sp_ready = nullptr;
+  }
+}
+
 // Gather entities from every player's lists (and global multi-owner lists),
 // then bucket into each PlayerEconomy by owner / player_id.
 static void fill_all_rosters(MatchEconomy* out) {
@@ -2554,6 +2763,32 @@ static int find_seen_seat(uint32_t player) {
   return -1;
 }
 
+// Uprising: before the skirmish seats are initialized, ThePlayerList already
+// exposes an uninitialized dummy "local" player (id 0, no money object). It is
+// replaced by the real seat a fraction of a second later, so if it ever lands
+// in g_seen it comes back as a phantom row for the rest of the match.
+// Logged signature of the dummy: "seat p=... id=0 loc=1 money=0 hm=0 ...".
+// A real local seat always has a money object, so hm=0 is the discriminator.
+static bool seat_is_dummy_local(const PlayerEconomy& pe) {
+  if (!uprising_active()) return false;
+  if (!pe.is_local) return false;
+  if (pe.player_id != 0) return false;
+  return !pe.has_money;
+}
+
+static void drop_dummy_local_seats() {
+  int kept = 0;
+  for (int i = 0; i < g_seen_n; ++i) {
+    if (seat_is_dummy_local(g_seen[i].last)) continue;
+    if (kept != i) g_seen[kept] = g_seen[i];
+    ++kept;
+  }
+  if (kept != g_seen_n) {
+    log("econ: dropped %d dummy local seat(s)", g_seen_n - kept);
+    g_seen_n = kept;
+  }
+}
+
 // +0x106 / +0x123C are set for spectators. Defeat uses the same bytes, so a
 // seat that already has a score stays visible instead of disappearing.
 static bool seat_entered_battle(const PlayerEconomy& pe) {
@@ -2594,6 +2829,101 @@ static bool faction_anchor_key(const char* key) {
          std::strstr(key, "PowerPlant");
 }
 
+static int faction_from_side_name(const char* s) {
+  if (!s || !s[0]) return 0;
+  if (std::strstr(s, "Allied") || std::strstr(s, "Allies")) return 1;
+  if (std::strstr(s, "Soviet")) return 2;
+  if (std::strstr(s, "Japan") || std::strstr(s, "Empire") || std::strstr(s, "Yuriko"))
+    return 3;
+  return 0;
+}
+
+// The side names live in the image as plain C strings. A player reaches one
+// through a short pointer chain (Player -> Side/PlayerTemplate -> name), so
+// matching the string *address* is layout independent and identical for both
+// profiles: only the image base differs.
+static int faction_from_side_string_va(uint32_t image_va) {
+  switch (image_va) {
+    case 0x00C62A2Cu:  // retail FactionAllies
+    case 0x00C74B8Cu:  // uprising FactionAllies
+      return 1;
+    case 0x00C62A1Cu:  // retail FactionSoviet
+    case 0x00C74B7Cu:  // uprising FactionSoviet
+      return 2;
+    case 0x00C62A0Cu:  // retail FactionJapan
+    case 0x00C74B6Cu:  // uprising FactionJapan
+      return 3;
+    default:
+      return 0;
+  }
+}
+
+// Uprising has no unit roster. Walk a bounded pointer graph from the player
+// and look for a side-name string. Depth 3 covers Player -> Template -> Side
+// -> name, and it is cached per player so the cost is paid once a match.
+static int detect_faction_from_player(uint32_t player) {
+  if (!is_ptr(player)) return 0;
+  const uint32_t base = loaded_module();
+  if (!base) return 0;
+  const uint32_t lo = base;
+  const uint32_t hi = base + 0x900000u;
+  auto match = [&](uint32_t raw) -> int {
+    if (raw < lo || raw >= hi) return 0;
+    return faction_from_side_string_va(kModBase + (raw - base));
+  };
+
+  uint32_t queue[128];
+  uint32_t seen[128];
+  int qn = 0, sn = 0, qi = 0;
+  auto enqueue = [&](uint32_t p) {
+    if (!is_ptr(p) || qn >= 128) return;
+    for (int i = 0; i < sn; ++i) {
+      if (seen[i] == p) return;
+    }
+    if (sn < 128) seen[sn++] = p;
+    queue[qn++] = p;
+  };
+  enqueue(player);
+  int depth_end = qn;
+  for (int depth = 0; depth < 3 && qi < qn; ++depth) {
+    const int stop = depth_end;
+    for (; qi < stop; ++qi) {
+      const uint32_t node = queue[qi];
+      for (uint32_t off = 0; off <= 0x400; off += 4) {
+        uint32_t v = 0;
+        if (!safe_read_u32(node + off, &v)) continue;
+        const int f = match(v);
+        if (f) return f;
+        enqueue(v);
+      }
+    }
+    depth_end = qn;
+  }
+  return 0;
+}
+
+// Last resort: read a "Faction*" string straight off the player or one hop
+// away. Cheap and only runs when the address walk found nothing.
+static int detect_faction_by_string(uint32_t player) {
+  if (!is_ptr(player)) return 0;
+  for (uint32_t off = 0x40; off <= 0x280; off += 4) {
+    uint32_t p = 0;
+    if (!safe_read_u32(player + off, &p) || !is_ptr(p)) continue;
+    char buf[48] = {};
+    if (safe_read_bytes(p, buf, sizeof(buf) - 1) && std::strncmp(buf, "Faction", 7) == 0) {
+      const int f = faction_from_side_name(buf);
+      if (f) return f;
+    }
+    uint32_t p2 = 0;
+    if (!safe_read_u32(p, &p2) || !is_ptr(p2)) continue;
+    if (safe_read_bytes(p2, buf, sizeof(buf) - 1) && std::strncmp(buf, "Faction", 7) == 0) {
+      const int f = faction_from_side_name(buf);
+      if (f) return f;
+    }
+  }
+  return 0;
+}
+
 static int detect_faction(const PlayerEconomy& pe) {
   int anchor[4] = {};
   int all[4] = {};
@@ -2618,7 +2948,39 @@ static int detect_faction(const PlayerEconomy& pe) {
       best_n = all[f];
     }
   }
-  return best;
+  if (best) return best;
+  int f = detect_faction_from_player(pe.player);
+  if (!f) f = detect_faction_by_string(pe.player);
+  return f;
+}
+
+// The engine always creates one extra seat for the neutral / civilian side.
+// It carries no team colour at all (the default 0x808080 gray) and never
+// receives starting money, so it can be told apart from a real participant.
+static bool uprising_neutral_seat(const PlayerEconomy& pe) {
+  if (pe.is_local) return false;
+  const bool gray = pe.has_color && pe.color_r == 0x80 && pe.color_g == 0x80 && pe.color_b == 0x80;
+  if (!gray) return false;
+  // A real participant always receives starting cash, the neutral seat never does.
+  return !pe.money;
+}
+
+// Uprising: no roster yet, so retail seat_entered_battle (needs unit counts)
+// would hide everyone. Keep seats that look like real match players.
+static bool uprising_seat_ok(const PlayerEconomy& pe) {
+  if (!is_ptr(pe.player)) return false;
+  if (seat_is_dummy_local(pe)) return false;
+  if (!pe.is_local && pe.player_id == 0) return false;
+  if (uprising_neutral_seat(pe)) return false;
+  uint8_t observer = 0, replay = 0;
+  if (!safe_read_bytes(pe.player + 0x106, &observer, 1) ||
+      !safe_read_bytes(pe.player + 0x123C, &replay, 1)) {
+    return pe.is_local;
+  }
+  if ((observer != 0 || replay != 0) && !pe.is_local) return false;
+  if (pe.is_local) return true;
+  if (!pe.has_money) return false;
+  return pe.has_color || pe.has_power || pe.has_score;
 }
 
 static int anchor_count_for(const PlayerEconomy& pe, int faction) {
@@ -2670,11 +3032,93 @@ static int remember_faction(uint32_t player, const PlayerEconomy& pe, int detect
   return detected;
 }
 
+// One diagnostic line per seat per match so a bad offset, a filtered-out real
+// player, or a missed side pointer is visible in ra3_overlay.log.
+static uint32_t g_seat_diag[16] = {};
+static int g_seat_diag_n = 0;
+
+static bool seat_diag_once(uint32_t player) {
+  for (int i = 0; i < g_seat_diag_n; ++i) {
+    if (g_seat_diag[i] == player) return false;
+  }
+  if (g_seat_diag_n < 16) g_seat_diag[g_seat_diag_n++] = player;
+  return true;
+}
+
+static void clear_seat_diag() { g_seat_diag_n = 0; }
+
+// Side objects and their name strings live inside the game image, so any
+// player field that points back into the image is a candidate for the side
+// pointer. Logged once per seat per match to pin the layout down.
+static void dump_player_image_refs_once(uint32_t player) {
+  const uint32_t base = loaded_module();
+  if (!base || !is_ptr(player)) return;
+  for (uint32_t off = 0; off < 0x400; off += 4) {
+    uint32_t v = 0;
+    if (!safe_read_u32(player + off, &v)) continue;
+    if (v < base || v >= base + 0x900000u) continue;
+    uint32_t w[4] = {};
+    safe_read_u32(v, &w[0]);
+    safe_read_u32(v + 4, &w[1]);
+    safe_read_u32(v + 8, &w[2]);
+    safe_read_u32(v + 12, &w[3]);
+    char txt[24] = {};
+    if (safe_read_bytes(v, txt, sizeof(txt) - 1)) {
+      txt[sizeof(txt) - 1] = 0;
+      for (size_t k = 0; k < sizeof(txt); ++k) {
+        if (txt[k] == 0) break;
+        if (txt[k] < 0x20 || txt[k] > 0x7E) {
+          txt[0] = 0;
+          break;
+        }
+      }
+    }
+    log("imgref p=%08X off=%03X rva=%X [%08X %08X %08X %08X] %s", player, off, v - base, w[0],
+        w[1], w[2], w[3], txt[0] ? txt : "");
+  }
+}
+
+static FacCache* fac_slot(uint32_t player, bool create) {
+  for (int i = 0; i < g_fac_cache_n; ++i) {
+    if (g_fac_cache[i].player == player) return &g_fac_cache[i];
+  }
+  if (create && g_fac_cache_n < 16) {
+    g_fac_cache[g_fac_cache_n].player = player;
+    ++g_fac_cache_n;
+    return &g_fac_cache[g_fac_cache_n - 1];
+  }
+  return nullptr;
+}
+
 static void apply_seat_labels(MatchEconomy* out) {
   if (!out) return;
+  const bool up = uprising_active();
   for (int i = 0; i < out->player_count; ++i) {
     PlayerEconomy& pe = out->players[i];
-    const int faction = remember_faction(pe.player, pe, detect_faction(pe));
+    FacCache* slot = fac_slot(pe.player, true);
+    int faction = slot ? slot->faction : 0;
+    const uint32_t now_ms = GetTickCount();
+    // Uprising: the pointer walk is heavy, so only retry every couple of
+    // seconds once a seat has been measured and stayed unknown.
+    const bool due = !up || !slot || !slot->next_try ||
+                     (int32_t)(now_ms - slot->next_try) >= 0;
+    if (!faction && due) {
+      int detected = detect_faction(pe);
+      if (!detected) detected = detect_faction_from_player(pe.player);
+      if (!detected) detected = detect_faction_by_string(pe.player);
+      faction = remember_faction(pe.player, pe, detected);
+      if (up && slot) slot->next_try = now_ms + 2000;
+    }
+    if (up && seat_diag_once(pe.player)) {
+      uint8_t observer = 0, replay = 0;
+      safe_read_bytes(pe.player + 0x106, &observer, 1);
+      safe_read_bytes(pe.player + 0x123C, &replay, 1);
+      log("seat p=%08X id=%u loc=%d money=%u hm=%d hp=%d hs=%d obs=%02X/%02X gray=%d fac=%d ok=%d",
+          pe.player, pe.player_id, pe.is_local ? 1 : 0, pe.money, pe.has_money ? 1 : 0,
+          pe.has_power ? 1 : 0, pe.has_score ? 1 : 0, (unsigned)observer, (unsigned)replay,
+          uprising_neutral_seat(pe) ? 1 : 0, faction, uprising_seat_ok(pe) ? 1 : 0);
+      dump_player_image_refs_once(pe.player);
+    }
     const char* fac = faction == 1 ? u8"盟军" : faction == 2 ? u8"苏联" : faction == 3 ? u8"帝国" : u8"玩家";
     std::snprintf(pe.name, sizeof(pe.name), "%s", fac);
   }
@@ -3124,7 +3568,7 @@ static void fill_player_protocols(PlayerEconomy* pe) {
   ensure_protocol_keys();
   uint32_t logic = 0;
   uint32_t now = 0;
-  if (safe_read_u32(module_base() + 0x8DDE84, &logic) && is_ptr(logic)) {
+  if (safe_read_u32(loaded_module() + battle_logic_rva(), &logic) && is_ptr(logic)) {
     safe_read_u32(logic + 0x50, &now);
   }
 
@@ -3225,33 +3669,332 @@ static void fill_player_protocols(PlayerEconomy* pe) {
   }
 }
 
-static void clear_local_superweapon_cooldowns() {
-  if (get_flag(0x0D) == 0) return;
+// Uprising: dump the raw dwords around the special-power list head plus any
+// node reachable from the player whose +0x10 looks like a cooldown duration,
+// so the real container can be identified instead of guessed.
+static void probe_power_list_once(uint32_t player) {
+  uint32_t now = 0;
+  uint32_t logic = 0;
+  if (safe_read_u32(loaded_module() + battle_logic_rva(), &logic) && is_ptr(logic)) {
+    safe_read_u32(logic + 0x50, &now);
+  }
+  log("-- probe player=%08X now=%08X --", player, now);
+  {
+    uint32_t list = 0;
+    safe_read_u32(loaded_module() + player_list_rva(), &list);
+    uint32_t cnt = 0;
+    safe_read_u32(list + 0x2C, &cnt);
+    log("plist=%08X active=%u local=%08X head218=%08X", list, cnt, player,
+        *reinterpret_cast<uint32_t*>(player + 0x218));
+  }
+  for (uint32_t base = 0x200; base <= 0x2A0; base += 0x10) {
+    uint32_t v[4] = {};
+    safe_read_u32(player + base, &v[0]);
+    safe_read_u32(player + base + 4, &v[1]);
+    safe_read_u32(player + base + 8, &v[2]);
+    safe_read_u32(player + base + 12, &v[3]);
+    log("pb %03X: %08X %08X %08X %08X", base, v[0], v[1], v[2], v[3]);
+  }
+  const uint32_t heads[] = {0x218, 0x248, 0x1238, 0x1320};
+  for (uint32_t hi = 0; hi < 4; ++hi) {
+    const uint32_t head = player + heads[hi];
+    uint32_t node = 0;
+    if (!safe_read_u32(head, &node)) continue;
+    log("ph %03X: node=%08X self=%d", heads[hi], node, node == head ? 1 : 0);
+    for (int k = 0; k < 4 && is_ptr(node) && node != head; ++k) {
+      uint32_t w[6] = {};
+      for (int j = 0; j < 6; ++j) safe_read_u32(node + j * 4, &w[j]);
+      log("pn %03X[%d] %08X: %08X %08X %08X %08X %08X %08X", heads[hi], k, node, w[0], w[1],
+          w[2], w[3], w[4], w[5]);
+      uint32_t next = 0;
+      if (!safe_read_u32(node, &next) || next == node) break;
+      node = next;
+    }
+  }
+  // Any pointer reachable from the player that carries a cooldown-shaped pair.
+  int hits = 0;
+  for (uint32_t off = 0; off < 0x1400 && hits < 40; off += 4) {
+    uint32_t p = 0;
+    if (!safe_read_u32(player + off, &p) || !is_ptr(p)) continue;
+    uint32_t key = 0, ready = 0, dur = 0;
+    if (!safe_read_u32(p + 8, &key)) continue;
+    if (!safe_read_u32(p + 0x0C, &ready)) continue;
+    if (!safe_read_u32(p + 0x10, &dur)) continue;
+    if (dur == 0 || dur >= 0x200000u) continue;
+    if (ready == 0 || ready > now + 0x200000u) continue;
+    log("pcand off=%03X p=%08X key=%08X ready=%08X dur=%08X d=%d", off, p, key, ready, dur,
+        (int32_t)(ready - now));
+    ++hits;
+  }
+  log("-- probe done hits=%d --", hits);
+}
+
+// ---------------------------------------------------------------------------
+// Uprising: local player plumbing for the no-cooldown family.
+//
+// Retail flips the special-power module's "ready at" field ([module + 0x20]) to
+// 1 from the MustCode SuperPower stub at 0x729F19. The Uprising twin sits at
+// 0x73BB19 and reads the owner as [module - 8 + 0x428] instead of +0x418, but
+// the stub only knows the local player through IDB, and IDB is refreshed by the
+// PlayerID hook, which the engine only calls while it draws the local player's
+// id. After a new match IDB can therefore still point at the previous player and
+// the owner test never matches — superweapons and protocol powers keep their
+// cooldowns. Keep IDB in step with ThePlayerList and answer the module
+// readiness predicates (SpecialPowerModule::isReady / ready-ratio) directly for
+// the local player's modules, so the feature no longer depends on the stub.
+// ---------------------------------------------------------------------------
+static uint32_t uprising_list_local() {
+  if (!uprising_active() || !loaded_module()) return 0;
   uint32_t list = 0;
-  if (!safe_read_u32(module_base() + kLocalPlayerRva, &list) || !is_ptr(list)) return;
+  if (!safe_read_u32(loaded_module() + player_list_rva(), &list) || !is_ptr(list)) return 0;
+  uint32_t local = 0;
+  if (!safe_read_u32(list + kPlayerListLocalOff, &local) || !is_ptr(local)) return 0;
+  return local;
+}
+
+static uint32_t g_last_module_owner = 0;
+static uint32_t g_ready_bool_hits = 0;
+static uint32_t g_ready_ratio_hits = 0;
+
+// [module - 8] is the module container; its +0x428 field is the owner player
+// (the engine itself reads it at 0x73BB19). Smallest possible work per call.
+static bool sp_module_owned_by_local(void* self) {
+  const uint32_t s = reinterpret_cast<uint32_t>(self);
+  if (!is_ptr(s)) return false;
+  uint32_t container = 0;
+  if (!safe_read_u32(s - 8u, &container) || !is_ptr(container)) return false;
+  uint32_t owner = 0;
+  if (!safe_read_u32(container + 0x428u, &owner) || !is_ptr(owner)) return false;
+  g_last_module_owner = owner;
+  const uint32_t local = uprising_list_local();
+  if (local && owner == local) return true;
+  if (idb_base()) {
+    const uint32_t cached = read_u32(reinterpret_cast<uint32_t>(idb_base()));
+    if (is_ptr(cached) && owner == cached) return true;
+  }
+  return false;
+}
+
+// Uprising 0x75BB90: SpecialPowerModule::isReady(). Both of its branches agree
+// once [module + 0x20] is in the past, so report ready outright for the local
+// player's modules while a ready toggle (0x18/0x19/0x1A -> 0x0D) is on.
+typedef unsigned char(__fastcall* fn_sp_ready_bool)(void* self, void* edx);
+static fn_sp_ready_bool g_orig_sp_ready_bool = nullptr;
+static unsigned char __fastcall hk_sp_ready_bool(void* self, void* edx) {
+  __try {
+    if (get_flag(0x0D) != 0 && sp_module_owned_by_local(self)) {
+      ++g_ready_bool_hits;
+      return 1;
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  if (g_orig_sp_ready_bool) return g_orig_sp_ready_bool(self, edx);
+  return 0;
+}
+
+// Uprising 0x73BAA0: the ready ratio (0 = just fired, 1 = ready) that paints the
+// command bar and feeds the list based check. This is the function the retail
+// SuperPower stub patches; return 1.0f directly instead of relying on the stub.
+typedef float(__fastcall* fn_sp_ready_ratio)(void* self, void* edx);
+static fn_sp_ready_ratio g_orig_sp_ready_ratio = nullptr;
+static float __fastcall hk_sp_ready_ratio(void* self, void* edx) {
+  __try {
+    if (get_flag(0x0D) != 0 && sp_module_owned_by_local(self)) {
+      ++g_ready_ratio_hits;
+      return 1.0f;
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  if (g_orig_sp_ready_ratio) return g_orig_sp_ready_ratio(self, edx);
+  return 0.f;
+}
+
+static void install_uprising_power_ready_hooks() {
+  static bool tried = false;
+  if (tried || !uprising_active() || !loaded_module()) return;
+  tried = true;
+  MH_STATUS st = MH_Initialize();
+  if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) {
+    log("power ready MH_Initialize failed: %d", (int)st);
+    return;
+  }
+  void* ratio = reinterpret_cast<void*>(loaded_module() + (0x73BAA0u - kModBase));
+  st = MH_CreateHook(ratio, reinterpret_cast<void*>(&hk_sp_ready_ratio),
+                     reinterpret_cast<void**>(&g_orig_sp_ready_ratio));
+  if (st == MH_OK) {
+    MH_EnableHook(ratio);
+    log("power ready ratio hook armed at %p", ratio);
+  } else {
+    log("power ready ratio hook failed: %d", (int)st);
+    g_orig_sp_ready_ratio = nullptr;
+  }
+  void* ready = reinterpret_cast<void*>(loaded_module() + (0x75BB90u - kModBase));
+  st = MH_CreateHook(ready, reinterpret_cast<void*>(&hk_sp_ready_bool),
+                     reinterpret_cast<void**>(&g_orig_sp_ready_bool));
+  if (st == MH_OK) {
+    MH_EnableHook(ready);
+    log("power ready bool hook armed at %p", ready);
+  } else {
+    log("power ready bool hook failed: %d", (int)st);
+    g_orig_sp_ready_bool = nullptr;
+  }
+}
+
+// Publish the engine's own local player into IDB (Player* at +0, player id at
+// +4) so every [IDB] comparing stub sees the player of the current match.
+static void sync_idb_local_player() {
+  uint8_t* idb = idb_base();
+  if (!idb) return;
+  const uint32_t local = uprising_list_local();
+  if (!local) return;
+  uint32_t id = 0;
+  safe_read_u32(local + 0x20, &id);
+  uint32_t* box = reinterpret_cast<uint32_t*>(idb);
+  if (box[0] == local && box[1] == id) return;
+  static uint32_t next_log = 0;
+  const uint32_t tick = GetTickCount();
+  if ((int32_t)(tick - next_log) >= 0) {
+    next_log = tick + 5000;
+    log("idb sync %08X/%u -> %08X/%u", box[0], box[1], local, id);
+  }
+  box[0] = local;
+  box[1] = id;
+}
+
+static void clear_local_superweapon_cooldowns() {
+  if (!loaded_module()) return;
+  // Uprising only: keep 0x0D in sync with the toggles every frame so a state
+  // that never went through the toggle path can still arm the clear.
+  if (uprising_active()) {
+    sync_power_flags_from_toggles();
+    install_sp_probe();
+    install_uprising_power_ready_hooks();
+    sync_idb_local_player();
+  }
+
+  if (uprising_active()) {
+    static uint32_t probed = 0;
+    static int probes = 0;
+    static uint32_t next_probe = 0;
+    uint32_t lp = 0;
+    if (safe_read_u32(loaded_module() + player_list_rva(), &lp) && is_ptr(lp) &&
+        safe_read_u32(lp + kPlayerListLocalOff, &lp) && is_ptr(lp)) {
+      if (lp != probed) {
+        probed = lp;
+        probes = 0;
+        next_probe = 0;
+      }
+      const uint32_t tick = GetTickCount();
+      if (probes < 8 && (int32_t)(tick - next_probe) >= 0) {
+        ++probes;
+        next_probe = tick + 15000;
+        probe_power_list_once(lp);
+      }
+    }
+  }
+
+
+  static uint32_t next_log = 0;
+  const uint32_t now = GetTickCount();
+  const bool want_log = uprising_active() && (int32_t)(now - next_log) >= 0;
+
+  if (get_flag(0x0D) == 0) {
+    if (want_log) {
+      next_log = now + 3000;
+      log("pwc derived flag 0x0D=0 (sw=%d proto=%d skill=%d)", (int)get_flag(0x18),
+          (int)get_flag(0x19), (int)get_flag(0x1A));
+    }
+    return;
+  }
+
+  uint32_t list = 0;
+  if (!safe_read_u32(loaded_module() + player_list_rva(), &list) || !is_ptr(list)) {
+    if (want_log) {
+      next_log = now + 3000;
+      log("pwc no player list");
+    }
+    return;
+  }
   uint32_t player = 0;
-  if (!safe_read_u32(list + kPlayerListLocalOff, &player) || !is_ptr(player)) return;
+  if (!safe_read_u32(list + kPlayerListLocalOff, &player) || !is_ptr(player)) {
+    if (want_log) {
+      next_log = now + 3000;
+      log("pwc no local player list=%08X", list);
+    }
+    return;
+  }
+
+  // The list is circular with its sentinel embedded at Player+0x218.
   const uint32_t head = player + 0x218;
   uint32_t node = 0;
   if (!safe_read_u32(head, &node)) return;
-  for (int n = 0; n < 32 && is_ptr(node) && node != head; ++n) {
-    uint32_t dur = 0, next = 0;
-    if (safe_read_u32(node + 0x10, &dur) && dur <= 15u * 1200u) {
-      safe_write_u32(node + 0x0C, 0);
+  if (want_log) log("pwc head raw=%08X self=%d", node, node == head ? 1 : 0);
+
+  int seen = 0, cleared = 0;
+  uint32_t dbg[3][3] = {};
+  int dbg_n = 0;
+  for (int n = 0; n < 64 && is_ptr(node) && node != head; ++n) {
+    uint32_t key = 0, ready = 0, dur = 0, next = 0;
+    safe_read_u32(node + 8, &key);
+    safe_read_u32(node + 0x0C, &ready);
+    safe_read_u32(node + 0x10, &dur);
+    if (dbg_n < 3) {
+      dbg[dbg_n][0] = key;
+      dbg[dbg_n][1] = ready;
+      dbg[dbg_n][2] = dur;
+      ++dbg_n;
+    }
+    ++seen;
+    // The entry is a cooldown when it has a duration; anything odd is left
+    // alone so unrelated nodes never get corrupted.
+    if (dur != 0 && dur < 0x100000u) {
+      if (ready != 0) {
+        safe_write_u32(node + 0x0C, 0);
+        ++cleared;
+      }
     }
     if (!safe_read_u32(node, &next) || next == node) break;
     node = next;
+  }
+
+  if (want_log) {
+    next_log = now + 3000;
+    uint32_t idb_p = 0, idb_id = 0;
+    if (idb_base()) {
+      idb_p = *reinterpret_cast<uint32_t*>(idb_base());
+      idb_id = *reinterpret_cast<uint32_t*>(idb_base() + 4);
+    }
+    uint32_t p428 = 0;
+    safe_read_u32(player + 0x428, &p428);
+    log("pwc local=%08X head=%08X seen=%d cleared=%d idb=%08X/%08X owner428=%08X(%s) "
+        "readyHits=%u/%u lastOwner=%08X n0=[k=%08X r=%08X d=%08X] n1=[k=%08X r=%08X d=%08X]",
+        player, head, seen, cleared, idb_p, idb_id, p428, p428 == player ? "self" : "other",
+        (unsigned)g_ready_bool_hits, (unsigned)g_ready_ratio_hits, g_last_module_owner,
+        dbg[0][0], dbg[0][1], dbg[0][2], dbg[1][0], dbg[1][1], dbg[1][2]);
+    if (seen == 0) {
+      uint32_t p1c = 0, p20 = 0, p24 = 0;
+      safe_read_u32(player + 0x1C, &p1c);
+      safe_read_u32(player + 0x20, &p20);
+      safe_read_u32(player + 0x24, &p24);
+      int m20 = is_ptr(p20) ? sp_list_nodes(p20) : -2;
+      log("pwc hint: +0x218 empty; p1C=%08X p20=%08X(%d nodes) p24=%08X p428=%08X "
+          "(build/charge a superweapon for this feature to matter)",
+          p1c, p20, m20, p24, p428);
+    }
   }
 }
 
 static bool read_battle_clock(uint32_t* logic_out, float* seconds_out) {
   if (logic_out) *logic_out = 0;
   if (seconds_out) *seconds_out = 0.f;
+  const uint32_t base = loaded_module();
+  if (!base) return false;
   uint32_t logic = 0;
-  if (!safe_read_u32(module_base() + 0x8DDE84, &logic) || !is_ptr(logic)) return false;
+  if (!safe_read_u32(base + battle_logic_rva(), &logic) || !is_ptr(logic)) return false;
   uint32_t mode = 0;
   if (!safe_read_u32(logic + 0x148, &mode)) return false;
-  const bool active = mode == 1 || mode == 2 || mode == 4 || mode == 6 || mode == 7;
+  const bool active = mode == 1 || mode == 2 || mode == 4 || mode == 6 || mode == 7 ||
+                      (uprising_active() && (mode == 5 || mode == 8));
   if (!active) return false;
   uint32_t ticks = 0;
   float secs = 0.f;
@@ -3266,7 +4009,7 @@ static bool read_battle_clock(uint32_t* logic_out, float* seconds_out) {
 bool collect_match_economy_impl(MatchEconomy* out) {
   if (!out) return false;
   *out = MatchEconomy{};
-  if (!module_base()) {
+  if (!loaded_module()) {
     std::snprintf(out->note, sizeof(out->note), u8"未找到游戏模块");
     return false;
   }
@@ -3298,7 +4041,7 @@ bool collect_match_economy_impl(MatchEconomy* out) {
   out->match_seconds = battle_seconds;
 
   uint32_t list = 0;
-  if (!safe_read_u32(module_base() + kLocalPlayerRva, &list) || !is_ptr(list)) {
+  if (!safe_read_u32(loaded_module() + player_list_rva(), &list) || !is_ptr(list)) {
     clear_roster_caches();
     std::snprintf(out->note, sizeof(out->note), u8"未进入对局（PlayerList 为空）");
     return false;
@@ -3334,12 +4077,15 @@ bool collect_match_economy_impl(MatchEconomy* out) {
 
   // Fallback: local even if values not ready yet.
   if (out->player_count == 0 && is_ptr(local)) {
-    fill_player_economy_basic(&out->players[0], local, local);
-    out->player_count = 1;
+    PlayerEconomy pe{};
+    fill_player_economy_basic(&pe, local, local);
+    if (!seat_is_dummy_local(pe)) {
+      out->players[out->player_count++] = pe;
+    }
   }
 
-  // Unit/building tallies for every seat (incl. other players).
-  fill_all_rosters(out);
+  // Unit tallies use retail entity offsets. Leave them off on Uprising.
+  if (!uprising_active()) fill_all_rosters(out);
 
   // Drop spectators and seats that have not entered. Keep anyone already
   // shown this match, including after defeat.
@@ -3348,8 +4094,13 @@ bool collect_match_economy_impl(MatchEconomy* out) {
     for (int i = 0; i < out->player_count; ++i) {
       PlayerEconomy& pe = out->players[i];
       const int seen_i = find_seen_seat(pe.player);
-      if (!seat_entered_battle(pe) && seen_i < 0) continue;
-      mark_defeated_flag(&pe);
+      if (uprising_active()) {
+        if (seat_is_dummy_local(pe)) continue;
+        if (!uprising_seat_ok(pe) && seen_i < 0) continue;
+      } else {
+        if (!seat_entered_battle(pe) && seen_i < 0) continue;
+        mark_defeated_flag(&pe);
+      }
       if (seen_i >= 0 && !seat_has_record(pe) && seat_has_record(g_seen[seen_i].last)) {
         PlayerEconomy snap = g_seen[seen_i].last;
         snap.defeated = true;
@@ -3373,13 +4124,18 @@ bool collect_match_economy_impl(MatchEconomy* out) {
 
   apply_seat_labels(out);
 
+  // Scrub any dummy local seat recorded before this fix / earlier in the match.
+  if (uprising_active()) drop_dummy_local_seats();
+
   {
     bool present[kMaxEconPlayers] = {};
     for (int i = 0; i < out->player_count; ++i) {
       PlayerEconomy& pe = out->players[i];
       int seen_i = find_seen_seat(pe.player);
-      if (seen_i < 0 && g_seen_n < kMaxEconPlayers &&
-          (seat_entered_battle(pe) || pe.defeated)) {
+      const bool keep_seen =
+          uprising_active() ? (uprising_seat_ok(pe) || pe.defeated)
+                            : (seat_entered_battle(pe) || pe.defeated);
+      if (seen_i < 0 && g_seen_n < kMaxEconPlayers && keep_seen) {
         seen_i = g_seen_n++;
         g_seen[seen_i].player = pe.player;
       }
@@ -3391,6 +4147,7 @@ bool collect_match_economy_impl(MatchEconomy* out) {
     for (int s = 0; s < g_seen_n && out->player_count < kMaxEconPlayers; ++s) {
       if (present[s]) continue;
       PlayerEconomy snap = g_seen[s].last;
+      if (seat_is_dummy_local(snap)) continue;
       snap.defeated = true;
       snap.roster_count = 0;
       snap.unit_total = 0;
@@ -3415,7 +4172,9 @@ bool collect_match_economy_impl(MatchEconomy* out) {
     }
   }
 
-  for (int i = 0; i < out->player_count; ++i) fill_player_protocols(&out->players[i]);
+  if (!uprising_active()) {
+    for (int i = 0; i < out->player_count; ++i) fill_player_protocols(&out->players[i]);
+  }
 
   out->valid = out->player_count > 0;
   if (!out->valid) {
@@ -4415,6 +5174,10 @@ static SummonSnap g_summon_snap;
 
 static bool summon_prepare_impl(uint32_t player, int count, const char* const* type_ids,
                                 int type_count, std::string* out_msg) {
+  if (!module_base()) {
+    if (out_msg) *out_msg = u8"未找到游戏模块";
+    return false;
+  }
   if (count < 1) count = 1;
   if (count > 20) count = 20;
   if (!type_ids || type_count <= 0) {
@@ -4954,11 +5717,20 @@ bool set_spawn_rank(int level, std::string* out_msg) {
 }
 
 bool adjust_local_money(int delta, std::string* out_msg) {
-  if (!module_base()) {
+  if (!loaded_module()) {
     if (out_msg) *out_msg = u8"未找到游戏模块";
     return false;
   }
-  uint32_t local = local_owner_for_ops();
+  uint32_t local = 0;
+  if (module_base()) {
+    local = local_owner_for_ops();
+  } else if (uprising_active()) {
+    uint32_t list = 0;
+    if (safe_read_u32(loaded_module() + player_list_rva(), &list) && is_ptr(list)) {
+      safe_read_u32(list + kPlayerListLocalOff, &local);
+    }
+    if (!is_ptr(local)) local = local_owner_for_ops();
+  }
   if (!is_ptr(local)) {
     if (out_msg) *out_msg = u8"未找到己方玩家（请先进入对局）";
     return false;
@@ -4967,7 +5739,7 @@ bool adjust_local_money(int delta, std::string* out_msg) {
 }
 
 bool adjust_selected_player_money(int delta, std::string* out_msg) {
-  if (!module_base()) {
+  if (!loaded_module()) {
     if (out_msg) *out_msg = u8"未找到游戏模块";
     return false;
   }
