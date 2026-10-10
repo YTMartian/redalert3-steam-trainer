@@ -8,6 +8,14 @@ set "PYTHONIOENCODING=utf-8"
 cd /d "%~dp0.."
 set "REPO=%CD%"
 
+rem Always rebuild the overlay DLL first, then embed it. Otherwise main.exe
+rem would keep shipping a stale ra3_overlay_v4.dll (new UI panels would be
+rem missing at runtime even though the DLL on disk is up to date).
+if /i "%~1" neq "norebuild" (
+  echo [0/4] rebuilding ra3_overlay_v4.dll ...
+  call "%~dp0build.bat" || goto :err
+)
+
 set "PY=python"
 where python >nul 2>nul || set "PY=py"
 if exist "%LOCALAPPDATA%\Programs\Python\Python39\python.exe" set "PY=%LOCALAPPDATA%\Programs\Python\Python39\python.exe"

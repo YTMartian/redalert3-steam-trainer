@@ -592,6 +592,10 @@ void init() {
   install_script_player_guard();
   install_player_list_read_guard();
   install_roster_hooks();
+  camera_install_hook();
+  time_control_install();
+  lua_bridge_install();
+  misc_install();
 }
 
 void shutdown() {
@@ -1460,9 +1464,21 @@ static const HotkeySlot kDefaultHotkeys[] = {
     {"unit_kill", "unit_kill", VK_DELETE, false, false, false},
     {"unit_clone", "unit_clone", 'I', false, false, false},
     {"summon_troops", "summon_troops", 'U', false, false, false},
+    // 摄像机（对应 CameraBridge 的默认快捷键 Ctrl+E / Ctrl+S，可自行改）
+    {"cam_play", "cam_play", 'E', true, false, false},
+    {"cam_stop", "cam_stop", 'E', true, true, false},
+    {"cam_mark", "cam_mark", 'K', true, false, false},
+    {"cam_save", "cam_save", 'S', true, false, false},
+    // 时间控制（对应 CameraBridge 的时间暂停插件，可自行改键）
+    {"time_toggle", "time_toggle", 'T', true, false, false},
+    {"time_pause", "time_pause", 'W', true, true, false},
+    {"time_restore", "time_restore", 'Q', true, true, false},
+    // 动画 / Lua（对应 CameraBridge 的动画跟踪与 Lua 桥，可自行改键）
+    {"lua_probe", "lua_probe", 'L', true, false, false},
+    {"lua_dump_state", "lua_dump_state", 'L', true, true, false},
 };
 
-static HotkeySlot g_hotkeys[32];
+static HotkeySlot g_hotkeys[40];
 static int g_hotkey_n = 0;
 static bool g_hotkey_capture = false;
 
@@ -1644,6 +1660,19 @@ static const FeatureInfo kFeatures[] = {
     {"spawn_mcv", u8"召唤基地车", "engine", 0},
     {"summon_troops", u8"召唤部队", "engine", 0},
     {"spawn_rank", u8"出场等级", "spawn_rank", 0},
+    {"cam_play", u8"摄像机动画", "engine", 0},
+    {"cam_stop", u8"停止摄像机动画", "engine", 0},
+    {"cam_mark", u8"记录摄像机节点", "engine", 0},
+    {"cam_save", u8"保存摄像机轨道", "engine", 0},
+    {"time_toggle", u8"时间控制 开/关", "engine", 0},
+    {"time_pause", u8"暂停游戏时间", "engine", 0},
+    {"time_slow", u8"慢放 0.5x", "engine", 0},
+    {"time_1x", u8"常速 1.0x", "engine", 0},
+    {"time_fast", u8"快放 2.0x", "engine", 0},
+    {"time_fast3", u8"快放 3.0x", "engine", 0},
+    {"time_restore", u8"恢复游戏时间", "engine", 0},
+    {"lua_probe", u8"读取动画 Lua 变量", "engine", 0},
+    {"lua_dump_state", u8"输出 Lua 状态", "engine", 0},
 };
 
 static const char* kGroupRes[] = {"money_sel", "money", "power", "scpoint", "haveallsc", "fastbuild", "oremine"};
@@ -1653,13 +1682,20 @@ static const char* kGroupAmmo[] = {"ammo", "danger"};
 static const char* kGroupUnit[] = {
     "speed_max", "speed_slow", "speed_freeze", "speed_restore", "hp_max", "hp_min", "hp_normal",
     "unit_rank", "unit_kill", "unit_clone", "convert_unit", "spawn_unit", "clone_multi",
-    "damage_mult", "full_buff", "spawn_rank", "spawn_mcv", "summon_troops"};
+                                    "damage_mult", "full_buff", "spawn_rank", "spawn_mcv", "summon_troops"};
+
+static const char* kGroupTime[] = {"time_toggle", "time_pause", "time_slow", "time_1x",
+                                   "time_fast", "time_fast3", "time_restore"};
+
+static const char* kGroupLua[] = {"lua_probe", "lua_dump_state"};
 
 static const GroupInfo kGroups[] = {
     {u8"资源", kGroupRes, 7, u8"己方默认 +10万；玩家资金从列表选择阵营后加减（默认 1万）"},
     {u8"超武 / 地图", kGroupSw, 7, nullptr},
     {u8"弹药 / 危险", kGroupAmmo, 2, nullptr},
     {u8"单位操作", kGroupUnit, 18, u8"需先在游戏里选中单位"},
+    {u8"时间控制", kGroupTime, 7, u8"控制整局游戏速度（0 = 暂停），左边「时间控制」有滑块面板"},
+    {u8"动画 / Lua", kGroupLua, 2, u8"对应 CameraBridge 的动画跟踪与 Lua 桥，细节在左边「动画 / Lua」面板"},
 };
 
 const FeatureInfo* features(int* count) {

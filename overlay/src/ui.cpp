@@ -29,6 +29,10 @@ HWND g_hwnd = nullptr;
 int g_group = 0;
 bool g_show_settings = false;
 bool g_show_build_lock = false;
+bool g_show_camera = false;
+bool g_show_time = false;
+bool g_show_lua = false;
+bool g_show_misc = false;
 bool g_stats_open = false;
 bool g_stats_pinned = false;
 bool g_stats_compact = false;
@@ -2730,6 +2734,1067 @@ static void draw_build_lock_panel() {
   ImGui::PopStyleColor();
 }
 
+constexpr float kRad2Deg = 57.2957795f;
+constexpr float kDeg2Rad = 0.0174532925f;
+
+float deg_of_rad(float rad) {
+  float d = rad * kRad2Deg;
+  while (d > 180.f) d -= 360.f;
+  while (d <= -180.f) d += 360.f;
+  return d;
+}
+
+// 摄像机页面（CameraBridge 的「摄像机操作」）
+void draw_camera_panel() {
+  static game_api::CameraState s_edit;
+  static bool s_edit_ok = false;
+  static bool s_follow = true;
+  static float s_step_pos = 50.f;
+  static float s_step_ang = 5.f;
+  static float s_step_dist = 50.f;
+  static char s_new_label[32] = {};
+  static char s_cfg_name[64] = {};
+  static char s_cfg_note[512] = {};
+  static int s_note_cfg = -1;
+
+  game_api::CameraState live{};
+  const bool have_live = game_api::camera_read(&live);
+  const bool takeover = game_api::camera_takeover();
+  if (takeover) {
+    game_api::CameraState lv{};
+    if (game_api::camera_live(&lv)) {
+      s_edit = lv;
+      s_edit_ok = true;
+    }
+  } else if (s_follow && have_live) {
+    s_edit = live;
+    s_edit_ok = true;
+  }
+  if (!s_edit_ok && have_live) {
+    s_edit = live;
+    s_edit_ok = true;
+  }
+
+  auto push_edit = [&]() {
+    if (!game_api::camera_takeover()) game_api::camera_set_takeover(true);
+    game_api::camera_set_live(&s_edit);
+    game_api::camera_apply(&s_edit);
+  };
+
+  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"摄像机");
+  ImGui::SameLine();
+  const int hook_state = game_api::camera_hook_state();
+  if (hook_state == 1 && have_live) {
+    ImGui::TextDisabled(u8"已接管引擎相机 (View %08X)", live.view);
+  } else if (hook_state == 1) {
+    ImGui::TextDisabled(u8"hook 已就绪，等待游戏更新相机…");
+  } else if (hook_state < 0) {
+    ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.45f, 1.f), u8"相机 hook 安装失败，请重新注入");
+  } else {
+    ImGui::TextDisabled(u8"未就绪（仅零售版 1.12 支持）");
+  }
+
+  if (ImGui::BeginTabBar("##cam_tabs", ImGuiTabBarFlags_None)) {
+    // ------------------------------- 当前坐标 -------------------------------
+    if (ImGui::BeginTabItem(u8"当前坐标")) {
+      if (!have_live && hook_state == 1) {
+        ImGui::TextWrapped(u8"还没有读到相机。先进入对局并移动一下视角（或者等一帧），再回到这里。");
+      }
+      if (have_live) {
+        ImGui::TextDisabled(u8"游戏当前：X %.1f  Y %.1f  Z %.1f   偏航 %.2f°  俯仰 %.2f°  距离 %.1f",
+                            live.x, live.y, live.z, deg_of_rad(live.yaw),
+                            live.pitch * kRad2Deg, live.dist);
+      }
+
+      ImGui::Spacing();
+      bool tk = takeover;
+      if (ImGui::Checkbox(u8"接管摄像机（持续锁定）", &tk)) {
+        game_api::camera_set_takeover(tk);
+        game_api::beep(tk ? "on" : "off");
+      }
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(u8"打开后引擎每次设置相机都会被改成这里的目标值；关掉恢复游戏自己控制。");
+      }
+      ImGui::SameLine();
+      ImGui::Checkbox(u8"跟随当前", &s_follow);
+      ImGui::SameLine();
+      ImGui::TextDisabled(u8"(关掉「接管」时数值会跟着游戏走)");
+
+      ImGui::Separator();
+      ImGui::TextUnformatted(u8"坐标");
+      ImGui::SetNextItemWidth(110.f);
+      if (ImGui::InputFloat("X##camx", &s_edit.x, 0.f, 0.f, "%.2f")) push_edit();
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(110.f);
+      if (ImGui::InputFloat("Y##camy", &s_edit.y, 0.f, 0.f, "%.2f")) push_edit();
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(110.f);
+      if (ImGui::InputFloat("Z##camz", &s_edit.z, 0.f, 0.f, "%.2f")) push_edit();
+
+      ImGui::TextUnformatted(u8"旋转");
+      float yaw_d = deg_of_rad(s_edit.yaw);
+      float pitch_d = s_edit.pitch * kRad2Deg;
+      float roll_d = s_edit.roll * kRad2Deg;
+      ImGui::SetNextItemWidth(110.f);
+      if (ImGui::InputFloat(u8"偏航##camyaw", &yaw_d, 0.f, 0.f, "%.2f")) {
+        s_edit.yaw = yaw_d * kDeg2Rad;
+        push_edit();
+      }
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(110.f);
+      if (ImGui::InputFloat(u8"俯仰##campitch", &pitch_d, 0.f, 0.f, "%.2f")) {
+        s_edit.pitch = pitch_d * kDeg2Rad;
+        push_edit();
+      }
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(110.f);
+      if (ImGui::InputFloat(u8"滚转##camroll", &roll_d, 0.f, 0.f, "%.2f")) {
+        s_edit.roll = roll_d * kDeg2Rad;
+        push_edit();
+      }
+
+      ImGui::TextUnformatted(u8"距离（缩放）");
+      ImGui::SetNextItemWidth(110.f);
+      if (ImGui::InputFloat("##camdist", &s_edit.dist, 0.f, 0.f, "%.1f")) push_edit();
+
+      ImGui::Spacing();
+      if (ImGui::Button(u8"把当前值应用到游戏", ImVec2(160, 0))) {
+        push_edit();
+        game_api::beep("click");
+      }
+      ImGui::SameLine();
+      if (ImGui::Button(u8"读取游戏当前", ImVec2(120, 0))) {
+        if (have_live) {
+          s_edit = live;
+          s_follow = true;
+        }
+        game_api::beep("click");
+      }
+      ImGui::SameLine();
+      if (ImGui::Button(u8"停止接管", ImVec2(90, 0))) {
+        game_api::camera_set_takeover(false);
+        game_api::beep("off");
+      }
+
+      ImGui::Spacing();
+      ImGui::Separator();
+      ImGui::TextDisabled(u8"微调（步长可调，点一下立即生效）");
+      ImGui::SetNextItemWidth(90.f);
+      ImGui::InputFloat(u8"位置步长", &s_step_pos, 0.f, 0.f, "%.0f");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(90.f);
+      ImGui::InputFloat(u8"角度步长", &s_step_ang, 0.f, 0.f, "%.1f");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(90.f);
+      ImGui::InputFloat(u8"距离步长", &s_step_dist, 0.f, 0.f, "%.0f");
+
+      auto nudge = [&](const char* id, const char* label, float dx, float dy, float dz,
+                       float da, float dp, float dr, float dd) {
+        ImGui::PushID(id);
+        ImGui::TextUnformatted(label);
+        ImGui::SameLine();
+        if (ImGui::Button(u8"-##m", ImVec2(28, 0))) {
+          s_edit.x -= dx;
+          s_edit.y -= dy;
+          s_edit.z -= dz;
+          s_edit.yaw -= da * kDeg2Rad;
+          s_edit.pitch -= dp * kDeg2Rad;
+          s_edit.roll -= dr * kDeg2Rad;
+          s_edit.dist -= dd;
+          if (s_edit.dist < 1.f) s_edit.dist = 1.f;
+          push_edit();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(u8"+##p", ImVec2(28, 0))) {
+          s_edit.x += dx;
+          s_edit.y += dy;
+          s_edit.z += dz;
+          s_edit.yaw += da * kDeg2Rad;
+          s_edit.pitch += dp * kDeg2Rad;
+          s_edit.roll += dr * kDeg2Rad;
+          s_edit.dist += dd;
+          push_edit();
+        }
+        ImGui::PopID();
+      };
+      nudge("camx", u8"X", s_step_pos, 0, 0, 0, 0, 0, 0);
+      ImGui::SameLine();
+      nudge("camy", u8"Y", 0, s_step_pos, 0, 0, 0, 0, 0);
+      ImGui::SameLine();
+      nudge("camz", u8"Z", 0, 0, s_step_pos, 0, 0, 0, 0);
+      nudge("camyaw", u8"偏航", 0, 0, 0, s_step_ang, 0, 0, 0);
+      ImGui::SameLine();
+      nudge("campitch", u8"俯仰", 0, 0, 0, 0, s_step_ang, 0, 0);
+      ImGui::SameLine();
+      nudge("camroll", u8"滚转", 0, 0, 0, 0, 0, s_step_ang, 0);
+      nudge("camdist", u8"距离", 0, 0, 0, 0, 0, 0, s_step_dist);
+
+      ImGui::Spacing();
+      ImGui::TextDisabled(
+          u8"提示：Z 轴向上。偏航=atan2(矩阵[4],矩阵[0])，俯仰=asin(矩阵[9])，与引擎 0x7EC240 的算法一致。");
+      ImGui::EndTabItem();
+    }
+
+    // ------------------------------- 轨迹与播放 -------------------------------
+    if (ImGui::BeginTabItem(u8"轨迹与播放")) {
+      const int interp = game_api::camera_interp();
+      ImGui::TextUnformatted(u8"插值");
+      ImGui::SameLine();
+      ImGui::SetNextItemWidth(140.f);
+      int mode = interp;
+      if (ImGui::Combo("##cam_interp", &mode, u8"线性插值\0贝塞尔曲线\0平滑样条\0")) {
+        game_api::camera_set_interp(mode);
+      }
+      if (interp == 1) {
+        ImGui::SameLine();
+        ImGui::TextDisabled(u8"节点作为控制点，不一定经过节点");
+      } else if (interp == 2) {
+        ImGui::SameLine();
+        ImGui::TextDisabled(u8"曲线穿过每个节点（额外选项）");
+      }
+
+      const int st = game_api::camera_play_state();
+      const float total = game_api::camera_total_time();
+      const float head = game_api::camera_playhead();
+      const int key_n = game_api::camera_key_count();
+
+      ImGui::Spacing();
+      if (ImGui::Button(st == 1 ? u8"暂停" : u8"播放", ImVec2(80, 0))) {
+        if (st == 1) {
+          game_api::camera_play_pause();
+        } else if (key_n < 2) {
+          game_api::set_status(u8"至少需要两个节点才能播放");
+          game_api::beep("error");
+        } else {
+          game_api::camera_play_start();
+          game_api::beep("click");
+        }
+      }
+      ImGui::SameLine();
+      if (ImGui::Button(u8"停止", ImVec2(70, 0))) {
+        game_api::camera_play_stop();
+        game_api::beep("off");
+      }
+      ImGui::SameLine();
+      bool loop = game_api::camera_loop();
+      if (ImGui::Checkbox(u8"循环", &loop)) game_api::camera_set_loop(loop);
+      ImGui::SameLine();
+      float rate = game_api::camera_play_rate();
+      ImGui::SetNextItemWidth(140.f);
+      if (ImGui::SliderFloat(u8"速度", &rate, 0.1f, 4.f, "%.2fx")) {
+        game_api::camera_set_play_rate(rate);
+      }
+
+      float t = head;
+      ImGui::SetNextItemWidth(-60.f);
+      if (ImGui::SliderFloat("##cam_head", &t, 0.f, total > 0.1f ? total : 1.f, "%.2f s")) {
+        game_api::camera_set_playhead(t);
+      }
+      ImGui::SameLine();
+      ImGui::Text("%.1f/%.1f", head, total);
+      ImGui::SameLine();
+      ImGui::TextDisabled(u8"节点 %d", key_n);
+
+      ImGui::Separator();
+      ImGui::SetNextItemWidth(120.f);
+      ImGui::InputText(u8"新节点标签", s_new_label, sizeof(s_new_label));
+      ImGui::SameLine();
+      if (ImGui::Button(u8"复制当前坐标并添加节点", ImVec2(190, 0))) {
+        const int idx = game_api::camera_key_add_from_current(s_new_label);
+        if (idx < 0) {
+          game_api::set_status(u8"添加节点失败：还没读到摄像机");
+          game_api::beep("error");
+        } else {
+          game_api::beep("click");
+        }
+      }
+      ImGui::SameLine();
+      if (ImGui::Button(u8"清空轨迹", ImVec2(80, 0))) {
+        game_api::camera_keys_clear();
+        game_api::beep("off");
+      }
+
+      const ImGuiTableFlags tf = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                 ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY |
+                                 ImGuiTableFlags_SizingFixedFit;
+      if (ImGui::BeginTable("##cam_keys", 13, tf, ImVec2(0, 230.f))) {
+        const char* heads[13] = {"#",    u8"标签", u8"时间", "X",      "Y",    "Z",
+                                 u8"偏航", u8"俯仰", u8"滚转",  u8"距离", u8"操作",
+                                 "##mv", "##del"};
+        for (int c = 0; c < 13; ++c) ImGui::TableSetupColumn(heads[c]);
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableHeadersRow();
+
+        for (int i = 0; i < key_n; ++i) {
+          game_api::CameraKey k;
+          if (!game_api::camera_key(i, &k)) continue;
+          game_api::CameraKey e = k;
+          bool commit = false;
+          ImGui::PushID(i);
+          ImGui::TableNextRow();
+
+          ImGui::TableSetColumnIndex(0);
+          ImGui::Text("%d", i + 1);
+
+          ImGui::TableSetColumnIndex(1);
+          ImGui::SetNextItemWidth(80.f);
+          char lab[32];
+          std::memcpy(lab, e.label, sizeof(lab));
+          if (ImGui::InputText("##lab", lab, sizeof(lab))) {
+            std::snprintf(e.label, sizeof(e.label), "%s", lab);
+            commit = true;
+          }
+
+          ImGui::TableSetColumnIndex(2);
+          ImGui::SetNextItemWidth(60.f);
+          ImGui::InputFloat("##t", &e.t, 0.f, 0.f, "%.2f");
+          if (ImGui::IsItemDeactivatedAfterEdit()) commit = true;
+
+          const float vx[7] = {e.x, e.y, e.z, deg_of_rad(e.yaw), e.pitch * kRad2Deg,
+                               e.roll * kRad2Deg, e.dist};
+          float out[7] = {vx[0], vx[1], vx[2], vx[3], vx[4], vx[5], vx[6]};
+          const char* ids[7] = {"x", "y", "z", "yaw", "pitch", "roll", "dist"};
+          for (int c = 0; c < 7; ++c) {
+            ImGui::TableSetColumnIndex(3 + c);
+            ImGui::SetNextItemWidth(c == 6 ? 60.f : 62.f);
+            ImGui::InputFloat(ids[c], &out[c], 0.f, 0.f, c >= 3 && c <= 5 ? "%.2f" : "%.1f");
+            if (ImGui::IsItemDeactivatedAfterEdit()) commit = true;
+          }
+          e.x = out[0];
+          e.y = out[1];
+          e.z = out[2];
+          e.yaw = out[3] * kDeg2Rad;
+          e.pitch = out[4] * kDeg2Rad;
+          e.roll = out[5] * kDeg2Rad;
+          e.dist = out[6];
+
+          ImGui::TableSetColumnIndex(10);
+          if (ImGui::SmallButton(u8"用当前")) {
+            game_api::camera_key_update_from_current(i);
+            game_api::beep("click");
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton(u8"跳转")) {
+            game_api::camera_set_playhead(e.t);
+            game_api::beep("click");
+          }
+          ImGui::TableSetColumnIndex(11);
+          if (ImGui::SmallButton(u8"删除")) {
+            game_api::camera_key_remove(i);
+            commit = false;
+            ImGui::PopID();
+            break;
+          }
+
+          const bool time_changed = commit && (e.t != k.t);
+          if (commit) game_api::camera_key_set(i, e);
+          ImGui::PopID();
+          if (time_changed) break;  // 排序后本帧剩余行下标失效，下一帧再画
+        }
+        ImGui::EndTable();
+      }
+
+      // 俯视轨迹图
+      ImGui::Spacing();
+      ImGui::TextDisabled(u8"轨迹俯视图（X/Y 平面）");
+      const ImVec2 p0 = ImGui::GetCursorScreenPos();
+      ImVec2 avail = ImGui::GetContentRegionAvail();
+      if (avail.y > 200.f) avail.y = 200.f;
+      if (avail.x < 60.f) avail.x = 60.f;
+      if (avail.y < 60.f) avail.y = 60.f;
+      ImGui::InvisibleButton("##cam_pathmap", avail);
+      ImDrawList* dl = ImGui::GetWindowDrawList();
+      dl->AddRectFilled(p0, ImVec2(p0.x + avail.x, p0.y + avail.y), IM_COL32(14, 18, 24, 230), 4.f);
+      dl->AddRect(p0, ImVec2(p0.x + avail.x, p0.y + avail.y), IM_COL32(70, 80, 100, 200), 4.f);
+      if (key_n >= 1) {
+        float minx = 0.f, maxx = 0.f, miny = 0.f, maxy = 0.f;
+        for (int i = 0; i < key_n; ++i) {
+          game_api::CameraKey k;
+          if (!game_api::camera_key(i, &k)) continue;
+          if (i == 0) {
+            minx = maxx = k.x;
+            miny = maxy = k.y;
+          } else {
+            minx = k.x < minx ? k.x : minx;
+            maxx = k.x > maxx ? k.x : maxx;
+            miny = k.y < miny ? k.y : miny;
+            maxy = k.y > maxy ? k.y : maxy;
+          }
+        }
+        float spanx = maxx - minx;
+        float spany = maxy - miny;
+        if (spanx < 1.f) spanx = 1.f;
+        if (spany < 1.f) spany = 1.f;
+        const float scale = std::min((avail.x - 30.f) / spanx, (avail.y - 30.f) / spany);
+        auto map_pt = [&](float x, float y) {
+          return ImVec2(p0.x + 15.f + (x - minx) * scale,
+                        p0.y + avail.y - 15.f - (y - miny) * scale);
+        };
+        ImVec2 prev(0, 0);
+        for (int i = 0; i < key_n; ++i) {
+          game_api::CameraKey k;
+          if (!game_api::camera_key(i, &k)) continue;
+          const ImVec2 pt = map_pt(k.x, k.y);
+          if (i > 0) dl->AddLine(prev, pt, IM_COL32(90, 170, 255, 220), 2.f);
+          dl->AddCircleFilled(pt, 4.f, IM_COL32(255, 210, 90, 255));
+          char num[8];
+          std::snprintf(num, sizeof(num), "%d", i + 1);
+          dl->AddText(ImVec2(pt.x + 6.f, pt.y - 16.f), IM_COL32(220, 230, 250, 255), num);
+          prev = pt;
+        }
+        ImGui::SetCursorScreenPos(ImVec2(p0.x + 8.f, p0.y + 6.f));
+        ImGui::TextDisabled(u8"X %.0f~%.0f  Y %.0f~%.0f", minx, maxx, miny, maxy);
+      }
+      ImGui::EndTabItem();
+    }
+
+    // ------------------------------- 定时事件 -------------------------------
+    if (ImGui::BeginTabItem(u8"定时事件")) {
+      const int ev_n = game_api::camera_event_count();
+      const int fired = game_api::camera_events_fired();
+      ImGui::TextDisabled(u8"事件触发一次后不会自动重置，需要手动点「重置已触发」（和 CameraBridge 一致）");
+      ImGui::Spacing();
+      if (ImGui::Button(u8"添加事件", ImVec2(100, 0))) {
+        game_api::CameraEvent ev;
+        ev.t = 0.f;
+        ev.base = 0;
+        ev.action = 0;
+        game_api::camera_event_add(ev);
+      }
+      ImGui::SameLine();
+      if (ImGui::Button(u8"重置已触发", ImVec2(110, 0))) {
+        game_api::camera_events_reset();
+        game_api::beep("click");
+      }
+      ImGui::SameLine();
+      ImGui::TextColored(ImVec4(0.95f, 0.85f, 0.5f, 1.f), u8"%d / %d 个事件已触发", fired, ev_n);
+      ImGui::SameLine();
+      if (ImGui::Button(u8"清空", ImVec2(70, 0))) game_api::camera_events_clear();
+
+      const ImGuiTableFlags etf = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                  ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit;
+      if (ImGui::BeginTable("##cam_events", 6, etf, ImVec2(0, 260.f))) {
+        ImGui::TableSetupColumn(u8"时间(s)");
+        ImGui::TableSetupColumn(u8"基准");
+        ImGui::TableSetupColumn(u8"动作");
+        ImGui::TableSetupColumn(u8"参数");
+        ImGui::TableSetupColumn(u8"状态");
+        ImGui::TableSetupColumn(u8"操作");
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableHeadersRow();
+
+        for (int i = 0; i < ev_n; ++i) {
+          game_api::CameraEvent ev;
+          if (!game_api::camera_event(i, &ev)) continue;
+          game_api::CameraEvent e = ev;
+          bool commit = false;
+          ImGui::PushID(i);
+          ImGui::TableNextRow();
+
+          ImGui::TableSetColumnIndex(0);
+          ImGui::SetNextItemWidth(70.f);
+          ImGui::InputFloat("##et", &e.t, 0.f, 0.f, "%.2f");
+          if (ImGui::IsItemDeactivatedAfterEdit()) commit = true;
+
+          ImGui::TableSetColumnIndex(1);
+          ImGui::SetNextItemWidth(120.f);
+          if (ImGui::Combo("##eb", &e.base, u8"动画开始后\0进入对局后\0")) commit = true;
+
+          ImGui::TableSetColumnIndex(2);
+          ImGui::SetNextItemWidth(150.f);
+          if (ImGui::Combo("##ea", &e.action,
+                           u8"开始播放动画\0停止播放动画\0暂停/继续动画\0跳到指定节点\0使用节点坐标\0切换功能开关\0")) {
+            commit = true;
+          }
+
+          ImGui::TableSetColumnIndex(3);
+          ImGui::SetNextItemWidth(150.f);
+          if (e.action == 3 || e.action == 4) {
+            const int kn = game_api::camera_key_count();
+            char items[1024] = {};
+            size_t off = 0;
+            for (int m = 0; m < kn && off + 32 < sizeof(items); ++m) {
+              char one[32];
+              const int len = std::snprintf(one, sizeof(one), u8"节点 %d", m + 1);
+              if (len <= 0) break;
+              std::memcpy(items + off, one, (size_t)len + 1);
+              off += (size_t)len + 1;
+            }
+            if (kn > 0 && off + 2 <= sizeof(items)) {
+              items[off] = 0;
+              if (ImGui::Combo("##epn", &e.param, items)) commit = true;
+            } else {
+              ImGui::TextDisabled(u8"没有节点");
+            }
+          } else if (e.action == 5) {
+            const int fn = game_api::camera_event_feature_count();
+            char items[512] = {};
+            size_t off = 0;
+            for (int m = 0; m < fn && off + 64 < sizeof(items); ++m) {
+              const char* s = game_api::camera_event_feature_label(m);
+              const size_t len = std::strlen(s);
+              std::memcpy(items + off, s, len + 1);
+              off += len + 1;
+            }
+            if (fn > 0 && off + 2 <= sizeof(items)) {
+              items[off] = 0;
+              if (ImGui::Combo("##epf", &e.param, items)) commit = true;
+            } else {
+              ImGui::TextDisabled(u8"—");
+            }
+          } else {
+            ImGui::TextDisabled(u8"—");
+          }
+
+          ImGui::TableSetColumnIndex(4);
+          if (ev.fired) {
+            ImGui::TextColored(ImVec4(0.55f, 0.9f, 0.6f, 1.f), u8"已触发");
+          } else {
+            ImGui::TextDisabled(u8"待触发");
+          }
+
+          ImGui::TableSetColumnIndex(5);
+          if (ImGui::SmallButton(u8"删除")) {
+            game_api::camera_event_remove(i);
+            ImGui::PopID();
+            break;
+          }
+          if (commit) game_api::camera_event_set(i, e);
+          ImGui::PopID();
+        }
+        ImGui::EndTable();
+      }
+      ImGui::EndTabItem();
+    }
+
+    // ------------------------------- 配置 -------------------------------
+    if (ImGui::BeginTabItem(u8"配置")) {
+      const int n = game_api::camera_config_count();
+      const int active = game_api::camera_config_active();
+      if (s_note_cfg != active) {
+        s_note_cfg = active;
+        std::snprintf(s_cfg_note, sizeof(s_cfg_note), "%s", game_api::camera_config_note(active));
+        std::snprintf(s_cfg_name, sizeof(s_cfg_name), "%s", game_api::camera_config_name(active));
+      }
+
+      ImGui::TextDisabled(u8"一个配置就是一条轨迹 + 它的定时事件，自动保存在 DLL 同目录的 ra3_camera.ini");
+      ImGui::Spacing();
+      ImGui::SetNextItemWidth(180.f);
+      if (ImGui::BeginCombo("##cfg", game_api::camera_config_name(active))) {
+        for (int i = 0; i < n; ++i) {
+          const bool sel = i == active;
+          if (ImGui::Selectable(game_api::camera_config_name(i), sel)) {
+            game_api::camera_config_select(i);
+          }
+          if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+      }
+      ImGui::SameLine();
+      if (ImGui::Button(u8"新建", ImVec2(60, 0))) {
+        game_api::camera_config_add(u8"新轨迹");
+        game_api::beep("click");
+      }
+      ImGui::SameLine();
+      if (ImGui::Button(u8"克隆", ImVec2(60, 0))) {
+        game_api::camera_config_clone(active, u8"");
+        game_api::beep("click");
+      }
+      ImGui::SameLine();
+      if (ImGui::Button(u8"删除", ImVec2(60, 0))) {
+        if (!game_api::camera_config_remove(active)) game_api::beep("error");
+        else game_api::beep("off");
+      }
+
+      ImGui::Spacing();
+      ImGui::TextUnformatted(u8"名称");
+      ImGui::SetNextItemWidth(220.f);
+      if (ImGui::InputText("##cfgname", s_cfg_name, sizeof(s_cfg_name))) {
+        game_api::camera_config_rename(active, s_cfg_name);
+      }
+      ImGui::Spacing();
+      ImGui::TextUnformatted(u8"说明");
+      ImGui::SetNextItemWidth(-1.f);
+      if (ImGui::InputTextMultiline("##cfgnote", s_cfg_note, sizeof(s_cfg_note),
+                                    ImVec2(-1.f, 90.f))) {
+        game_api::camera_config_set_note(active, s_cfg_note);
+      }
+
+      ImGui::Spacing();
+      if (ImGui::Button(u8"保存到文件", ImVec2(120, 0))) {
+        const bool ok = game_api::camera_config_save();
+        game_api::beep(ok ? "click" : "error");
+      }
+      ImGui::SameLine();
+      if (ImGui::Button(u8"从文件读取", ImVec2(120, 0))) {
+        game_api::camera_config_load();
+        s_note_cfg = -1;
+        game_api::beep("click");
+      }
+      ImGui::Spacing();
+      ImGui::TextDisabled(u8"文件：%s", game_api::camera_file_path());
+      ImGui::Spacing();
+      ImGui::TextDisabled(u8"快捷键：Ctrl+E 播放/暂停动画，Ctrl+Alt+E 停止，Ctrl+K 记录节点，Ctrl+S 保存配置。");
+      ImGui::EndTabItem();
+    }
+
+    ImGui::EndTabBar();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 时间控制面板（RA3TimePausePlugin 对应）
+// ---------------------------------------------------------------------------
+static std::string fmt_clock(float seconds) {
+  if (!(seconds > 0.f)) seconds = 0.f;
+  const int total = (int)(seconds + 0.5f);
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%02d:%02d", total / 60, total % 60);
+  return buf;
+}
+
+void draw_time_panel() {
+  static float s_scale = 1.0f;
+  static bool s_inited = false;
+
+  float seen_scale = 0.f, seen_factor = 0.f;
+  bool valid = false;
+  game_api::time_control_read(&seen_scale, &seen_factor, &valid);
+  bool enabled = game_api::time_control_enabled();
+  if (!s_inited) {
+    s_scale = game_api::time_control_scale();
+    s_inited = true;
+  }
+
+  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"时间控制");
+  ImGui::SameLine();
+  if (valid) {
+    ImGui::TextDisabled(u8"游戏时间倍率 %.3fx（GameSpeedFactor %.3f）", seen_scale, seen_factor);
+  } else {
+    ImGui::TextDisabled(u8"未读到（仅零售版 1.12、且进入对局后可用）");
+  }
+
+  ImGui::Spacing();
+  if (!valid) {
+    ImGui::TextWrapped(u8"还没读到游戏时间倍率。请进入遭遇战对局后再回来；若仍读不到，"
+                       u8"请把 ra3_overlay.log 里以 time: 开头的行发给我。");
+    return;
+  }
+
+  ImGui::Checkbox(u8"启用时间控制（关闭后游戏恢复原速）", &enabled);
+  if (enabled != game_api::time_control_enabled()) {
+    game_api::time_control_set_enabled(enabled);
+  }
+  ImGui::SameLine();
+  ImGui::TextDisabled(u8"?");
+
+  ImGui::Spacing();
+  ImGui::SetNextItemWidth(320.f);
+  if (ImGui::SliderFloat(u8"##time_scale", &s_scale, 0.0f, 4.0f, u8"%.3fx")) {
+    game_api::time_control_set_scale(s_scale);
+  }
+  ImGui::SameLine();
+  ImGui::TextDisabled(u8"目标倍率 %.3fx（0 = 暂停游戏逻辑）", s_scale);
+
+  ImGui::Spacing();
+  ImGui::TextDisabled(u8"快捷档位");
+  if (ImGui::Button(u8"暂停 (0x)")) {
+    s_scale = 0.0f;
+    game_api::time_control_set_scale(0.0f);
+  }
+  ImGui::SameLine();
+  if (ImGui::Button(u8"1/4 速")) {
+    s_scale = 0.25f;
+    game_api::time_control_set_scale(0.25f);
+  }
+  ImGui::SameLine();
+  if (ImGui::Button(u8"半速")) {
+    s_scale = 0.5f;
+    game_api::time_control_set_scale(0.5f);
+  }
+  ImGui::SameLine();
+  if (ImGui::Button(u8"常速")) {
+    s_scale = 1.0f;
+    game_api::time_control_set_scale(1.0f);
+  }
+  ImGui::SameLine();
+  if (ImGui::Button(u8"2x")) {
+    s_scale = 2.0f;
+    game_api::time_control_set_scale(2.0f);
+  }
+  ImGui::SameLine();
+  if (ImGui::Button(u8"4x")) {
+    s_scale = 4.0f;
+    game_api::time_control_set_scale(4.0f);
+  }
+
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+  if (ImGui::Button(u8"恢复原始速度")) {
+    game_api::time_control_restore();
+    s_scale = game_api::time_control_scale();
+  }
+  ImGui::SameLine();
+  ImGui::TextDisabled(u8"关闭持续覆盖并写回进入对局时的原始倍率。");
+
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+  ImGui::TextDisabled(u8"说明：时间倍率直接写游戏全局数据（[[0xCE8138]+0x54]），"
+                      u8"每帧覆盖以保持生效。暂停时单位与弹道都会静止，镜头仍可自由操作，"
+                      u8"适合做相机运镜。");
+
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"快进到指定对局时间");
+
+  float now_s = 0.f;
+  const bool have_clock = game_api::battle_clock(&now_s);
+  if (have_clock) {
+    ImGui::SameLine();
+    ImGui::TextDisabled(u8"当前对局时间 %s", fmt_clock(now_s).c_str());
+  } else {
+    ImGui::SameLine();
+    ImGui::TextDisabled(u8"读不到对局时钟");
+  }
+
+  static float s_ff_target = 60.f;
+  static float s_ff_speed = 8.f;
+  static bool  s_ff_auto = false;
+  static bool  s_ff_inited = false;
+  if (!s_ff_inited) {
+    s_ff_auto = game_api::time_control_ff_auto();
+    s_ff_inited = true;
+  }
+
+  ImGui::SetNextItemWidth(200.f);
+  ImGui::InputFloat(u8"目标时间（秒）##ff_target", &s_ff_target, 10.f, 60.f, "%.1f");
+  ImGui::SameLine();
+  if (ImGui::SmallButton(u8"+1 分##ff_add60")) s_ff_target += 60.f;
+  ImGui::SameLine();
+  if (have_clock && ImGui::SmallButton(u8"+2 分##ff_add120")) s_ff_target = now_s + 120.f;
+
+  ImGui::SetNextItemWidth(200.f);
+  ImGui::SliderFloat(u8"##ff_speed", &s_ff_speed, 1.0f, 20.0f, u8"快进倍率 %.1fx");
+
+  if (ImGui::Checkbox(u8"到达目标时间后自动开始快进##ff_auto", &s_ff_auto)) {
+    game_api::time_control_set_ff_auto(s_ff_auto);
+  }
+
+  ImGui::Spacing();
+  const bool ff_on = game_api::time_control_ff_active();
+  if (!ff_on) {
+    ImGui::BeginDisabled(!have_clock);
+    if (ImGui::Button(u8"快进至目标时间")) {
+      game_api::time_control_ff_start(s_ff_target, s_ff_speed);
+      s_scale = game_api::time_control_scale();
+      g_last_msg = u8"已开始快进";
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextDisabled(u8"把倍率拉到快进倍率，到达目标时间自动暂停。");
+  } else {
+    ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.35f, 1.f), u8"快进中：目标 %s，倍率 %.1fx",
+                       fmt_clock(game_api::time_control_ff_target()).c_str(),
+                       game_api::time_control_ff_speed());
+    if (ImGui::Button(u8"取消快进")) {
+      game_api::time_control_ff_cancel();
+      s_scale = game_api::time_control_scale();
+    }
+  }
+}
+
+void draw_lua_panel() {
+  const bool ready = game_api::lua_bridge_ready();
+  const int hooks = game_api::lua_bridge_hook_state();
+
+  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"动画 / Lua");
+  ImGui::SameLine();
+  if (ready) {
+    ImGui::TextDisabled(u8"lua_State = 0x%X（Lua API 命中 %d 次）", game_api::lua_bridge_state(),
+                        game_api::lua_bridge_api_hits());
+  } else if (hooks == 1) {
+    ImGui::TextDisabled(u8"挂钩已就绪，等待游戏脚本第一次调用 Lua API…");
+  } else {
+    ImGui::TextDisabled(u8"未就绪（仅零售版 1.12、且进入对局后可用）");
+  }
+
+  if (!ready) {
+    ImGui::Spacing();
+    ImGui::TextWrapped(u8"这块对应 CameraBridge 的「动画跟踪 + Lua 桥」。原理是挂钩游戏内置的 "
+                       u8"Lua 5.0 C API（lua_getglobal / lua_setglobal / lua_type 等），"
+                       u8"从第一个参数拿到 lua_State*，之后就能读写脚本的全局变量。");
+    ImGui::Spacing();
+    ImGui::TextWrapped(u8"请先进入遭遇战对局（脚本开始运行）再回来。如果一直读不到，"
+                       u8"请把 ra3_overlay.log 里以 lua: 开头的行发给我。");
+    ImGui::TextDisabled(u8"hook 状态：%d（-1 = 尚未安装，1 = 已安装）", hooks);
+    return;
+  }
+
+  game_api::LuaAnimInfo anim{};
+  game_api::lua_anim_read(&anim);
+
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+  ImGui::TextDisabled(u8"动画跟踪（原版动画窗口读的就是这几个全局变量，缓存每秒刷新 4 次）");
+
+  struct Row {
+    const char* name;
+    const game_api::LuaGlobal* v;
+  };
+  const Row rows[] = {
+      {"AnimationLuaGetCurrentGameObjectAddress", &anim.game_object_address},
+      {"AnimationLuaGetCurrentGameObjectId", &anim.game_object_id},
+      {"willSwitchAnimation", &anim.will_switch_animation},
+      {"willSwitchPause", &anim.will_switch_pause},
+      {"gameTime", &anim.game_time},
+      {"relativeTime", &anim.relative_time},
+  };
+
+  if (ImGui::BeginTable("##lua_anim", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
+    ImGui::TableSetupColumn(u8"Lua 全局变量", ImGuiTableColumnFlags_WidthFixed, 330.f);
+    ImGui::TableSetupColumn(u8"类型", ImGuiTableColumnFlags_WidthFixed, 110.f);
+    ImGui::TableSetupColumn(u8"值", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableHeadersRow();
+    for (const Row& r : rows) {
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      ImGui::TextUnformatted(r.name);
+      ImGui::TableNextColumn();
+      ImGui::TextDisabled("%s", game_api::lua_type_name(r.v->type));
+      ImGui::TableNextColumn();
+      ImGui::TextUnformatted(r.v->text[0] ? r.v->text : "-");
+    }
+    ImGui::EndTable();
+  }
+
+  ImGui::Spacing();
+  if (ImGui::Button(u8"重新读取动画变量（写日志）")) {
+    std::string msg;
+    game_api::lua_bridge_engine_cmd("lua_probe", nullptr, &msg);
+    g_last_msg = msg;
+  }
+  ImGui::SameLine();
+  if (ImGui::Button(u8"输出 Lua 状态指针")) {
+    std::string msg;
+    game_api::lua_bridge_engine_cmd("lua_dump_state", nullptr, &msg);
+    g_last_msg = msg;
+  }
+
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"读写任意 Lua 全局变量");
+  ImGui::TextDisabled(u8"对应原版 RA3LuaBridge 暴露的 getglobal / setglobal。");
+
+  static char s_name[128] = "willSwitchAnimation";
+  static char s_value[256] = "1";
+  static std::string s_result;
+
+  ImGui::Spacing();
+  ImGui::SetNextItemWidth(320.f);
+  ImGui::InputText(u8"变量名##lua_name", s_name, sizeof(s_name));
+  ImGui::SetNextItemWidth(320.f);
+  ImGui::InputText(u8"值##lua_value", s_value, sizeof(s_value));
+
+  ImGui::Spacing();
+  if (ImGui::Button(u8"读取")) {
+    game_api::LuaGlobal v{};
+    if (game_api::lua_global_read(s_name, &v)) {
+      char buf[320];
+      std::snprintf(buf, sizeof(buf), u8"%s → 类型 %s，值 %s", s_name,
+                    game_api::lua_type_name(v.type), v.text[0] ? v.text : "<空>");
+      s_result = buf;
+    } else {
+      s_result = u8"读取失败（Lua 未就绪，或变量不存在）";
+    }
+  }
+  ImGui::SameLine();
+  if (ImGui::Button(u8"写字符串")) {
+    s_result = game_api::lua_global_write_string(s_name, s_value)
+                   ? u8"写入成功（字符串）"
+                   : u8"写入失败";
+  }
+  ImGui::SameLine();
+  if (ImGui::Button(u8"写数字")) {
+    const double n = std::atof(s_value);
+    s_result = game_api::lua_global_write_number(s_name, n) ? u8"写入成功（数字）"
+                                                            : u8"写入失败";
+  }
+  ImGui::SameLine();
+  if (ImGui::Button(u8"置为 nil")) {
+    s_result = game_api::lua_global_write_nil(s_name) ? u8"已置为 nil" : u8"写入失败";
+  }
+
+  if (!s_result.empty()) ImGui::TextWrapped("%s", s_result.c_str());
+
+  ImGui::Spacing();
+  ImGui::TextWrapped(u8"注意：这个定制版 Lua 的类型表里没有独立的 boolean 标签"
+                     u8"（只有 userdata / nil / number / string / table / function）。"
+                     u8"如果脚本里的开关量实际是布尔值，写数字不一定会被当成真/假，"
+                     u8"请先「读取」看它原本的类型，再决定写什么。");
+}
+
+static void draw_misc_panel() {
+  game_api::MiscState st{};
+  game_api::misc_read(&st);
+
+  const bool any_ok = st.flags_ok || st.shadow_size_ok || st.shadow_dist_ok || st.light.ok;
+
+  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"杂项操作");
+  ImGui::SameLine();
+  if (!any_ok) {
+    ImGui::TextDisabled(u8"未读到（仅零售版 1.12、且进入对局后可用）");
+  } else if (!st.flags_ok || !st.light.ok) {
+    ImGui::TextDisabled(u8"部分可用");
+  } else {
+    ImGui::TextDisabled(u8"就绪");
+  }
+  ImGui::Separator();
+  ImGui::Spacing();
+
+  static bool s_hide_hp = false;
+  static bool s_hide_sil = false;
+  static bool s_take = true;
+  static bool s_ui_inited = false;
+  if (!s_ui_inited && st.flags_ok) {
+    s_hide_hp = !st.show_health;
+    s_hide_sil = !st.show_silhouette;
+    s_ui_inited = true;
+  }
+
+  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"隐藏显示");
+  ImGui::Spacing();
+  {
+    std::string msg;
+    ImGui::BeginDisabled(!st.flags_ok);
+    if (ImGui::Checkbox(u8"不显示血条和维修标志", &s_hide_hp)) {
+      game_api::misc_set_hide_health(s_hide_hp, s_take, &msg);
+    }
+    if (ImGui::Checkbox(u8"不显示建筑背后的单位剪影", &s_hide_sil)) {
+      game_api::misc_set_hide_silhouette(s_hide_sil, s_take, &msg);
+    }
+    if (ImGui::Checkbox(u8"每帧保持（换局、改画质后仍生效）", &s_take)) {
+      game_api::misc_set_hide_health(s_hide_hp, s_take, &msg);
+      game_api::misc_set_hide_silhouette(s_hide_sil, s_take, &msg);
+    }
+    ImGui::EndDisabled();
+    if (!msg.empty()) g_last_msg = msg;
+  }
+  if (!st.flags_ok) {
+    ImGui::TextDisabled(u8"没读到渲染对象 [0xCE08F0]，先进入对局再回来。");
+  }
+
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"阴影");
+  ImGui::Spacing();
+
+  static int s_size = 1024;
+  static float s_dist = 0.f;
+  static bool s_shadow_inited = false;
+  if (st.shadow_size_ok) s_size = st.shadow_size;
+  if (!s_shadow_inited && st.shadow_dist_ok) {
+    s_dist = st.shadow_dist;
+    s_shadow_inited = true;
+  }
+
+  {
+    const char* items[] = {u8"1024（默认）", u8"2048", u8"4096", u8"8192"};
+    const int kSizes[4] = {1024, 2048, 4096, 8192};
+    int cur = 0;
+    for (int i = 0; i < 4; ++i) {
+      if (s_size == kSizes[i]) cur = i;
+    }
+    ImGui::SetNextItemWidth(220.f);
+    if (ImGui::Combo(u8"阴影贴图大小##misc_size", &cur, items, 4)) {
+      std::string msg;
+      game_api::misc_set_shadow_size(kSizes[cur], &msg);
+      if (!msg.empty()) g_last_msg = msg;
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled(u8"（1024/2048/4096/8192，重新开始一局后生效）");
+  }
+
+  ImGui::SetNextItemWidth(320.f);
+  if (ImGui::SliderFloat(u8"最大阴影距离##misc_dist", &s_dist, 0.f, 20000.f, u8"%.0f")) {
+    std::string msg;
+    game_api::misc_set_shadow_distance(s_dist, &msg);
+    if (!msg.empty()) g_last_msg = msg;
+  }
+  ImGui::SameLine();
+  if (ImGui::SmallButton(u8"默认##misc_dist_def")) {
+    s_dist = 1000.f;
+    std::string msg;
+    game_api::misc_set_shadow_distance(s_dist, &msg);
+    if (!msg.empty()) g_last_msg = msg;
+  }
+  if (!st.shadow_size_ok && !st.shadow_dist_ok) {
+    ImGui::TextDisabled(u8"没读到阴影全局 [0xCEEDB4]/[0xCEEDB8]，先进入对局再回来。");
+  }
+
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"光照颜色");
+  ImGui::SameLine();
+  ImGui::TextDisabled(u8"分量是 0..1 的浮点（1.000 = 255），可输入更大或更小的值");
+
+  static float s_light[4][3] = {};
+  static bool s_light_inited = false;
+  if (!s_light_inited && st.light.ok) {
+    const float* src[4] = {st.light.ambient, st.light.main, st.light.tint1, st.light.tint2};
+    for (int g = 0; g < 4; ++g) {
+      for (int c = 0; c < 3; ++c) s_light[g][c] = src[g][c];
+    }
+    s_light_inited = true;
+  }
+
+  ImGui::Spacing();
+  static bool s_lock = true;
+  if (ImGui::Checkbox(u8"每帧保持光照颜色", &s_lock)) {
+    game_api::misc_set_light_lock(s_lock);
+  }
+  ImGui::SameLine();
+  if (ImGui::SmallButton(u8"恢复默认光照##misc_light_reset")) {
+    game_api::misc_restore_lights();
+    s_light_inited = false;
+    s_lock = false;
+    g_last_msg = u8"杂项：光照颜色已恢复默认";
+  }
+
+  ImGui::Spacing();
+  static const char* kLightLabel[4] = {u8"环境光颜色##misc_l0", u8"主光源颜色##misc_l1",
+                                       u8"调色颜色 #1##misc_l2", u8"调色颜色 #2##misc_l3"};
+  ImGui::BeginDisabled(!st.light.ok);
+  for (int g = 0; g < 4; ++g) {
+    ImGui::SetNextItemWidth(360.f);
+    if (ImGui::ColorEdit3(kLightLabel[g], s_light[g],
+                          ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR |
+                              ImGuiColorEditFlags_PickerHueBar)) {
+      std::string msg;
+      game_api::misc_set_light(g, s_light[g], &msg);
+      if (!msg.empty()) g_last_msg = msg;
+    }
+  }
+  ImGui::EndDisabled();
+  if (!st.light.ok) {
+    ImGui::TextDisabled(u8"没读到光照结构 [[0xCE0D78]+0x24]，进入对局后可用。");
+  }
+
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+  ImGui::TextDisabled(u8"说明：血条 / 剪影是渲染对象 [0xCE08F0] 的 +0x139 / +0x138 两个字节；"
+                      u8"光照结构在 [[0xCE0D78]+0x24]；阴影贴图大小与最大阴影距离在 "
+                      u8"[0xCEEDB4] / [0xCEEDB8]。写入前都会校验指针与当前值。"
+                      u8"阴影贴图大小需要重新开始一局才会重建阴影贴图。");
+}
+
 static void draw_unit_inspector() {
   game_api::UnitInspect info{};
   game_api::inspect_first_selected(&info);
@@ -2907,6 +3972,150 @@ static void draw_unit_inspector() {
   ImGui::PopStyleColor();
 }
 
+// ---------------------------------------------------------------------------
+// 单位操作扩展（对应 CameraBridge 的「选择哪些单位 / 切换单位的队伍 /
+// 在游戏中禁用输入」）。挂在「单位操作」页底部。
+// ---------------------------------------------------------------------------
+static uint32_t g_unit_scope_player_ui = 0;
+static uint32_t g_unit_team_player_ui = 0;
+static uint32_t g_unit_color_player_ui = 0;
+
+static void draw_unit_ops_extra() {
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"单位操作扩展");
+
+  // ---- 在游戏中禁用输入 ----
+  bool input_off = game_api::game_input_disabled();
+  if (ImGui::Checkbox(u8"在游戏中禁用鼠标输入##no_game_mouse", &input_off)) {
+    game_api::set_game_input_disabled(input_off);
+    game_api::beep("click");
+  }
+  ImGui::SameLine();
+  ImGui::TextDisabled(u8"（拍运镜时不让游戏响应悬停 / 点击）");
+
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+
+  // ---- 选择哪些单位 ----
+  static const char* kScopeLabels[4] = { u8"选中的单位", u8"未选中的单位", u8"所有的单位",
+                                         u8"指定玩家的单位" };
+  int scope = game_api::unit_scope();
+  if (scope < 0 || scope > 3) scope = game_api::kUnitScopeSelected;
+
+  ImGui::TextUnformatted(u8"选择哪些单位");
+  ImGui::SetNextItemWidth(200.f);
+  if (ImGui::BeginCombo("##unit_scope", kScopeLabels[scope])) {
+    for (int i = 0; i < 4; ++i) {
+      if (ImGui::Selectable(kScopeLabels[i], scope == i)) {
+        game_api::set_unit_scope(i);
+        game_api::beep("click");
+      }
+    }
+    ImGui::EndCombo();
+  }
+
+  if (scope == game_api::kUnitScopePlayer) {
+    ImGui::TextDisabled(u8"选择玩家范围（默认本地玩家）");
+    const uint32_t who = draw_player_picker("unit_scope", &g_unit_scope_player_ui);
+    game_api::set_unit_scope_player(who);
+  }
+
+  static uint32_t s_scope_buf[512];
+  const int n = game_api::unit_collect_scope(s_scope_buf, 512);
+  ImGui::SameLine();
+  ImGui::TextDisabled(u8"当前范围命中 %d 个单位", n);
+
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+
+  // ---- 切换单位的队伍 ----
+  ImGui::TextUnformatted(u8"切换单位的队伍");
+  ImGui::TextDisabled(u8"把上面所选范围内的单位改到指定玩家名下（不改模型，只改归属）");
+  const uint32_t target = draw_player_picker("unit_team", &g_unit_team_player_ui);
+
+  static bool s_enable_ai = true;
+  ImGui::Checkbox(u8"启用 AI 操控##unit_team_ai", &s_enable_ai);
+  ImGui::SameLine();
+  ImGui::TextDisabled(u8"不勾选时：改完归属顺手把单位速度压成 0，免得 AI 把它调走");
+
+  ImGui::Spacing();
+  ImGui::BeginDisabled(target == 0 || n <= 0);
+  if (ImGui::Button(u8"把范围内单位切换给该玩家")) {
+    std::string msg;
+    const bool ok = game_api::unit_change_team_ex(target, s_enable_ai, &msg);
+    g_last_msg = msg;
+    game_api::beep(ok ? "click" : "error");
+  }
+  ImGui::EndDisabled();
+  if (n <= 0) {
+    ImGui::SameLine();
+    ImGui::TextDisabled(u8"范围内没有单位（先选中单位，或把范围改成「所有的单位」）");
+  }
+  ImGui::TextDisabled(u8"注意：改变队伍会让正在录制的录像不同步。");
+
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+
+  // ---- 切换单位的颜色 ----
+  ImGui::TextUnformatted(u8"切换单位的颜色");
+  ImGui::TextDisabled(u8"选择谁的单位（RA3 的单位颜色来自所属玩家，改色会波及该玩家全部单位）");
+  const uint32_t color_who = draw_player_picker("unit_color", &g_unit_color_player_ui);
+
+  static float s_unit_color[3] = { 1.f, 0.f, 0.f };
+  ImGui::SetNextItemWidth(240.f);
+  ImGui::ColorEdit3(u8"颜色##unit_color", s_unit_color,
+                    ImGuiColorEditFlags_Float | ImGuiColorEditFlags_PickerHueBar |
+                        ImGuiColorEditFlags_DisplayRGB);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(u8"点击右侧有颜色的按钮可以打开调色板；在左侧输入框按 Ctrl 再单击左键"
+                      u8"就可以输入大于 255 或者小于 0 的数值");
+  }
+
+  if (color_who != 0) {
+    uint8_t cr = 0, cg = 0, cb = 0;
+    if (game_api::unit_color_read(color_who, &cr, &cg, &cb)) {
+      ImGui::TextDisabled(u8"该队伍当前颜色：(%u, %u, %u)%s", (unsigned)cr, (unsigned)cg,
+                          (unsigned)cb,
+                          game_api::unit_color_has_backup(color_who) ? u8"（已记录原色）" : "");
+    } else {
+      ImGui::TextDisabled(u8"读不到该队伍的颜色字段（先进入对局）");
+    }
+  }
+
+  ImGui::Spacing();
+  ImGui::BeginDisabled(color_who == 0);
+  if (ImGui::Button(u8"应用颜色")) {
+    std::string msg;
+    const bool ok = game_api::unit_color_write(
+        color_who, (uint8_t)(s_unit_color[0] * 255.f + 0.5f),
+        (uint8_t)(s_unit_color[1] * 255.f + 0.5f), (uint8_t)(s_unit_color[2] * 255.f + 0.5f),
+        &msg);
+    g_last_msg = msg;
+    game_api::beep(ok ? "click" : "error");
+  }
+  ImGui::SameLine();
+  if (ImGui::Button(u8"恢复原来的颜色")) {
+    std::string msg;
+    const bool ok = game_api::unit_color_restore(color_who, &msg);
+    g_last_msg = msg;
+    game_api::beep(ok ? "click" : "error");
+  }
+  ImGui::EndDisabled();
+  if (color_who != 0 && game_api::unit_color_read(color_who, nullptr, nullptr, nullptr)) {
+    uint8_t cr = 0, cg = 0, cb = 0;
+    game_api::unit_color_read(color_who, &cr, &cg, &cb);
+    ImGui::SameLine();
+    ImGui::ColorButton("##unit_color_now", ImVec4(cr / 255.f, cg / 255.f, cb / 255.f, 1.f),
+                       ImGuiColorEditFlags_NoTooltip, ImVec2(22.f, 22.f));
+  }
+  ImGui::TextDisabled(u8"说明：改的是玩家对象的颜色字段（+0x80），相当于把该队伍的部队整体换色。");
+}
+
 void draw() {
   if (!g_inited) return;
   if (!input::menu_visible() && !(g_stats_open && g_stats_pinned)) return;
@@ -3016,12 +4225,17 @@ void draw() {
 
     ImGui::BeginChild("##side", ImVec2(side_w, -inspect_reserve), true);
     for (int i = 0; i < group_count; ++i) {
-      const bool sel = (!g_show_settings && !g_show_build_lock && g_group == i);
+      const bool sel = (!g_show_settings && !g_show_build_lock && !g_show_camera &&
+                        !g_show_time && !g_show_lua && !g_show_misc && g_group == i);
       ImGui::PushID(i);
       if (draw_nav_item(groups[i].name, groups[i].name, sel)) {
         g_group = i;
         g_show_settings = false;
         g_show_build_lock = false;
+        g_show_camera = false;
+        g_show_time = false;
+        g_show_lua = false;
+        g_show_misc = false;
       }
       ImGui::PopID();
     }
@@ -3036,14 +4250,57 @@ void draw() {
       }
       g_show_settings = false;
       g_show_build_lock = false;
+      g_show_camera = false;
+      g_show_time = false;
+      g_show_lua = false;
+      g_show_misc = false;
     }
     if (draw_nav_item("lock", u8"建造限制", g_show_build_lock)) {
       g_show_build_lock = true;
       g_show_settings = false;
+      g_show_camera = false;
+      g_show_time = false;
+      g_show_lua = false;
+      g_show_misc = false;
+    }
+    if (draw_nav_item("cam", u8"摄像机", g_show_camera)) {
+      g_show_camera = true;
+      g_show_settings = false;
+      g_show_build_lock = false;
+      g_show_time = false;
+      g_show_lua = false;
+      g_show_misc = false;
+    }
+    if (draw_nav_item("time", u8"时间控制", g_show_time)) {
+      g_show_time = true;
+      g_show_settings = false;
+      g_show_build_lock = false;
+      g_show_camera = false;
+      g_show_lua = false;
+      g_show_misc = false;
+    }
+    if (draw_nav_item("lua", u8"动画 / Lua", g_show_lua)) {
+      g_show_lua = true;
+      g_show_settings = false;
+      g_show_build_lock = false;
+      g_show_camera = false;
+      g_show_time = false;
+    }
+    if (draw_nav_item("misc", u8"杂项操作", g_show_misc)) {
+      g_show_misc = true;
+      g_show_settings = false;
+      g_show_build_lock = false;
+      g_show_camera = false;
+      g_show_time = false;
+      g_show_lua = false;
     }
     if (draw_nav_item("ui", u8"界面设置", g_show_settings)) {
       g_show_settings = true;
       g_show_build_lock = false;
+      g_show_camera = false;
+      g_show_time = false;
+      g_show_lua = false;
+      g_show_misc = false;
     }
     ImGui::EndChild();
 
@@ -3053,6 +4310,14 @@ void draw() {
       draw_settings_panel();
     } else if (g_show_build_lock) {
       draw_build_lock_panel();
+    } else if (g_show_camera) {
+      draw_camera_panel();
+    } else if (g_show_time) {
+      draw_time_panel();
+    } else if (g_show_lua) {
+      draw_lua_panel();
+    } else if (g_show_misc) {
+      draw_misc_panel();
     } else if (g_group >= 0 && g_group < group_count) {
       const auto& g = groups[g_group];
       ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), "%s", g.name);
@@ -3083,6 +4348,10 @@ void draw() {
           if (unit_page || sw_page || res_page) end_pair_flow();
           draw_feature_row(feat);
         }
+      }
+      if (unit_page) {
+        end_pair_flow();
+        draw_unit_ops_extra();
       }
     }
     ImGui::EndChild();

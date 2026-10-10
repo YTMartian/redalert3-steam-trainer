@@ -5705,6 +5705,13 @@ bool summon_prepare(uint32_t player, int count, const char* const* type_ids, int
 
 void drain_unit_spawns() { drain_unit_spawns_impl(); }
 
+// 对局时钟（秒），供摄像机定时事件等使用。
+bool battle_clock(float* seconds_out) {
+  if (seconds_out) *seconds_out = 0.f;
+  if (!loaded_module()) return false;
+  return read_battle_clock(nullptr, seconds_out);
+}
+
 void set_money_player(uint32_t player) { g_money_player = player; }
 
 int player_spawn_rank(uint32_t player) {
@@ -5849,6 +5856,24 @@ bool engine_run(const char* key, std::string* out_msg) {
     return false;
   }
 
+  {
+    bool handled = false;
+    const bool ok = camera_engine_cmd(key, &handled, out_msg);
+    if (handled) return ok;
+  }
+
+  {
+    bool handled = false;
+    const bool ok = time_control_engine_cmd(key, &handled, out_msg);
+    if (handled) return ok;
+  }
+
+  {
+    bool handled = false;
+    const bool ok = lua_bridge_engine_cmd(key, &handled, out_msg);
+    if (handled) return ok;
+  }
+
   if (std::strcmp(key, "speed_max") == 0) return apply_speed("max", out_msg);
   if (std::strcmp(key, "speed_slow") == 0) return apply_speed("slow", out_msg);
   if (std::strcmp(key, "speed_freeze") == 0) return apply_speed("freeze", out_msg);
@@ -5940,6 +5965,252 @@ bool set_unit_display_name(const char* type_id, const char* display_name,
     } else {
       *out_msg = std::string(u8"已保存「") + zh + u8"」到本地种类名表";
     }
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 单位操作扩展（对应 CameraBridge 的「选择哪些单位 / 切换单位的队伍」）
+// ---------------------------------------------------------------------------
+namespace {
+
+int g_unit_scope = kUnitScopeSelected;
+uint32_t g_unit_scope_player = 0;  // 0 表示用本地玩家
+
+uint32_t ent_owner_of(uint32_t ent) {
+  uint32_t ow = 0;
+  if (!safe_read_u32(ent + ent_off(kEntOwner, kEntOwnerEp1), &ow)) return 0;
+  return is_ptr(ow) ? ow : 0;
+}
+
+bool ent_in_selected(uint32_t ent, const std::vector<uint32_t>& sel) {
+  for (uint32_t e : sel) {
+    if (e == ent) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+int unit_scope() { return g_unit_scope; }
+
+void set_unit_scope(int scope) {
+  if (scope < kUnitScopeSelected || scope > kUnitScopePlayer) scope = kUnitScopeSelected;
+  g_unit_scope = scope;
+}
+
+uint32_t unit_scope_player() { return g_unit_scope_player; }
+
+void set_unit_scope_player(uint32_t player) {
+  g_unit_scope_player = is_ptr(player) ? player : 0;
+}
+
+int unit_collect_scope(uint32_t* out, int max_out) {
+  if (!out || max_out <= 0) return 0;
+  const std::vector<uint32_t> sel = selected_entities_stable(256);
+
+  if (g_unit_scope == kUnitScopeSelected) {
+    int n = 0;
+    for (uint32_t e : sel) {
+      if (n >= max_out) break;
+      out[n++] = e;
+    }
+    return n;
+  }
+
+  // 其余范围都要走一份「全部活动单位」快照（g_live 由 CreateUnit/扫描填充）。
+  std::vector<uint32_t> all;
+  if (g_live_cs_ready) {
+    EnterCriticalSection(&g_live_cs);
+    all.reserve(g_live.size());
+    for (const auto& kv : g_live) all.push_back(kv.first);
+    LeaveCriticalSection(&g_live_cs);
+  }
+
+  const uint32_t want_player =
+      is_ptr(g_unit_scope_player) ? g_unit_scope_player : local_owner_for_ops();
+
+  int n = 0;
+  for (uint32_t ent : all) {
+    if (n >= max_out) break;
+    if (!looks_like_entity(ent) || !entity_alive(ent)) continue;
+    switch (g_unit_scope) {
+      case kUnitScopeUnselected:
+        if (ent_in_selected(ent, sel)) continue;
+        break;
+      case kUnitScopePlayer:
+        if (!is_ptr(want_player) || ent_owner_of(ent) != want_player) continue;
+        break;
+      case kUnitScopeAll:
+      default:
+        break;
+    }
+    out[n++] = ent;
+  }
+  // g_live 还没铺开时，「所有的单位」至少把当前选中纳入，便于用户看到反馈。
+  if (n == 0 && g_unit_scope == kUnitScopeAll) {
+    for (uint32_t e : sel) {
+      if (n >= max_out) break;
+      out[n++] = e;
+    }
+  }
+  return n;
+}
+
+bool unit_change_team(uint32_t target_player, std::string* out_msg) {
+  return unit_change_team_ex(target_player, true, out_msg);
+}
+
+bool unit_change_team_ex(uint32_t target_player, bool enable_ai, std::string* out_msg) {
+  if (uprising_active()) {
+    if (out_msg) *out_msg = u8"切换队伍：起义时刻暂未适配";
+    return false;
+  }
+  if (!is_ptr(target_player) || !is_ptr(read_u32(target_player))) {
+    if (out_msg) *out_msg = u8"切换队伍：目标玩家无效";
+    return false;
+  }
+  uint32_t ents[512];
+  const int n = unit_collect_scope(ents, 512);
+  if (n <= 0) {
+    if (out_msg) *out_msg = u8"切换队伍：当前范围内没有单位（先选中单位，或换个范围）";
+    return false;
+  }
+  const uint32_t off = ent_off(kEntOwner, kEntOwnerEp1);
+  int changed = 0;
+  for (int i = 0; i < n; ++i) {
+    const uint32_t ent = ents[i];
+    if (ent_owner_of(ent) == target_player) continue;
+    if (write_u32(ent + off, target_player)) ++changed;
+  }
+  // 不启用 AI 操控：改完归属顺手把速度压成 0，免得 AI 立刻把单位调走。
+  // （这不是引擎级的「禁止 AI」，只是原地冻结，取消时用「单位速度」还原。）
+  int frozen = 0;
+  if (!enable_ai && changed > 0) {
+    for (int i = 0; i < n; ++i) {
+      for (uint32_t node : speed_nodes(ents[i])) {
+        if (set_speed_node(node, 0.f)) ++frozen;
+      }
+    }
+  }
+  if (changed == 0 && frozen == 0) {
+    if (out_msg) *out_msg = u8"切换队伍：范围内单位已经属于该队伍";
+    return false;
+  }
+  if (out_msg) {
+    char buf[160];
+    if (frozen > 0) {
+      std::snprintf(buf, sizeof(buf), u8"已把 %d 个单位切换到目标队伍，并把 %d 处速度冻结为 0",
+                    changed, frozen);
+    } else {
+      std::snprintf(buf, sizeof(buf), u8"已把 %d 个单位切换到目标队伍", changed);
+    }
+    *out_msg = buf;
+  }
+  log("unit team change -> %08X (%d units, frozen %d, scope %d)", target_player, changed,
+      frozen, g_unit_scope);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 「切换单位的颜色」：读写玩家对象的颜色字段（+0x80 / +0x84）。
+// ---------------------------------------------------------------------------
+namespace {
+
+struct ColorBackup {
+  uint32_t addr;
+  uint32_t argb;
+};
+
+std::map<uint32_t, ColorBackup> g_color_backup;  // key = 玩家对象指针
+
+bool color_ok(uint32_t argb) {
+  // 只认「0x00RRGGBB」这种形状：高位字节必须是 0，避免把指针（高位字节非 0）
+  // 误判成颜色后写坏玩家对象。
+  return (argb & 0xFF000000u) == 0 && (argb & 0x00FFFFFFu) != 0;
+}
+
+// 找到该玩家颜色所在的地址；读不到返回 0。
+uint32_t color_slot_of(uint32_t player) {
+  if (!is_ptr(player)) return 0;
+  uint32_t offs[3] = { 0x80u, 0x84u, 0x88u };
+  const int count = uprising_active() ? 3 : 2;
+  for (int i = 0; i < count; ++i) {
+    uint32_t v = 0;
+    if (!safe_read_u32(player + offs[i], &v)) continue;
+    if (color_ok(v)) return player + offs[i];
+  }
+  return 0;
+}
+
+}  // namespace
+
+bool unit_color_read(uint32_t player, uint8_t* r, uint8_t* g, uint8_t* b) {
+  const uint32_t slot = color_slot_of(player);
+  if (!slot) return false;
+  const uint32_t v = read_u32(slot);
+  if (r) *r = (uint8_t)((v >> 16) & 0xFFu);
+  if (g) *g = (uint8_t)((v >> 8) & 0xFFu);
+  if (b) *b = (uint8_t)(v & 0xFFu);
+  return true;
+}
+
+bool unit_color_has_backup(uint32_t player) {
+  return g_color_backup.find(player) != g_color_backup.end();
+}
+
+bool unit_color_write(uint32_t player, uint8_t r, uint8_t g, uint8_t b,
+                      std::string* out_msg) {
+  if (uprising_active()) {
+    if (out_msg) *out_msg = u8"切换颜色：起义时刻暂未适配";
+    return false;
+  }
+  const uint32_t slot = color_slot_of(player);
+  if (!slot) {
+    if (out_msg) *out_msg = u8"切换颜色：读不到该玩家的颜色字段（先进入对局）";
+    return false;
+  }
+  const uint32_t cur = read_u32(slot);
+  if (g_color_backup.find(player) == g_color_backup.end()) {
+    ColorBackup b0{};
+    b0.addr = slot;
+    b0.argb = cur;
+    g_color_backup[player] = b0;
+  }
+  // 保留原 alpha（RA3 用 alpha 表示是否灰显，别动它）。
+  const uint32_t keep_a = cur & 0xFF000000u;
+  const uint32_t argb = keep_a | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+  if (!write_u32(slot, argb)) {
+    if (out_msg) *out_msg = u8"切换颜色：写入失败";
+    return false;
+  }
+  if (out_msg) {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), u8"已把该队伍颜色改为 (%u, %u, %u)", (unsigned)r,
+                  (unsigned)g, (unsigned)b);
+    *out_msg = buf;
+  }
+  log("unit color write %08X -> (%u,%u,%u)", player, (unsigned)r, (unsigned)g, (unsigned)b);
+  return true;
+}
+
+bool unit_color_restore(uint32_t player, std::string* out_msg) {
+  auto it = g_color_backup.find(player);
+  if (it == g_color_backup.end()) {
+    if (out_msg) *out_msg = u8"恢复颜色：没有记录过这个队伍的原始颜色";
+    return false;
+  }
+  if (!write_u32(it->second.addr, it->second.argb)) {
+    if (out_msg) *out_msg = u8"恢复颜色：写入失败";
+    return false;
+  }
+  const uint32_t v = it->second.argb;
+  g_color_backup.erase(it);
+  if (out_msg) {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), u8"已恢复原色 (%u, %u, %u)", (unsigned)((v >> 16) & 255u),
+                  (unsigned)((v >> 8) & 255u), (unsigned)(v & 255u));
+    *out_msg = buf;
   }
   return true;
 }

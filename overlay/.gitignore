@@ -15,8 +15,23 @@ third_party/imgui/examples/
 third_party/imgui/docs/
 third_party/imgui/misc/
 third_party/imgui/.github/
+third_party/imgui/.editorconfig
+third_party/imgui/.gitattributes
+third_party/imgui/.gitignore
+third_party/imgui/backends/*
+!third_party/imgui/backends/imgui_impl_dx9.cpp
+!third_party/imgui/backends/imgui_impl_dx9.h
+!third_party/imgui/backends/imgui_impl_win32.cpp
+!third_party/imgui/backends/imgui_impl_win32.h
 
 # MinHook extras
 third_party/minhook/build/
 third_party/minhook/dll/
 third_party/minhook/examples/
+third_party/minhook/.github/
+third_party/minhook/.editorconfig
+third_party/minhook/.gitignore
+third_party/minhook/AUTHORS.txt
+third_party/minhook/CMakeLists.txt
+third_party/minhook/cmake/
+third_party/minhook/dll_resources/

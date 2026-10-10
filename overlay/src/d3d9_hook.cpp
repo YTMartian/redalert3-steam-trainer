@@ -52,6 +52,8 @@ volatile LONG g_present_count = 0;
 volatile LONG g_swap_present_count = 0;
 volatile LONG g_drew_this_frame = 0;
 volatile LONG g_skip_draw = 0;
+// 「禁用游戏中的鼠标输入」：勾选后吞掉发往游戏窗口的鼠标消息。
+volatile LONG g_game_mouse_off = 0;
 IDirect3DDevice9* g_ui_device = nullptr;
 
 HMODULE g_self = nullptr;
@@ -149,6 +151,13 @@ LRESULT CALLBACK hk_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
   }
   if (!g_orig_wndproc) {
     return DefWindowProcW(hwnd, msg, wparam, lparam);
+  }
+  // 「禁用游戏中的鼠标输入」：吞掉鼠标消息，游戏不再响应悬停/点击。
+  if (InterlockedCompareExchange(&g_game_mouse_off, 0, 0) != 0) {
+    const bool mouse_msg =
+        (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) || msg == WM_MOUSEWHEEL ||
+        msg == WM_MOUSEHWHEEL;
+    if (mouse_msg) return 0;
   }
   return CallWindowProcW(g_orig_wndproc, hwnd, msg, wparam, lparam);
 }
@@ -289,6 +298,10 @@ HRESULT APIENTRY hk_end_scene(IDirect3DDevice9* device) {
 HRESULT APIENTRY hk_present(IDirect3DDevice9* device, const RECT* src, const RECT* dst,
                             HWND hwnd, const RGNDATA* dirty) {
   game_api::drain_unit_spawns();
+  game_api::camera_tick();
+  game_api::time_control_tick();
+  game_api::lua_bridge_tick();
+  game_api::misc_tick();
   InterlockedIncrement(&g_present_count);
   render_overlay_seh(device);
   const HRESULT hr = g_orig_present(device, src, dst, hwnd, dirty);
@@ -594,3 +607,17 @@ void stop() {
 }
 
 }  // namespace d3d9_hook
+
+namespace game_api {
+
+// 「禁用游戏中的鼠标输入」：勾选后 hk_wndproc 吞掉发往游戏窗口的鼠标消息。
+// 对应 CameraBridge 的「在游戏中禁用输入」。
+void set_game_input_disabled(bool on) {
+  InterlockedExchange(&d3d9_hook::g_game_mouse_off, on ? 1 : 0);
+}
+
+bool game_input_disabled() {
+  return InterlockedCompareExchange(&d3d9_hook::g_game_mouse_off, 0, 0) != 0;
+}
+
+}  // namespace game_api

@@ -58,6 +58,7 @@ ra3_image.json
 # 运行期生成的界面配置与日志
 overlay_ui.ini
 ra3_overlay.log
+ra3_camera.ini
 
 # 编辑器 / 系统
 .vscode/

@@ -25,6 +25,10 @@ add_library(ra3_overlay SHARED
   src/unit_icons.cpp
   src/game_api.cpp
   src/game_features.cpp
+  src/camera.cpp
+  src/time_control.cpp
+  src/lua_bridge.cpp
+  src/render_misc.cpp
   ${IMGUI_DIR}/imgui.cpp
   ${IMGUI_DIR}/imgui_draw.cpp
   ${IMGUI_DIR}/imgui_tables.cpp
