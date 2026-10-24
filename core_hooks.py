@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 核心功能版 hook 定义 —— 17 个已定位 hook 的完整注入信息
-每个 hook: 名称 / Steam新VA / 原始指令AOB(hex) / jmp目标(MustCode+偏移)
+每个 hook: 名称 / Steam VA / 原始指令AOB(hex) / jmp目标(MustCode+偏移)
+
+地址是从模块基址 0x400000 起算的绝对 VA（ra3_1.12.game 关闭了 ASLR，加载基址
+固定，所以 VA 与 RVA 只差 0x400000）。注意下面 DATA_GLOBALS 存的是 RVA，不是 VA，
+两种约定不能混用；本表的 AOB 已按 VA 从 ra3_1.12.game 逐条离线校验通过。
 """
 import pefile
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32
 
-# 17 个已定位 hook（名称, Steam新RVA, AOB, jmp目标偏移）
+# 17 个已定位 hook（名称, Steam VA, AOB, jmp目标偏移）
 # jmp 目标偏移 = MustCode 块内偏移（十六进制）
 CORE_HOOKS = [
     ('PlayerID',       0x54119B, '8b50288b4220',          0x1200),
@@ -28,7 +32,7 @@ CORE_HOOKS = [
     ('EnemyCantBuild', 0x74D920, '0350043bd7',            0x3d0),
 ]
 
-# 已定位的全局数据指针（.data 段 RVA 不变）
+# 已定位的全局数据指针（**RVA**，不是 VA；VA = RVA + 0x400000，如 0x8E08DC → 0xCE08DC）
 DATA_GLOBALS = [
     # Steam 版重定位：旧 0x8DB73C 已无任何代码引用；新地址经运行时差分扫描确认为 0x8E08DC
     # （结构不变：+0x5C=选中数量，+0x50=选中单位链表头，节点+8 → 对象+0x138=单位实体）
@@ -39,7 +43,7 @@ DATA_GLOBALS = [
 ]
 
 if __name__ == '__main__':
-    for name, rva, aob, target in CORE_HOOKS:
-        print('%-15s va=0x%08X len=%d jmp=MustCode+0x%X' % (name, 0x400000+rva, len(aob)//2, target))
+    for name, va, aob, target in CORE_HOOKS:
+        print('%-15s va=0x%08X len=%d jmp=MustCode+0x%X' % (name, va, len(aob)//2, target))
     print()
     print('total %d hooks' % len(CORE_HOOKS))

@@ -46,10 +46,28 @@ volatile LONG g_engine_busy = 0;
 // UI appearance (persisted). Defaults match the previous large layout.
 float g_ui_scale = 1.00f;     // 0.70 ~ 1.30
 float g_ui_opacity = 0.80f;   // 0.35 ~ 1.00
+// ScaleAllSizes / FontGlobalScale do not affect hardcoded Image sizes.
+static float ui_px(float v) {
+  const float s = (g_ui_scale > 0.01f) ? g_ui_scale : 1.f;
+  return v * s;
+}
 bool g_unit_inspect_open = true;
+bool g_show_debug_status = false;  // 顶部调试状态，默认关闭，避免长日志撑开窗口
 char g_ui_settings_path[MAX_PATH] = {};
 bool g_settings_dirty = false;
 float g_settings_save_timer = 0.f;
+
+// 杂项 / 真无敌 / 空投的持久化设置（写进 overlay_ui.ini）。
+static int g_misc_shadow_size = 0;     // 0 = 没设置过
+static float g_misc_shadow_dist = 0.f; // 0 = 没设置过
+static bool g_misc_hide_hp = false;
+static bool g_misc_hide_sil = false;
+static bool g_misc_take = false;
+static bool g_misc_shadow_take = false;
+static bool g_misc_light_lock = true;
+static int g_crate_kind_persist = 0;
+static int g_crate_count_persist = 1;
+static bool g_misc_restore_pending = false;
 
 struct AsyncResult {
   bool done = false;
@@ -92,7 +110,8 @@ DWORD WINAPI engine_worker(LPVOID param) {
         std::strcmp(job->key, "clone_multi") == 0 ||
         std::strcmp(job->key, "ore_convoy") == 0 ||
         std::strcmp(job->key, "spawn_mcv") == 0 ||
-        std::strcmp(job->key, "summon_troops") == 0;
+        std::strcmp(job->key, "summon_troops") == 0 ||
+        std::strcmp(job->key, "airdrop") == 0;
     if (need_terrain) {
       input::set_menu_visible(false);
       Sleep(280);
@@ -211,6 +230,33 @@ void load_ui_settings() {
       game_api::set_money_sel_step((int)std::atoi(val.c_str()));
     } else if (key == "mcv_faction") {
       game_api::set_mcv_faction((int)std::atoi(val.c_str()));
+    } else if (key == "misc.shadow_size") {
+      g_misc_shadow_size = (int)std::atoi(val.c_str());
+      g_misc_restore_pending = true;
+    } else if (key == "misc.shadow_dist") {
+      g_misc_shadow_dist = (float)std::atof(val.c_str());
+      g_misc_restore_pending = true;
+    } else if (key == "misc.hide_hp") {
+      g_misc_hide_hp = (val == "1" || val == "true" || val == "yes");
+      g_misc_restore_pending = true;
+    } else if (key == "misc.hide_sil") {
+      g_misc_hide_sil = (val == "1" || val == "true" || val == "yes");
+      g_misc_restore_pending = true;
+    } else if (key == "misc.take") {
+      g_misc_take = (val == "1" || val == "true" || val == "yes");
+      g_misc_restore_pending = true;
+    } else if (key == "misc.shadow_take") {
+      g_misc_shadow_take = (val == "1" || val == "true" || val == "yes");
+      g_misc_restore_pending = true;
+    } else if (key == "misc.light_lock") {
+      g_misc_light_lock = (val == "1" || val == "true" || val == "yes");
+      g_misc_restore_pending = true;
+    } else if (key == "crate.kind") {
+      g_crate_kind_persist = (int)std::atoi(val.c_str());
+    } else if (key == "crate.count") {
+      g_crate_count_persist = (int)std::atoi(val.c_str());
+      if (g_crate_count_persist < 1) g_crate_count_persist = 1;
+      if (g_crate_count_persist > 20) g_crate_count_persist = 20;
     } else if (key.compare(0, 3, "hk.") == 0) {
       game_api::apply_hotkey_text(key.c_str() + 3, val.c_str());
     }
@@ -233,6 +279,15 @@ void save_ui_settings() {
   f << "money_self_step=" << game_api::money_self_step() << "\n";
   f << "money_sel_step=" << game_api::money_sel_step() << "\n";
   f << "mcv_faction=" << game_api::mcv_faction() << "\n";
+  f << "misc.shadow_size=" << g_misc_shadow_size << "\n";
+  f << "misc.shadow_dist=" << g_misc_shadow_dist << "\n";
+  f << "misc.hide_hp=" << (g_misc_hide_hp ? 1 : 0) << "\n";
+  f << "misc.hide_sil=" << (g_misc_hide_sil ? 1 : 0) << "\n";
+  f << "misc.take=" << (g_misc_take ? 1 : 0) << "\n";
+  f << "misc.shadow_take=" << (g_misc_shadow_take ? 1 : 0) << "\n";
+  f << "misc.light_lock=" << (g_misc_light_lock ? 1 : 0) << "\n";
+  f << "crate.kind=" << g_crate_kind_persist << "\n";
+  f << "crate.count=" << g_crate_count_persist << "\n";
   const int hk_n = game_api::hotkey_slot_count();
   for (int i = 0; i < hk_n; ++i) {
     char combo[48] = {};
@@ -245,22 +300,33 @@ void save_ui_settings() {
 }
 
 void apply_ra3_theme() {
+  // ScaleAllSizes also multiplies _MainScale / WindowMinSize / IndentSpacing /
+  // CellPadding / … — fields we used to leave dirty, so each slider tick
+  // compounded and the whole window width drifted. Always restore a clean
+  // scale=1 snapshot, then scale exactly once.
+  static ImGuiStyle s_base;
+  static bool s_base_ready = false;
+  if (!s_base_ready) {
+    s_base = ImGuiStyle();
+    s_base.WindowPadding = ImVec2(12, 12);
+    s_base.FramePadding = ImVec2(10, 6);
+    s_base.ItemSpacing = ImVec2(10, 8);
+    s_base.ItemInnerSpacing = ImVec2(8, 5);
+    s_base.WindowRounding = 8.0f;
+    s_base.ChildRounding = 6.0f;
+    s_base.FrameRounding = 5.0f;
+    s_base.PopupRounding = 5.0f;
+    s_base.ScrollbarRounding = 6.0f;
+    s_base.GrabRounding = 4.0f;
+    s_base.TabRounding = 5.0f;
+    s_base.WindowBorderSize = 1.0f;
+    s_base.FrameBorderSize = 0.0f;
+    s_base.ScrollbarSize = 12.0f;
+    s_base_ready = true;
+  }
+
   ImGuiStyle& s = ImGui::GetStyle();
-  // Base metrics at scale=1.0 (previous default layout).
-  s.WindowPadding = ImVec2(12, 12);
-  s.FramePadding = ImVec2(10, 6);
-  s.ItemSpacing = ImVec2(10, 8);
-  s.ItemInnerSpacing = ImVec2(8, 5);
-  s.WindowRounding = 8.0f;
-  s.ChildRounding = 6.0f;
-  s.FrameRounding = 5.0f;
-  s.PopupRounding = 5.0f;
-  s.ScrollbarRounding = 6.0f;
-  s.GrabRounding = 4.0f;
-  s.TabRounding = 5.0f;
-  s.WindowBorderSize = 1.0f;
-  s.FrameBorderSize = 0.0f;
-  s.ScrollbarSize = 12.0f;
+  s = s_base;
 
   ImGui::StyleColorsDark();
   ImVec4* c = s.Colors;
@@ -308,7 +374,6 @@ void apply_ra3_theme() {
   c[ImGuiCol_TabUnfocused] = panel;
   c[ImGuiCol_TabUnfocusedActive] = ImVec4(0.18f, 0.32f, 0.55f, 1.0f);
 
-  // ScaleAllSizes is cumulative — always rebuild base first, then scale once.
   if (g_ui_scale > 0.01f && g_ui_scale != 1.0f) {
     s.ScaleAllSizes(g_ui_scale);
   }
@@ -704,27 +769,32 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
   }
 
   if (p.roster_count > 0 || p.unit_total || p.building_total || p.protocol_count > 0) {
-    ImGui::Spacing();
+    ImGui::Dummy(ImVec2(0.f, 4.f));
+    ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(accent.x, accent.y, accent.z, 0.28f));
     ImGui::Separator();
-    ImGui::Spacing();
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0.f, 3.f));
 
-    const float icon_sz = 46.f;
-    const float gap = 6.f;
-    const float cell_w = icon_sz + 4.f;
-    const float cell_h = icon_sz + 14.f;
+    const float icon_sz = ui_px(42.f);
+    const float gap = ui_px(4.f);
+    const float pad = ui_px(2.f);
+    const float cell_w = icon_sz + pad * 2.f;
+    const float cell_h = icon_sz + pad * 2.f;
+    const float round = ui_px(5.f);
     ImDrawList* draw = ImGui::GetWindowDrawList();
 
-    auto draw_roster_section = [&](const char* title, bool buildings, ImU32 accent_u32) {
+    auto draw_roster_section = [&](const char* title, bool buildings, ImU32 accent_u32,
+                                   bool trailing_gap) {
       int n = 0;
       for (int i = 0; i < p.roster_count; ++i) {
         if (p.roster[i].is_building == buildings && p.roster[i].count > 0) ++n;
       }
       if (n <= 0) return;
 
+      ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(gap, ui_px(3.f)));
       ImGui::TextColored(ImVec4(0.70f, 0.78f, 0.90f, 1.f), "%s", title);
-      ImGui::SameLine();
+      ImGui::SameLine(0.f, ui_px(6.f));
       ImGui::TextDisabled("%d", buildings ? p.building_total : p.unit_total);
-      ImGui::Dummy(ImVec2(0.f, 2.f));
 
       const float avail = ImGui::GetContentRegionAvail().x;
       float used_x = 0.f;
@@ -735,38 +805,35 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
         if (r.is_building != buildings || r.count <= 0) continue;
 
         if (row_started && used_x + cell_w + gap > avail) {
-          ImGui::Dummy(ImVec2(0.f, 2.f));
+          ImGui::NewLine();
           used_x = 0.f;
           row_started = false;
         }
-        if (row_started) {
-          ImGui::SameLine(0.f, gap);
-        }
+        if (row_started) ImGui::SameLine(0.f, gap);
 
         ImGui::PushID(r.key[0] ? r.key : r.name);
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
-        const ImVec2 chip0 = p0;
         const ImVec2 chip1 = ImVec2(p0.x + cell_w, p0.y + cell_h);
 
-        draw->AddRectFilled(chip0, chip1, IM_COL32(12, 16, 24, 180), 6.f);
-        draw->AddRect(chip0, chip1, accent_u32, 6.f, 0, 1.0f);
+        draw->AddRectFilled(p0, chip1, IM_COL32(12, 16, 24, 180), round);
+        draw->AddRect(p0, chip1, accent_u32, round, 0, 1.0f);
 
         IDirect3DTexture9* tex = unit_icons::get(r.key, r.name, r.is_building);
-        ImGui::SetCursorScreenPos(ImVec2(p0.x + 2.f, p0.y + 2.f));
+        ImGui::SetCursorScreenPos(ImVec2(p0.x + pad, p0.y + pad));
         if (tex) {
           ImGui::Image((ImTextureID)tex, ImVec2(icon_sz, icon_sz));
         } else {
           ImGui::Dummy(ImVec2(icon_sz, icon_sz));
-          draw->AddRectFilled(ImVec2(p0.x + 2.f, p0.y + 2.f),
-                              ImVec2(p0.x + 2.f + icon_sz, p0.y + 2.f + icon_sz),
-                              IM_COL32(40, 48, 60, 220), 4.f);
+          draw->AddRectFilled(ImVec2(p0.x + pad, p0.y + pad),
+                              ImVec2(p0.x + pad + icon_sz, p0.y + pad + icon_sz),
+                              IM_COL32(40, 48, 60, 220), ui_px(3.f));
           const char* short_l = buildings ? u8"建" : u8"兵";
           const ImVec2 sts = ImGui::CalcTextSize(short_l);
-          draw->AddText(ImVec2(p0.x + 2.f + (icon_sz - sts.x) * 0.5f,
-                               p0.y + 2.f + (icon_sz - sts.y) * 0.5f),
+          draw->AddText(ImVec2(p0.x + pad + (icon_sz - sts.x) * 0.5f,
+                               p0.y + pad + (icon_sz - sts.y) * 0.5f),
                         IM_COL32(200, 210, 220, 255), short_l);
         }
-        if (ImGui::IsMouseHoveringRect(chip0, chip1)) {
+        if (ImGui::IsMouseHoveringRect(p0, chip1)) {
           ImGui::BeginTooltip();
           ImGui::TextUnformatted(r.name[0] ? r.name : r.key);
           ImGui::TextDisabled("%s  × %d", buildings ? u8"建筑" : u8"部队", r.count);
@@ -776,35 +843,38 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
         char cnt[16];
         std::snprintf(cnt, sizeof(cnt), "%d", r.count);
         const ImVec2 cts = ImGui::CalcTextSize(cnt);
-        const float bx1 = chip1.x - 2.f;
-        const float by1 = chip1.y - 2.f;
+        const float bx1 = chip1.x - pad;
+        const float by1 = chip1.y - pad;
         const float bx0 = bx1 - cts.x - 6.f;
         const float by0 = by1 - cts.y - 2.f;
         draw->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), IM_COL32(8, 10, 14, 230),
-                            4.f);
+                            ui_px(3.f));
         draw->AddText(ImVec2(bx0 + 3.f, by0 + 1.f), IM_COL32(255, 230, 160, 255), cnt);
 
-        ImGui::SetCursorScreenPos(ImVec2(p0.x + cell_w, p0.y));
-        ImGui::Dummy(ImVec2(0.1f, cell_h));
+        ImGui::SetCursorScreenPos(ImVec2(p0.x, p0.y));
+        ImGui::Dummy(ImVec2(cell_w, cell_h));
         ImGui::PopID();
 
         used_x += cell_w + gap;
         row_started = true;
       }
-      ImGui::Spacing();
+      ImGui::PopStyleVar();
+      if (trailing_gap) ImGui::Dummy(ImVec2(0.f, ui_px(5.f)));
     };
 
     const ImU32 unit_accent =
         p.is_local ? IM_COL32(200, 160, 50, 120) : IM_COL32(70, 130, 210, 120);
     const ImU32 bld_accent =
         p.is_local ? IM_COL32(180, 140, 40, 140) : IM_COL32(90, 150, 220, 140);
-    draw_roster_section(u8"部队", false, unit_accent);
-    draw_roster_section(u8"建筑", true, bld_accent);
+    const bool has_bld = p.building_total > 0;
+    const bool has_proto = p.protocol_count > 0;
+    draw_roster_section(u8"部队", false, unit_accent, has_bld || has_proto);
+    draw_roster_section(u8"建筑", true, bld_accent, has_proto);
     if (p.protocol_count > 0) {
+      ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(gap, ui_px(3.f)));
       ImGui::TextColored(ImVec4(0.70f, 0.78f, 0.90f, 1.f), u8"协议");
-      ImGui::SameLine();
+      ImGui::SameLine(0.f, ui_px(6.f));
       ImGui::TextDisabled("%d", p.protocol_count);
-      ImGui::Dummy(ImVec2(0.f, 2.f));
       const float avail = ImGui::GetContentRegionAvail().x;
       float used_x = 0.f;
       bool row_started = false;
@@ -812,7 +882,7 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
       for (int i = 0; i < p.protocol_count; ++i) {
         const auto& pr = p.protocols[i];
         if (row_started && used_x + cell_w + gap > avail) {
-          ImGui::Dummy(ImVec2(0.f, 2.f));
+          ImGui::NewLine();
           used_x = 0.f;
           row_started = false;
         }
@@ -820,10 +890,10 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
         ImGui::PushID(pr.key[0] ? pr.key : pr.name);
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
         const ImVec2 chip1(p0.x + cell_w, p0.y + cell_h);
-        draw->AddRectFilled(p0, chip1, IM_COL32(12, 22, 20, 180), 6.f);
-        draw->AddRect(p0, chip1, proto_accent, 6.f, 0, 1.0f);
+        draw->AddRectFilled(p0, chip1, IM_COL32(12, 22, 20, 180), round);
+        draw->AddRect(p0, chip1, proto_accent, round, 0, 1.0f);
         IDirect3DTexture9* tex = unit_icons::get(pr.key, pr.name, false);
-        ImGui::SetCursorScreenPos(ImVec2(p0.x + 2.f, p0.y + 2.f));
+        ImGui::SetCursorScreenPos(ImVec2(p0.x + pad, p0.y + pad));
         if (tex) ImGui::Image((ImTextureID)tex, ImVec2(icon_sz, icon_sz));
         else ImGui::Dummy(ImVec2(icon_sz, icon_sz));
         if (ImGui::IsMouseHoveringRect(p0, chip1)) {
@@ -838,20 +908,21 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
           if (pr.remain_sec < 60) std::snprintf(clk, sizeof(clk), "%ds", pr.remain_sec);
           else std::snprintf(clk, sizeof(clk), "%d:%02d", pr.remain_sec / 60, pr.remain_sec % 60);
           const ImVec2 cts = ImGui::CalcTextSize(clk);
-          const float bx1 = chip1.x - 2.f;
-          const float by1 = chip1.y - 2.f;
+          const float bx1 = chip1.x - pad;
+          const float by1 = chip1.y - pad;
           const float bx0 = bx1 - cts.x - 6.f;
           const float by0 = by1 - cts.y - 2.f;
-          draw->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), IM_COL32(8, 10, 14, 230), 4.f);
+          draw->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), IM_COL32(8, 10, 14, 230),
+                              ui_px(3.f));
           draw->AddText(ImVec2(bx0 + 3.f, by0 + 1.f), IM_COL32(255, 214, 120, 255), clk);
         }
-        ImGui::SetCursorScreenPos(ImVec2(p0.x + cell_w, p0.y));
-        ImGui::Dummy(ImVec2(0.1f, cell_h));
+        ImGui::SetCursorScreenPos(ImVec2(p0.x, p0.y));
+        ImGui::Dummy(ImVec2(cell_w, cell_h));
         ImGui::PopID();
         used_x += cell_w + gap;
         row_started = true;
       }
-      ImGui::Spacing();
+      ImGui::PopStyleVar();
     }
   }
 
@@ -896,26 +967,26 @@ void text_ellipsis(const char* s, float max_w) {
   if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", s);
 }
 
-void draw_compact_icon(ImDrawList* draw, const game_api::RosterType& r, float cell, float icon_sz,
-                       ImU32 border, bool building, bool defeated) {
-  const ImVec2 p0 = ImGui::GetCursorScreenPos();
+// Draw one compact chip at an absolute screen position (no ImGui layout side effects).
+void draw_compact_icon_at(ImDrawList* draw, const ImVec2& p0, const game_api::RosterType& r,
+                          float cell, float icon_sz, ImU32 border, bool building, bool defeated) {
   const ImVec2 chip1(p0.x + cell, p0.y + cell);
   const ImU32 fill = building ? IM_COL32(32, 24, 14, 210) : IM_COL32(14, 20, 32, 210);
-  draw->AddRectFilled(p0, chip1, fill, 4.f);
-  draw->AddRect(p0, chip1, border, 4.f, 0, 1.0f);
+  const float round = ui_px(4.f);
+  draw->AddRectFilled(p0, chip1, fill, round);
+  draw->AddRect(p0, chip1, border, round, 0, 1.0f);
 
   const float inset = (cell - icon_sz) * 0.5f;
-  ImGui::SetCursorScreenPos(ImVec2(p0.x + inset, p0.y + inset));
   IDirect3DTexture9* tex = unit_icons::get(r.key, r.name, r.is_building);
-  const ImVec4 tint = defeated ? ImVec4(0.62f, 0.62f, 0.62f, 0.80f) : ImVec4(1, 1, 1, 1);
+  const ImU32 tint = defeated ? IM_COL32(158, 158, 158, 204) : IM_COL32(255, 255, 255, 255);
   if (tex) {
-    ImGui::ImageWithBg((ImTextureID)tex, ImVec2(icon_sz, icon_sz), ImVec2(0, 0), ImVec2(1, 1),
-                       ImVec4(0, 0, 0, 0), tint);
+    draw->AddImage((ImTextureID)tex, ImVec2(p0.x + inset, p0.y + inset),
+                   ImVec2(p0.x + inset + icon_sz, p0.y + inset + icon_sz), ImVec2(0, 0),
+                   ImVec2(1, 1), tint);
   } else {
-    ImGui::Dummy(ImVec2(icon_sz, icon_sz));
     draw->AddRectFilled(ImVec2(p0.x + inset, p0.y + inset),
                         ImVec2(p0.x + inset + icon_sz, p0.y + inset + icon_sz),
-                        IM_COL32(40, 48, 60, 220), 3.f);
+                        IM_COL32(40, 48, 60, 220), ui_px(3.f));
     const char* short_l = building ? u8"建" : u8"兵";
     const ImVec2 sts = ImGui::CalcTextSize(short_l);
     draw->AddText(ImVec2(p0.x + inset + (icon_sz - sts.x) * 0.5f,
@@ -938,20 +1009,16 @@ void draw_compact_icon(ImDrawList* draw, const game_api::RosterType& r, float ce
   const float by1 = chip1.y - 1.f;
   const float bx0 = bx1 - cts.x - 5.f;
   const float by0 = by1 - cts.y - 1.f;
-  draw->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), IM_COL32(8, 10, 14, 230), 3.f);
+  draw->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), IM_COL32(8, 10, 14, 230), ui_px(3.f));
   draw->AddText(font, csz, ImVec2(bx0 + 2.5f, by0), IM_COL32(255, 228, 150, 255), cnt);
-
-  ImGui::SetCursorScreenPos(ImVec2(p0.x + cell, p0.y));
-  ImGui::Dummy(ImVec2(0.1f, cell));
 }
 
 void draw_compact_icon_row(const game_api::PlayerEconomy& p, bool buildings, bool defeated) {
-  const float icon_sz = 34.f;
-  const float cell = 38.f;
-  const float gap = 4.f;
-  const float label_w = 62.f;
-
-  if (ImGui::GetCursorPos().x > ImGui::GetWindowContentRegionMin().x + 2.f) ImGui::NewLine();
+  const float icon_sz = ui_px(32.f);
+  const float cell = ui_px(34.f);
+  const float gap = ui_px(3.f);
+  const float row_gap = ui_px(2.f);  // space after this row before the next
+  const float label_w = ui_px(56.f);
 
   const game_api::RosterType* items[game_api::kMaxRosterTypes];
   int n = 0;
@@ -969,11 +1036,10 @@ void draw_compact_icon_row(const game_api::PlayerEconomy& p, bool buildings, boo
   else std::snprintf(head, sizeof(head), "%s %d", buildings ? u8"建筑" : u8"部队", total);
 
   const ImVec2 ts = ImGui::CalcTextSize(head);
-  const float label_y = n > 0 ? row0.y + (cell - ts.y) * 0.5f : row0.y;
-  draw->AddText(ImVec2(row0.x, label_y), IM_COL32(176, 196, 220, 255), head);
   if (n <= 0) {
-    ImGui::Dummy(ImVec2(1.f, ts.y));
-    ImGui::NewLine();
+    draw->AddText(ImVec2(row0.x, row0.y), IM_COL32(176, 196, 220, 255), head);
+    // Grow layout via Dummy only — do not SetCursor beyond content first.
+    ImGui::Dummy(ImVec2(avail, ts.y + row_gap));
     return;
   }
 
@@ -982,25 +1048,26 @@ void draw_compact_icon_row(const game_api::PlayerEconomy& p, bool buildings, boo
                            : (p.is_local ? IM_COL32(214, 176, 72, 180) : IM_COL32(96, 156, 224, 180));
   const float icons_x = row0.x + label_w;
   const float wrap_w = (std::max)(cell, avail - label_w);
-  ImGui::SetCursorScreenPos(ImVec2(icons_x, row0.y));
 
-  float used_x = 0.f;
-  bool row_started = false;
+  float x = 0.f;
+  float y = 0.f;
+  int rows = 1;
   for (int i = 0; i < n; ++i) {
-    if (row_started && used_x + cell > wrap_w) {
-      ImGui::NewLine();
-      ImGui::SetCursorScreenPos(ImVec2(icons_x, ImGui::GetCursorScreenPos().y));
-      used_x = 0.f;
-      row_started = false;
+    if (x > 0.f && x + cell > wrap_w) {
+      x = 0.f;
+      y += cell + gap;
+      ++rows;
     }
-    if (row_started) ImGui::SameLine(0.f, gap);
-    ImGui::PushID(items[i]->key[0] ? items[i]->key : items[i]->name);
-    draw_compact_icon(draw, *items[i], cell, icon_sz, border, buildings, defeated);
-    ImGui::PopID();
-    used_x += cell + gap;
-    row_started = true;
+    const ImVec2 p0(icons_x + x, row0.y + y);
+    draw_compact_icon_at(draw, p0, *items[i], cell, icon_sz, border, buildings, defeated);
+    x += cell + gap;
   }
-  ImGui::NewLine();
+
+  const float block_h = (float)rows * cell + (float)(rows - 1) * gap;
+  draw->AddText(ImVec2(row0.x, row0.y + (block_h - ts.y) * 0.5f), IM_COL32(176, 196, 220, 255),
+                head);
+  // Reserve the drawn block with Dummy so AutoResize / parent bounds grow.
+  ImGui::Dummy(ImVec2(avail, block_h + row_gap));
 }
 
 void draw_compact_player(const game_api::PlayerEconomy& p, int index) {
@@ -1052,7 +1119,6 @@ void draw_compact_player(const game_api::PlayerEconomy& p, int index) {
   const ImVec2 origin = ImGui::GetCursorScreenPos();
   ImGui::PushID(index + 1);
   ImGui::BeginGroup();
-  ImGui::Dummy(ImVec2(0.f, 1.f));
 
   const float sw = ImGui::GetTextLineHeight();
   const ImVec2 sw0 = ImGui::GetCursorScreenPos();
@@ -1072,51 +1138,46 @@ void draw_compact_player(const game_api::PlayerEconomy& p, int index) {
   ImGui::SameLine(0.f, 4.f);
   ImGui::TextColored(power_col, "%s", power_s);
 
+  // Tiny gap under the header, then pack 部队 / 建筑 tight.
+  ImGui::Dummy(ImVec2(0.f, ui_px(2.f)));
   draw_compact_icon_row(p, false, p.defeated);
   draw_compact_icon_row(p, true, p.defeated);
   if (p.protocol_count > 0) {
-    const float icon_sz = 34.f;
-    const float cell = 38.f;
-    const float gap = 4.f;
-    const float label_w = 62.f;
-    if (ImGui::GetCursorPos().x > ImGui::GetWindowContentRegionMin().x + 2.f) ImGui::NewLine();
-    const float avail = ImGui::GetContentRegionAvail().x;
+    const float icon_sz = ui_px(32.f);
+    const float cell = ui_px(34.f);
+    const float gap = ui_px(3.f);
+    const float row_gap = ui_px(2.f);
+    const float label_w = ui_px(56.f);
+    const float avail_p = ImGui::GetContentRegionAvail().x;
     ImDrawList* pdraw = ImGui::GetWindowDrawList();
     const ImVec2 row0 = ImGui::GetCursorScreenPos();
     char head[32];
     std::snprintf(head, sizeof(head), u8"协议 %d", p.protocol_count);
     const ImVec2 ts = ImGui::CalcTextSize(head);
-    pdraw->AddText(ImVec2(row0.x, row0.y + (cell - ts.y) * 0.5f), IM_COL32(150, 214, 186, 255),
-                   head);
     const float icons_x = row0.x + label_w;
-    const float wrap_w = (std::max)(cell, avail - label_w);
-    ImGui::SetCursorScreenPos(ImVec2(icons_x, row0.y));
-    float used_x = 0.f;
-    bool row_started = false;
+    const float wrap_w = (std::max)(cell, avail_p - label_w);
+    float x = 0.f;
+    float y = 0.f;
+    int rows = 1;
     const ImU32 border = IM_COL32(96, 186, 156, 190);
     for (int i = 0; i < p.protocol_count; ++i) {
       const auto& pr = p.protocols[i];
-      if (row_started && used_x + cell > wrap_w) {
-        ImGui::NewLine();
-        ImGui::SetCursorScreenPos(ImVec2(icons_x, ImGui::GetCursorScreenPos().y));
-        used_x = 0.f;
-        row_started = false;
+      if (x > 0.f && x + cell > wrap_w) {
+        x = 0.f;
+        y += cell + gap;
+        ++rows;
       }
-      if (row_started) ImGui::SameLine(0.f, gap);
-      ImGui::PushID(pr.key[0] ? pr.key : pr.name);
-      const ImVec2 p0 = ImGui::GetCursorScreenPos();
+      const ImVec2 p0(icons_x + x, row0.y + y);
       const ImVec2 chip1(p0.x + cell, p0.y + cell);
-      pdraw->AddRectFilled(p0, chip1, IM_COL32(14, 28, 24, 210), 4.f);
-      pdraw->AddRect(p0, chip1, border, 4.f, 0, 1.0f);
+      pdraw->AddRectFilled(p0, chip1, IM_COL32(14, 28, 24, 210), ui_px(4.f));
+      pdraw->AddRect(p0, chip1, border, ui_px(4.f), 0, 1.0f);
       const float inset = (cell - icon_sz) * 0.5f;
-      ImGui::SetCursorScreenPos(ImVec2(p0.x + inset, p0.y + inset));
       IDirect3DTexture9* tex = unit_icons::get(pr.key, pr.name, false);
-      const ImVec4 tint = p.defeated ? ImVec4(0.62f, 0.62f, 0.62f, 0.80f) : ImVec4(1, 1, 1, 1);
+      const ImU32 tint = p.defeated ? IM_COL32(158, 158, 158, 204) : IM_COL32(255, 255, 255, 255);
       if (tex) {
-        ImGui::ImageWithBg((ImTextureID)tex, ImVec2(icon_sz, icon_sz), ImVec2(0, 0), ImVec2(1, 1),
-                           ImVec4(0, 0, 0, 0), tint);
-      } else {
-        ImGui::Dummy(ImVec2(icon_sz, icon_sz));
+        pdraw->AddImage((ImTextureID)tex, ImVec2(p0.x + inset, p0.y + inset),
+                        ImVec2(p0.x + inset + icon_sz, p0.y + inset + icon_sz), ImVec2(0, 0),
+                        ImVec2(1, 1), tint);
       }
       if (ImGui::IsMouseHoveringRect(p0, chip1)) {
         ImGui::BeginTooltip();
@@ -1136,19 +1197,18 @@ void draw_compact_player(const game_api::PlayerEconomy& p, int index) {
         const float by1 = chip1.y - 1.f;
         const float bx0 = bx1 - cts.x - 5.f;
         const float by0 = by1 - cts.y - 1.f;
-        pdraw->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), IM_COL32(8, 10, 14, 230), 3.f);
+        pdraw->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), IM_COL32(8, 10, 14, 230),
+                             ui_px(3.f));
         pdraw->AddText(font, csz, ImVec2(bx0 + 2.5f, by0), IM_COL32(255, 214, 120, 255), clk);
       }
-      ImGui::SetCursorScreenPos(ImVec2(p0.x + cell, p0.y));
-      ImGui::Dummy(ImVec2(0.1f, cell));
-      ImGui::PopID();
-      used_x += cell + gap;
-      row_started = true;
+      x += cell + gap;
     }
-    ImGui::NewLine();
+    const float block_h = (float)rows * cell + (float)(rows - 1) * gap;
+    pdraw->AddText(ImVec2(row0.x, row0.y + (block_h - ts.y) * 0.5f), IM_COL32(150, 214, 186, 255),
+                   head);
+    ImGui::Dummy(ImVec2(avail_p, block_h + row_gap));
   }
 
-  ImGui::Dummy(ImVec2(0.f, 1.f));
   ImGui::EndGroup();
   const ImVec2 r0 = ImGui::GetItemRectMin();
   const ImVec2 r1 = ImGui::GetItemRectMax();
@@ -1172,11 +1232,39 @@ void draw_stats_compact(const game_api::MatchEconomy& st) {
 
 void draw_stats_panel() {
   static game_api::MatchEconomy st{};
-  static double last_poll = -1.0;
-  const double now = ImGui::GetTime();
-  if (last_poll < 0.0 || (now - last_poll) >= 0.20) {
+  // Wall-clock gate — ImGui::GetTime() advances by the hitch duration, so after a
+  // slow collect the next frame was immediately due again (death spiral ~1.5s/frame).
+  // On open: poll immediately once to enqueue the full player-list scan. While
+  // seeding, protocol rebuild is skipped (~40ms hitch gone); 1s refresh is enough
+  // to show counts as Present classifies. Steady state stays at 2s.
+  static DWORD last_poll_tick = 0;
+  static DWORD last_res_tick = 0;
+  static bool was_seeding = false;
+  const DWORD now_tick = GetTickCount();
+  const bool seeding = game_api::roster_seed_pending();
+  if (seeding && !was_seeding) last_poll_tick = 0;
+  was_seeding = seeding;
+  // Full collect (roster / protocols / seats): slow. Money / power: ~10Hz.
+  const int poll_ms = seeding ? 1000 : 2000;
+  if (last_poll_tick == 0 || (int32_t)(now_tick - last_poll_tick) >= poll_ms) {
+    LARGE_INTEGER freq{}, t0{};
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
     game_api::collect_match_economy(&st);
-    last_poll = now;
+    LARGE_INTEGER t1{};
+    QueryPerformanceCounter(&t1);
+    const double ms = (freq.QuadPart > 0)
+                          ? (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart
+                          : 0.0;
+    if (ms >= 20.0) {
+      game_api::log("perf: collect_match_economy=%.1fms players=%d seed=%d", ms, st.player_count,
+                    seeding ? 1 : 0);
+    }
+    last_poll_tick = now_tick;
+    last_res_tick = now_tick;
+  } else if (st.valid && (last_res_tick == 0 || (int32_t)(now_tick - last_res_tick) >= 100)) {
+    game_api::refresh_match_resources(&st);
+    last_res_tick = now_tick;
   }
   sample_trends(st);
 
@@ -1281,7 +1369,7 @@ bool init(IDirect3DDevice9* device, void* hwnd) {
   io.IniFilename = nullptr;
 
   ImFontConfig cfg;
-  cfg.OversampleH = 2;
+  cfg.OversampleH = 1;  // 2x oversample doubles atlas fill cost for CJK
   cfg.PixelSnapH = true;
   const char* font_candidates[] = {
       "C:\\Windows\\Fonts\\msyh.ttc",
@@ -1292,8 +1380,10 @@ bool init(IDirect3DDevice9* device, void* hwnd) {
   bool font_ok = false;
   for (const char* path : font_candidates) {
     if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) {
+      // ChineseFull builds a huge atlas and freezes the first open for seconds.
+      // Common glyphs cover the UI; missing rare chars fall back to '?'.
       io.Fonts->AddFontFromFileTTF(path, 18.0f, &cfg,
-                                   io.Fonts->GetGlyphRangesChineseFull());
+                                   io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
       font_ok = true;
       break;
     }
@@ -1336,6 +1426,7 @@ void shutdown() {
 
 void begin_frame() {
   if (!g_inited) return;
+  unit_icons::begin_frame();
   ImGui_ImplDX9_NewFrame();
   ImGui_ImplWin32_NewFrame();
   ImGui::NewFrame();
@@ -1872,7 +1963,7 @@ static void draw_money_cell(const game_api::FeatureInfo* f, int cols) {
 }
 
 static bool draw_mcv_choice(const char* id, const char* type_id, const char* tip, bool selected) {
-  const float s = 56.f;
+  const float s = ui_px(56.f);
   ImGui::PushID(id);
   const ImVec2 p0 = ImGui::GetCursorScreenPos();
   const bool pressed = ImGui::InvisibleButton("##mcv", ImVec2(s, s));
@@ -2028,26 +2119,50 @@ static void summon_add(const char* id) {
 
 static bool draw_summon_icon(const char* tip, const char* icon_id, const char* icon_name,
                              bool removable) {
-  constexpr float kIcon = 40.f;
+  const float kIcon = ui_px(40.f);
+  const float inset = ui_px(2.f);
   const ImVec2 p0 = ImGui::GetCursorScreenPos();
   ImGui::InvisibleButton("##ico", ImVec2(kIcon, kIcon));
   const bool hovered = ImGui::IsItemHovered();
   const bool clicked = ImGui::IsItemClicked();
   ImDrawList* draw = ImGui::GetWindowDrawList();
-  draw->AddRectFilled(p0, ImVec2(p0.x + kIcon, p0.y + kIcon), IM_COL32(16, 22, 32, 220), 4.f);
+  draw->AddRectFilled(p0, ImVec2(p0.x + kIcon, p0.y + kIcon), IM_COL32(16, 22, 32, 220), ui_px(4.f));
   draw->AddRect(p0, ImVec2(p0.x + kIcon, p0.y + kIcon),
-                hovered ? IM_COL32(255, 214, 120, 255) : IM_COL32(70, 96, 130, 255), 4.f, 0,
+                hovered ? IM_COL32(255, 214, 120, 255) : IM_COL32(70, 96, 130, 255), ui_px(4.f), 0,
                 hovered ? 2.f : 1.f);
-  if (icon_id && icon_id[0]) {
-    IDirect3DTexture9* tex = unit_icons::get(icon_id, icon_name, false);
-    if (tex) {
-      draw->AddImage((ImTextureID)tex, ImVec2(p0.x + 2.f, p0.y + 2.f),
-                     ImVec2(p0.x + kIcon - 2.f, p0.y + kIcon - 2.f));
+  IDirect3DTexture9* tex = nullptr;
+  if (icon_id && icon_id[0]) tex = unit_icons::get(icon_id, icon_name, false);
+  if (tex) {
+    draw->AddImage((ImTextureID)tex, ImVec2(p0.x + inset, p0.y + inset),
+                   ImVec2(p0.x + kIcon - inset, p0.y + kIcon - inset));
+  } else {
+    // 战役 / 特殊单位没有打包图标：用名字占位，否则只剩一个空方块认不出。
+    char label[24] = {};
+    const char* src = (tip && tip[0]) ? tip : (icon_id ? icon_id : "?");
+    size_t taken = 0;
+    if ((unsigned char)src[0] < 0x80) {
+      for (size_t i = 0; src[i] && i < 6; ++i) label[taken++] = src[i];  // 英文类型名
+    } else {
+      int glyphs = 0;
+      for (size_t i = 0; src[i] && glyphs < 3;) {                       // 中文名最多 3 个字
+        const unsigned char c = (unsigned char)src[i];
+        size_t step = (c >> 5) == 6 ? 2 : ((c >> 4) == 14 ? 3 : ((c >> 3) == 30 ? 4 : 1));
+        if (taken + step > sizeof(label) - 1) break;
+        std::memcpy(label + taken, src + i, step);
+        taken += step;
+        i += step;
+        ++glyphs;
+      }
     }
+    label[taken] = 0;
+    const ImVec2 ts = ImGui::CalcTextSize(label);
+    draw->AddText(ImVec2(p0.x + (kIcon - ts.x) * 0.5f, p0.y + (kIcon - ts.y) * 0.5f),
+                  hovered ? IM_COL32(255, 226, 160, 255) : IM_COL32(196, 210, 232, 255), label);
   }
   if (hovered && tip && tip[0]) {
     ImGui::BeginTooltip();
     ImGui::TextUnformatted(tip);
+    if (icon_id && icon_id[0] && tip != icon_id) ImGui::TextDisabled("%s", icon_id);
     if (removable) ImGui::TextDisabled(u8"点击拿掉");
     ImGui::EndTooltip();
   }
@@ -2063,11 +2178,24 @@ struct SummonExtra {
   const char* name;
 };
 
+// 「特殊单位」：建造面板里没有、但对象模板库里登记着的对象。
+// 引擎的 CreateUnit 对它们一样有效（Ra3-Copilot 就是靠模板库按哈希找出来召唤的），
+// 这里按类型名找模板（find_template_by_id 走的也是同一张表）。
 static const SummonExtra kSummonExtra[] = {
+    // 帝国战役 / 起义时刻
+    {"JapanMechaKing", u8"将军刽子手"},
+    {"JapanEmperorMecha", u8"天皇芳朗（红鬼王）"},
+    {"JapanEmperorMecha02", u8"天皇机甲·改"},
+    {"JapanSentinelVehicle", u8"钢铁浪人"},
+    {"JapanGigaFortress_Land", u8"超级要塞（陆）"},
+    {"JapanFortressShip", u8"超级要塞（海）"},
+    {"JapanCommandoTech1_Complete", u8"欧米茄百合子（完整）"},
+    {"JapanAntiVehicleVehicleTech3_Movie", u8"鬼王（过场）"},
+    {"JapanRadarShip", u8"帝国雷达舰"},
+    {"JapanBalloonBombBalloon", u8"气球炸弹"},
+    // 苏联 / 盟军的非建造对象
     {"SovietAntiVehicleVehicleTech2", u8"磁暴坦克"},
-};
-
-static bool summon_is_extra(const char* id) {
+};static bool summon_is_extra(const char* id) {
   if (!id) return false;
   for (const auto& e : kSummonExtra) {
     if (std::strcmp(id, e.id) == 0) return true;
@@ -2100,9 +2228,10 @@ static const game_api::BuildLockEntry* summon_lookup(const game_api::BuildLockEn
 }
 
 static void draw_summon_candidate_box(const game_api::BuildLockEntry* cat, int count) {
-  constexpr float kIcon = 40.f;
-  constexpr float kGap = 4.f;
-  constexpr float kPad = 8.f;
+  // 尺寸跟着界面缩放走，否则缩放调大后图标会比这里算的宽度还宽，右边被裁掉。
+  const float kIcon = ui_px(40.f);
+  const float kGap = ui_px(4.f);
+  const float kPad = ui_px(8.f);
 
   ImGui::TextDisabled(u8"候选 %d", (int)g_summon_sel.size());
   ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -2117,12 +2246,15 @@ static void draw_summon_candidate_box(const game_api::BuildLockEntry* cat, int c
   if (g_summon_sel.empty()) {
     ImGui::TextDisabled(u8"点击下方部队加入，再点这里的图标可拿掉");
   } else {
-    const float avail = ImGui::GetContentRegionAvail().x - kPad;
+    const float avail = ImGui::GetContentRegionAvail().x - kPad - ImGui::GetStyle().ScrollbarSize;
     float used = 0.f;
     bool started = false;
     for (size_t n = 0; n < g_summon_sel.size(); ++n) {
       const auto* e = summon_lookup(cat, count, g_summon_sel[n]);
-      const char* tip = e && e->name[0] ? e->name : g_summon_sel[n].c_str();
+      const char* zh = e == nullptr ? game_api::type_display_name(g_summon_sel[n].c_str())
+                                    : nullptr;
+      const char* tip = (e && e->name[0]) ? e->name
+                                         : ((zh && zh[0]) ? zh : g_summon_sel[n].c_str());
       const char* icon_id = e ? (e->icon_id[0] ? e->icon_id : e->type_id) : "";
       const char* icon_name = e ? (e->icon_name[0] ? e->icon_name : e->name) : "";
       if (started && used + kIcon + kGap > avail) {
@@ -2153,65 +2285,228 @@ static void draw_summon_candidate_box(const game_api::BuildLockEntry* cat, int c
   ImGui::Spacing();
 }
 
+// 某阵营 + 单位/建筑 这一组里有没有可点的图标。
+static bool summon_row_has(const game_api::BuildLockEntry* cat, int count, int fac,
+                           bool buildings) {
+  for (int i = 0; i < count; ++i) {
+    const auto& e = cat[i];
+    if (e.building != buildings) continue;
+    if (summon_is_extra(e.type_id)) continue;
+    if (build_faction_rank_ui(e.type_id) != fac) continue;
+    if (!is_visible_rep(cat, count, i)) continue;
+    return true;
+  }
+  return false;
+}
+
+// 召唤图标一行：按阵营 + 单位/建筑筛出条目，按可用宽度换行。
+// 尺寸统一走 ui_px：以前这里写死 40/4，界面缩放调大后最右边那列会被面板裁掉。
+static void draw_summon_icon_row(const game_api::BuildLockEntry* cat, int count, int fac,
+                                 bool buildings, int id_base) {
+  const float kIcon = ui_px(40.f);
+  const float kGap = ui_px(4.f);
+  // 预留右侧滚动条 + 一点余量：内容一多面板就会出现竖向滚动条，可绘制宽度
+  // 随之变窄，不预留的话最右边那列会被面板边缘裁掉。
+  const float avail =
+      ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ScrollbarSize - kGap;
+  float used = 0.f;
+  bool started = false;
+  for (int i = 0; i < count; ++i) {
+    const auto& e = cat[i];
+    if (e.building != buildings) continue;
+    if (summon_is_extra(e.type_id)) continue;
+    if (build_faction_rank_ui(e.type_id) != fac) continue;
+    if (!is_visible_rep(cat, count, i)) continue;
+    if (started && used + kIcon + kGap > avail) {
+      used = 0.f;
+      started = false;
+    }
+    if (started) ImGui::SameLine(0.f, kGap);
+    const char* icon_id = e.icon_id[0] ? e.icon_id : e.type_id;
+    const char* icon_name = e.icon_name[0] ? e.icon_name : e.name;
+    ImGui::PushID(i + id_base);
+    if (draw_summon_icon(e.name[0] ? e.name : e.type_id, icon_id, icon_name, false)) {
+      summon_add(e.type_id);
+    }
+    ImGui::PopID();
+    used += kIcon + kGap;
+    started = true;
+  }
+}
+
+// 子串匹配（忽略 ASCII 大小写）：搜索对象类型名用。
+static bool summon_substr_ci(const char* s, const char* q) {
+  if (!q || !q[0]) return true;
+  if (!s) return false;
+  for (const char* p = s; *p; ++p) {
+    const char* a = p;
+    const char* b = q;
+    while (*a && *b) {
+      char ca = *a, cb = *b;
+      if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+      if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+      if (ca != cb) break;
+      ++a;
+      ++b;
+    }
+    if (!*b) return true;
+  }
+  return false;
+}
+
+// 「按名字搜索」：直接列对象模板库里的类型名（含战役 / 特殊 / Mod 单位）。
+// 找到后点一下就能加进候选框，和上面点图标是同一条召唤路径。
+static void draw_summon_search() {
+  static char s_query[64] = {};
+  ImGui::SeparatorText(u8"搜索全部对象（战役 / 特殊 / Mod）");
+  const std::vector<std::string>& all = game_api::object_type_names();
+  if (all.empty()) {
+    ImGui::TextDisabled(u8"还没读到对象模板库（进对局后再试）。");
+    ImGui::SameLine();
+    if (ImGui::SmallButton(u8"重新扫描")) game_api::refresh_object_type_names();
+    return;
+  }
+  char head[96];
+  std::snprintf(head, sizeof(head), u8"模板库共 %d 个对象类型", (int)all.size());
+  ImGui::TextDisabled("%s", head);
+  ImGui::SameLine();
+  if (ImGui::SmallButton(u8"重新扫描##summon_rescan")) game_api::refresh_object_type_names();
+  ImGui::SetNextItemWidth(-1.f);
+  ImGui::InputTextWithHint("##summon_search",
+                           u8"类型名或中文名片段，例如 Mecha / Oni / 将军 / 鬼王", s_query,
+                           sizeof(s_query));
+  if (strlen(s_query) < 2) {
+    ImGui::TextDisabled(u8"输入 2 个字符以上开始筛选（模板库里包含建造面板之外的对象）。");
+    return;
+  }
+  int shown = 0;
+  for (const std::string& id : all) {
+    const char* zh = game_api::type_display_name(id.c_str());
+    if (!summon_substr_ci(id.c_str(), s_query) &&
+        !(zh && zh[0] && summon_substr_ci(zh, s_query))) {
+      continue;
+    }
+    char label[192];
+    if (zh && zh[0]) {
+      std::snprintf(label, sizeof(label), "%s  ·  %s##summon_hit", zh, id.c_str());
+    } else {
+      std::snprintf(label, sizeof(label), "%s##summon_hit", id.c_str());
+    }
+    if (ImGui::Selectable(label)) summon_add(id.c_str());
+    ImGui::SetItemTooltip(u8"点击加入上方候选框");
+    if (++shown >= 24) {
+      ImGui::TextDisabled(u8"只列了前 %d 条，输入得更具体一些能缩小范围。", shown);
+      break;
+    }
+  }
+  if (shown == 0) ImGui::TextDisabled(u8"模板库里没有匹配的名字。");
+}
+
 static void draw_summon_unit_icons() {
   int count = 0;
   const game_api::BuildLockEntry* cat = game_api::build_lock_catalog(&count);
   draw_summon_candidate_box(cat, count);
-  constexpr float kIcon = 40.f;
-  constexpr float kGap = 4.f;
   if (count <= 0 || !cat) {
-    ImGui::TextWrapped(u8"还没读到部队。进入对局后再打开这一页。");
+    ImGui::TextDisabled(u8"还没从建造面板读到部队；下面的特殊 / 战役单位和搜索仍然可用。");
   }
-  for (int fac = 0; fac < 3 && count > 0 && cat; ++fac) {
-    ImGui::TextDisabled("%s", build_faction_label(fac));
-    const float avail = ImGui::GetContentRegionAvail().x;
-    float used = 0.f;
-    bool started = false;
-    bool any = false;
-    for (int i = 0; i < count; ++i) {
-      const auto& e = cat[i];
-      if (e.building) continue;
-      if (summon_is_extra(e.type_id)) continue;
-      if (build_faction_rank_ui(e.type_id) != fac) continue;
-      if (!is_visible_rep(cat, count, i)) continue;
-      if (started && used + kIcon + kGap > avail) {
-        used = 0.f;
-        started = false;
-      }
-      if (started) ImGui::SameLine(0.f, kGap);
-      const char* icon_id = e.icon_id[0] ? e.icon_id : e.type_id;
-      const char* icon_name = e.icon_name[0] ? e.icon_name : e.name;
-      ImGui::PushID(i + 30000);
-      if (draw_summon_icon(e.name[0] ? e.name : e.type_id, icon_id, icon_name, false)) {
-        summon_add(e.type_id);
-      }
-      ImGui::PopID();
-      used += kIcon + kGap;
-      started = true;
-      any = true;
+  bool any_building = false;
+  for (int i = 0; i < count && cat; ++i) {
+    if (cat[i].building) {
+      any_building = true;
+      break;
     }
-    if (!any) ImGui::TextDisabled(u8"—");
-    ImGui::Spacing();
   }
-  ImGui::TextDisabled(u8"特殊单位");
+  if (count > 0 && cat) {
+    ImGui::SeparatorText(u8"单位");
+    for (int fac = 0; fac < 4; ++fac) {
+      if (!summon_row_has(cat, count, fac, false)) continue;
+      ImGui::TextDisabled("%s", build_faction_label(fac));
+      draw_summon_icon_row(cat, count, fac, false, 30000);
+      ImGui::Spacing();
+    }
+    if (any_building) {
+      ImGui::SeparatorText(u8"建筑");
+      for (int fac = 0; fac < 4; ++fac) {
+        if (!summon_row_has(cat, count, fac, true)) continue;
+        ImGui::TextDisabled("%s", build_faction_label(fac));
+        draw_summon_icon_row(cat, count, fac, true, 60000);
+        ImGui::Spacing();
+      }
+    }
+  }
+  ImGui::SeparatorText(u8"特殊单位");
   {
-    const float avail = ImGui::GetContentRegionAvail().x;
+    const float kIcon = ui_px(40.f);
+    const float kGap = ui_px(4.f);
+    const float avail =
+        ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ScrollbarSize - kGap;
+    const bool list_ready = game_api::object_type_list_ready();
     float used = 0.f;
     bool started = false;
+    int absent = 0;
     for (int i = 0; i < (int)(sizeof(kSummonExtra) / sizeof(kSummonExtra[0])); ++i) {
       const auto& extra = kSummonExtra[i];
+      const bool has = !list_ready || game_api::object_type_exists(extra.id);
       if (started && used + kIcon + kGap > avail) {
         used = 0.f;
         started = false;
       }
       if (started) ImGui::SameLine(0.f, kGap);
       ImGui::PushID(i + 50000);
-      if (draw_summon_icon(extra.name, extra.id, extra.name, false)) summon_add(extra.id);
+      if (has) {
+        if (draw_summon_icon(extra.name, extra.id, extra.name, false)) summon_add(extra.id);
+      } else {
+        ++absent;
+        // 本版本模板库里没有这个对象：画成暗块，点不动，只留提示。
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton("##ico_missing", ImVec2(kIcon, kIcon));
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        draw->AddRectFilled(p0, ImVec2(p0.x + kIcon, p0.y + kIcon),
+                            IM_COL32(16, 22, 32, 140), ui_px(4.f));
+        draw->AddRect(p0, ImVec2(p0.x + kIcon, p0.y + kIcon), IM_COL32(60, 66, 78, 200),
+                      ui_px(4.f));
+        char label[24] = {};
+        size_t taken = 0;
+        for (size_t k = 0; extra.name[k] && taken < sizeof(label) - 1;) {
+          const unsigned char c = (unsigned char)extra.name[k];
+          const size_t step =
+              (c >> 5) == 6 ? 2 : ((c >> 4) == 14 ? 3 : ((c >> 3) == 30 ? 4 : 1));
+          if (taken + step > sizeof(label) - 1) break;
+          std::memcpy(label + taken, extra.name + k, step);
+          taken += step;
+          k += step;
+        }
+        label[taken] = 0;
+        const ImVec2 ts = ImGui::CalcTextSize(label);
+        draw->AddText(ImVec2(p0.x + (kIcon - ts.x) * 0.5f, p0.y + (kIcon - ts.y) * 0.5f),
+                      IM_COL32(110, 118, 132, 255), label);
+        if (ImGui::IsItemHovered()) {
+          ImGui::BeginTooltip();
+          ImGui::TextUnformatted(extra.name);
+          ImGui::TextDisabled("%s", extra.id);
+          ImGui::TextDisabled(u8"本版本的对象模板库里没有这个对象");
+          ImGui::EndTooltip();
+        }
+      }
       ImGui::PopID();
       used += kIcon + kGap;
       started = true;
     }
+    if (absent > 0) {
+      ImGui::TextDisabled(u8"其中 %d 个在本版本不存在（暗格）。用下面的搜索可以查当前版本实际有的对象。",
+                          absent);
+    }
+    if (ImGui::SmallButton(u8"把可用性写进日志##summon_diag")) {
+      game_api::log("special units: factory list = %d names",
+                    (int)game_api::object_type_names().size());
+      for (const auto& extra : kSummonExtra) {
+        game_api::log("special %-32s %s", extra.id,
+                      game_api::object_type_exists(extra.id) ? "PRESENT" : "absent");
+      }
+    }
+    ImGui::SetItemTooltip(u8"写进 ra3_overlay.log，出问题时可据此判断是版本没有还是引擎不造");
   }
+  draw_summon_search();
   ImGui::Spacing();
 }
 
@@ -2523,7 +2818,7 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
     ImGui::TextUnformatted(f->label);
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
     ImGui::TextWrapped(
-        u8"点下方部队放进候选框，再点候选里的图标可拿掉。数量是每种各召唤几个。出现在鼠标处，归所选玩家。快捷键按当前这些设置召唤。");
+        u8"点下方单位 / 建筑放进候选框，再点候选里的图标可拿掉。数量是每种各召唤几个。出现在鼠标处，归所选玩家。快捷键按当前这些设置召唤。");
     ImGui::PopStyleColor();
     const uint32_t who = draw_player_picker("summon", &g_summon_player_ui);
     int count = g_summon_count;
@@ -2532,6 +2827,39 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
       if (count < 1) count = 1;
       if (count > 20) count = 20;
       g_summon_count = count;
+    }
+    ImGui::SameLine();
+    float lift = game_api::summon_extra_lift();
+    ImGui::SetNextItemWidth(140.f);
+    if (ImGui::InputFloat(u8"高度##summon_lift", &lift, 100.f, 500.f, "%.0f")) {
+      game_api::set_summon_extra_lift(lift);
+    }
+    ImGui::SetItemTooltip(
+        u8"生成点在鼠标落点基础上再抬高多少（0 = 贴地）。\n"
+        u8"气球炸弹这类会自己再抬 2000，否则一落地就炸。");
+    bool visible_fix = game_api::summon_visible_fix();
+    if (ImGui::Checkbox(u8"召唤后立刻可见##summon_visible", &visible_fix)) {
+      game_api::set_summon_visible_fix(visible_fix);
+    }
+    ImGui::SetItemTooltip(
+        u8"引擎新建的对象带「隐形 / 未入世」标志，小地图透明、看起来像没召唤出来。\n"
+        u8"勾着就清掉这几位（默认，推荐）。");
+    bool hold = game_api::air_hold_enabled();
+    if (ImGui::Checkbox(u8"抬高后停在空中##summon_hold", &hold)) {
+      game_api::set_air_hold_enabled(hold);
+    }
+    ImGui::SetItemTooltip(
+        u8"气球炸弹这类「落地即爆」的对象，光抬高只会变成从高处掉下来炸。\n"
+        u8"勾着就每帧把它们按回召唤高度，真的停在空中。");
+    if (hold && game_api::air_hold_count() > 0) {
+      ImGui::SameLine();
+      ImGui::TextDisabled(u8"托着 %d 个", game_api::air_hold_count());
+      ImGui::SameLine();
+      if (ImGui::SmallButton(u8"放手##summon_release")) {
+        game_api::air_hold_release_all();
+        g_last_msg = u8"已放手，空中单位开始下落";
+      }
+      ImGui::SetItemTooltip(u8"清掉托举，让它们按自己的逻辑下落 / 引爆");
     }
     ImGui::SameLine();
     if (!action_ok) ImGui::BeginDisabled();
@@ -2559,7 +2887,98 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
       for (const auto& s : g_summon_sel) live.push_back(s.c_str());
       game_api::summon_prepare(who, g_summon_count, live.data(), (int)live.size(), nullptr);
     }
-    draw_summon_unit_icons();
+    // 默认展开：图标纹理按每帧 3 张的预算解码，展开不会卡住游戏
+    // （以前写死折叠是怕一帧解几百张图）。用户手动折叠后保持折叠。
+    ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+    if (ImGui::CollapsingHeader(u8"选择召唤单位 / 建筑##summon_pick")) {
+      draw_summon_unit_icons();
+    }
+    ImGui::PopID();
+    return;
+  }
+
+  if (std::strcmp(f->key, "invincible") == 0) {
+    end_chip_flow();
+    const bool busy = InterlockedCompareExchange(&g_engine_busy, 0, 0) != 0;
+    const bool action_ok = (!(feature_needs_hooks(f->key) && !armed)) && !busy;
+    ImGui::PushID(f->key);
+    if (!action_ok) ImGui::BeginDisabled();
+    if (ImGui::Button(u8"无敌", ImVec2(110.f, 0))) {
+      std::string msg;
+      const bool ok = game_api::invincible_apply(true, 0.f, 0, &msg);
+      if (!msg.empty()) g_last_msg = msg;
+      game_api::beep(ok ? "on" : "error");
+    }
+    ImGui::SameLine(0.f, 10.f);
+    if (ImGui::Button(u8"解除无敌", ImVec2(110.f, 0))) {
+      std::string msg;
+      game_api::invincible_apply(false, 0.f, 0, &msg);
+      if (!msg.empty()) g_last_msg = msg;
+      game_api::beep("off");
+    }
+    if (!action_ok) ImGui::EndDisabled();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextUnformatted(game_api::invincible_status());
+    ImGui::PopStyleColor();
+    ImGui::PopID();
+    return;
+  }
+
+  if (std::strcmp(f->key, "airdrop") == 0) {
+    end_chip_flow();
+    const bool busy = InterlockedCompareExchange(&g_engine_busy, 0, 0) != 0;
+    const bool action_ok = (!(feature_needs_hooks(f->key) && !armed)) && !busy;
+    ImGui::PushID(f->key);
+    ImGui::TextUnformatted(f->label);
+
+    const int kinds = game_api::crate_kind_count();
+    int sel = game_api::crate_kind_sel();
+    if (sel < 0 || sel >= kinds) sel = 0;
+    int count = game_api::crate_sel_count();
+    if (count < 1) count = 1;
+    if (count > 20) count = 20;
+
+    // 紧凑布局：一行放完「种类 / 数量 / 空投」。
+    // 面板太窄时（< 300px）自动拆成两行，避免控件被挤出面板外看不见。
+    const float avail = std::max(140.f, ImGui::GetContentRegionAvail().x);
+    const float drop_w = 62.f;
+    const float cnt_w = 96.f;
+    const float gap = 8.f;
+    const bool one_row = avail >= 300.f;
+    const float kind_w = one_row ? std::max(90.f, avail - drop_w - cnt_w - gap * 2.f) : avail;
+
+    ImGui::SetNextItemWidth(kind_w);
+    if (ImGui::BeginCombo(u8"##crate_kind",
+                          kinds > 0 ? game_api::crate_kind_label(sel) : u8"（未就绪）")) {
+      for (int i = 0; i < kinds; ++i) {
+        char label[160];
+        std::snprintf(label, sizeof(label), "%s##crate%d", game_api::crate_kind_label(i), i);
+        if (ImGui::Selectable(label, i == sel)) {
+          sel = i;
+          g_crate_kind_persist = i;
+          mark_settings_dirty();
+          game_api::crate_select(sel, count);
+          game_api::beep("click");
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", game_api::crate_kind_name(i));
+      }
+      ImGui::EndCombo();
+    }
+    if (one_row) ImGui::SameLine(0.f, gap);   // 窄面板时不并排，自动换行
+
+    ImGui::SetNextItemWidth(one_row ? cnt_w : std::max(80.f, avail - drop_w - gap));
+    if (ImGui::SliderInt(u8"##crate_count", &count, 1, 20, "%d")) {
+      g_crate_count_persist = count;
+      mark_settings_dirty();
+      game_api::crate_select(sel, count);
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(u8"空投个数（1~20）");
+    ImGui::SameLine(0.f, gap);
+    if (!action_ok) ImGui::BeginDisabled();
+    if (ImGui::Button(u8"空投", ImVec2(drop_w, 0))) run_feature_action(f);
+    if (!action_ok) ImGui::EndDisabled();
+    ImGui::SetItemTooltip(u8"鼠标先指到战场地形上再点");
+
     ImGui::PopID();
     return;
   }
@@ -2626,8 +3045,9 @@ static bool shown_banned(const game_api::BuildLockEntry* cat, int count, int ind
 
 static void draw_lock_faction_icons(const game_api::BuildLockEntry* cat, int count,
                                     bool want_banned) {
-  constexpr float kIcon = 40.f;
-  constexpr float kGap = 4.f;
+  const float kIcon = ui_px(40.f);
+  const float kGap = ui_px(4.f);
+  const float inset = ui_px(2.f);
   ImDrawList* draw = ImGui::GetWindowDrawList();
 
   for (int fac = 0; fac < 3; ++fac) {
@@ -2658,14 +3078,15 @@ static void draw_lock_faction_icons(const game_api::BuildLockEntry* cat, int cou
       const ImU32 edge = hovered ? IM_COL32(255, 214, 120, 255)
                                  : (want_banned ? IM_COL32(180, 90, 80, 255)
                                                 : IM_COL32(70, 96, 130, 255));
-      draw->AddRectFilled(p0, ImVec2(p0.x + kIcon, p0.y + kIcon), bg, 4.f);
-      draw->AddRect(p0, ImVec2(p0.x + kIcon, p0.y + kIcon), edge, 4.f, 0, hovered ? 2.f : 1.f);
+      draw->AddRectFilled(p0, ImVec2(p0.x + kIcon, p0.y + kIcon), bg, ui_px(4.f));
+      draw->AddRect(p0, ImVec2(p0.x + kIcon, p0.y + kIcon), edge, ui_px(4.f), 0,
+                    hovered ? 2.f : 1.f);
       const char* icon_id = e.icon_id[0] ? e.icon_id : e.type_id;
       const char* icon_name = e.icon_name[0] ? e.icon_name : e.name;
       IDirect3DTexture9* tex = unit_icons::get(icon_id, icon_name, e.building);
       if (tex) {
-        draw->AddImage((ImTextureID)tex, ImVec2(p0.x + 2.f, p0.y + 2.f),
-                       ImVec2(p0.x + kIcon - 2.f, p0.y + kIcon - 2.f));
+        draw->AddImage((ImTextureID)tex, ImVec2(p0.x + inset, p0.y + inset),
+                       ImVec2(p0.x + kIcon - inset, p0.y + kIcon - inset));
       } else {
         const char* mark = e.building ? u8"建" : u8"兵";
         const ImVec2 ts = ImGui::CalcTextSize(mark);
@@ -2797,6 +3218,7 @@ void draw_camera_panel() {
   if (ImGui::BeginTabBar("##cam_tabs", ImGuiTabBarFlags_None)) {
     // ------------------------------- 当前坐标 -------------------------------
     if (ImGui::BeginTabItem(u8"当前坐标")) {
+      ImGui::TextDisabled(u8"这里改的是镜头位置，不是单位位置。复制/移动单位请用「单位操作」。");
       if (!have_live && hook_state == 1) {
         ImGui::TextWrapped(u8"还没有读到相机。先进入对局并移动一下视角（或者等一帧），再回到这里。");
       }
@@ -2813,7 +3235,8 @@ void draw_camera_panel() {
         game_api::beep(tk ? "on" : "off");
       }
       if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip(u8"打开后引擎每次设置相机都会被改成这里的目标值；关掉恢复游戏自己控制。");
+        ImGui::SetTooltip(u8"打开后引擎每次设置相机都会被改成这里的目标值；关掉恢复游戏自己控制。"
+                          u8"退出遭遇战时会自动关闭，避免卡死。");
       }
       ImGui::SameLine();
       ImGui::Checkbox(u8"跟随当前", &s_follow);
@@ -3355,96 +3778,187 @@ static std::string fmt_clock(float seconds) {
 
 void draw_time_panel() {
   static float s_scale = 1.0f;
+  static bool s_enabled = false;
   static bool s_inited = false;
 
-  float seen_scale = 0.f, seen_factor = 0.f;
-  bool valid = false;
-  game_api::time_control_read(&seen_scale, &seen_factor, &valid);
-  bool enabled = game_api::time_control_enabled();
+  game_api::TimeProbe probe;
+  game_api::time_control_probe_snapshot(&probe);
   if (!s_inited) {
     s_scale = game_api::time_control_scale();
+    s_enabled = game_api::time_control_enabled();
     s_inited = true;
   }
 
-  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"时间控制");
+  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"时间控制（加速·实验）");
   ImGui::SameLine();
-  if (valid) {
-    ImGui::TextDisabled(u8"游戏时间倍率 %.3fx（GameSpeedFactor %.3f）", seen_scale, seen_factor);
+  ImGui::TextDisabled(u8"候选旋钮 [0xCB4098] logicFPS / [0xCB409C] updateFPS");
+
+  ImGui::Spacing();
+  ImGui::TextWrapped(u8"引擎 0x00655166 的帧循环：edi = updateFPS ÷ logicFPS，然后跑大约 6/edi 次"
+                     u8"逻辑更新。实测只把 updateFPS 调大，只会改变帧率、单位并不会变快（甚至略慢），"
+                     u8"所以下面把写入目标做成可切换项，请逐个试出真正管用的那个。");
+
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+
+  // ---- 实时状态 ----
+  const int logic_fps = probe.logic_fps > 0 ? probe.logic_fps : 15;
+  const int update_fps = probe.update_fps > 0 ? probe.update_fps : 30;
+  ImGui::Text(u8"logicFPS = %d", logic_fps);
+  ImGui::SameLine();
+  ImGui::TextColored(ImVec4(0.75f, 0.9f, 0.75f, 1.f), u8"| updateFPS = %d", update_fps);
+  ImGui::SameLine();
+  ImGui::TextDisabled(u8"| edi = %d", update_fps / (logic_fps > 0 ? logic_fps : 1));
+  if (probe.original_logic_fps > 0) {
+    ImGui::Text(u8"进局原值 logicFPS = %d  updateFPS = %d", probe.original_logic_fps,
+                probe.original_update_fps);
   } else {
-    ImGui::TextDisabled(u8"未读到（仅零售版 1.12、且进入对局后可用）");
+    ImGui::TextDisabled(u8"还没写过（原值将在第一次写入时记录）");
+  }
+  if (!game_api::battle_clock(nullptr)) {
+    ImGui::TextDisabled(u8"当前不在对局中：加速只在遭遇战/战役里生效。");
   }
 
   ImGui::Spacing();
-  if (!valid) {
-    ImGui::TextWrapped(u8"还没读到游戏时间倍率。请进入遭遇战对局后再回来；若仍读不到，"
-                       u8"请把 ra3_overlay.log 里以 time: 开头的行发给我。");
-    return;
-  }
-
-  ImGui::Checkbox(u8"启用时间控制（关闭后游戏恢复原速）", &enabled);
-  if (enabled != game_api::time_control_enabled()) {
-    game_api::time_control_set_enabled(enabled);
-  }
-  ImGui::SameLine();
-  ImGui::TextDisabled(u8"?");
+  ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.f),
+                     u8"硬性不变式：logicFPS >= 1 且 updateFPS >= logicFPS。"
+                     u8"破坏后者会让 0x0065516D 的整除得 0，再在 0x0065519A 处除零崩溃");
+  ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.f),
+                     u8"（上一版就是这么崩的）。所以减速/暂停做不了，只能加速。"
+                     u8"旧实现写的 [[0xCE8138]+0x54] 其实是亮度，早已停止写入。");
 
   ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+
+  // ---- 写入目标 ----
+  static int s_target = -1;
+  if (s_target < 0) s_target = game_api::time_control_speed_target();
+  ImGui::TextDisabled(u8"写入目标（默认「不改内存」，选错也不会崩，随时可切回）");
+  const char* kTargets[] = {u8"不改内存（只读）", u8"只改 logicFPS [0xCB4098]",
+                            u8"只改 updateFPS [0xCB409C]", u8"两者同步（保持 edi 不变）"};
+  game_api::TimeProbe p2;
   ImGui::SetNextItemWidth(320.f);
-  if (ImGui::SliderFloat(u8"##time_scale", &s_scale, 0.0f, 4.0f, u8"%.3fx")) {
-    game_api::time_control_set_scale(s_scale);
+  if (ImGui::Combo(u8"##time_target", &s_target, kTargets, 4)) {
+    game_api::time_control_set_speed_target(s_target);
+    game_api::time_control_set_scale(s_scale);  // 立刻按当前倍率应用
+    g_last_msg = s_target == 0 ? u8"时间控制：已停止写内存并还原"
+                               : u8"已切换写入目标，请对比单位速度是否变化";
   }
-  ImGui::SameLine();
-  ImGui::TextDisabled(u8"目标倍率 %.3fx（0 = 暂停游戏逻辑）", s_scale);
 
   ImGui::Spacing();
-  ImGui::TextDisabled(u8"快捷档位");
-  if (ImGui::Button(u8"暂停 (0x)")) {
-    s_scale = 0.0f;
-    game_api::time_control_set_scale(0.0f);
+  ImGui::Separator();
+  ImGui::Spacing();
+
+  // ---- 倍率 ----
+  s_enabled = game_api::time_control_enabled();  // 以模块内状态为准
+  ImGui::SetNextItemWidth(220.f);
+  if (ImGui::SliderFloat(u8"倍率##time_scale", &s_scale, 1.0f, 8.0f, u8"%.2fx")) {
+    if (s_target != 0) {
+      game_api::time_control_set_scale(s_scale);
+      s_enabled = true;
+    }
+    g_last_msg = u8"已设置加速倍率";
   }
   ImGui::SameLine();
-  if (ImGui::Button(u8"1/4 速")) {
-    s_scale = 0.25f;
-    game_api::time_control_set_scale(0.25f);
-  }
-  ImGui::SameLine();
-  if (ImGui::Button(u8"半速")) {
-    s_scale = 0.5f;
-    game_api::time_control_set_scale(0.5f);
-  }
-  ImGui::SameLine();
-  if (ImGui::Button(u8"常速")) {
+  ImGui::TextDisabled(u8"1x = 进局原速，8x = 上限；低于 1x 会被抬到 1x");
+
+  ImGui::BeginDisabled(s_target == 0);
+  if (ImGui::Button(u8"1x##time_1x")) {
     s_scale = 1.0f;
     game_api::time_control_set_scale(1.0f);
   }
   ImGui::SameLine();
-  if (ImGui::Button(u8"2x")) {
+  if (ImGui::Button(u8"1.5x##time_1_5x")) {
+    s_scale = 1.5f;
+    game_api::time_control_set_scale(1.5f);
+  }
+  ImGui::SameLine();
+  if (ImGui::Button(u8"2x##time_2x")) {
     s_scale = 2.0f;
     game_api::time_control_set_scale(2.0f);
   }
   ImGui::SameLine();
-  if (ImGui::Button(u8"4x")) {
+  if (ImGui::Button(u8"3x##time_3x")) {
+    s_scale = 3.0f;
+    game_api::time_control_set_scale(3.0f);
+  }
+  ImGui::SameLine();
+  if (ImGui::Button(u8"4x##time_4x")) {
     s_scale = 4.0f;
     game_api::time_control_set_scale(4.0f);
   }
-
-  ImGui::Spacing();
-  ImGui::Separator();
-  ImGui::Spacing();
-  if (ImGui::Button(u8"恢复原始速度")) {
-    game_api::time_control_restore();
-    s_scale = game_api::time_control_scale();
+  ImGui::SameLine();
+  if (ImGui::Button(u8"6x##time_6x")) {
+    s_scale = 6.0f;
+    game_api::time_control_set_scale(6.0f);
   }
   ImGui::SameLine();
-  ImGui::TextDisabled(u8"关闭持续覆盖并写回进入对局时的原始倍率。");
+  if (ImGui::Button(u8"8x##time_8x")) {
+    s_scale = 8.0f;
+    game_api::time_control_set_scale(8.0f);
+  }
+  ImGui::EndDisabled();
+  ImGui::SameLine();
+  if (ImGui::Button(u8"恢复原始速度##time_restore")) {
+    game_api::time_control_restore();
+    s_scale = 1.0f;
+    s_enabled = false;
+    g_last_msg = u8"已恢复原始游戏速度";
+  }
 
+  ImGui::Spacing();
+  ImGui::TextDisabled(u8"退出对局时会自动写回原值；写入次数 %d。", probe.writes);
+
+  // ---- 只读诊断：给将来找减速/暂停挂载点用 ----
   ImGui::Spacing();
   ImGui::Separator();
   ImGui::Spacing();
-  ImGui::TextDisabled(u8"说明：时间倍率直接写游戏全局数据（[[0xCE8138]+0x54]），"
-                      u8"每帧覆盖以保持生效。暂停时单位与弹道都会静止，镜头仍可自由操作，"
-                      u8"适合做相机运镜。");
+  if (ImGui::CollapsingHeader(u8"只读诊断（不会改动游戏）##time_diag")) {
+    if (probe.have_obj) {
+      ImGui::Text(u8"GameSpeedFactor [[0xCE8138]+0x30] = %.4f", probe.game_speed_factor);
+      ImGui::SameLine();
+      ImGui::TextDisabled(u8"（+0x54 = %.4f 是亮度，不写）", probe.brightness);
+    } else {
+      ImGui::TextDisabled(u8"[[0xCE8138]+0x30/+0x54] 未读到");
+    }
+    if (probe.session) {
+      ImGui::Text(u8"会话对象 [0xCE811C] = 0x%X", probe.session);
+      if (probe.have_session_fps) {
+        ImGui::SameLine();
+        ImGui::Text(u8"| vtbl+0x40（max update FPS） = %d", probe.session_fps);
+      } else {
+        ImGui::SameLine();
+        ImGui::TextDisabled(u8"| vtbl+0x40 未取到");
+      }
+    } else {
+      ImGui::TextDisabled(u8"会话对象 [0xCE811C] 为空（不在对局中）");
+    }
+    if (ImGui::Button(u8"扫描会话对象字段##time_dump")) {
+      game_api::time_control_probe_dump_session();
+      g_last_msg = u8"已把会话对象字段扫描写入日志";
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled(u8"用于以后寻找「真正的减速/暂停」入口");
+  }
 
+  // ---- 快捷键（原「时间控制（快捷键）」分组并入此处）----
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+  if (ImGui::CollapsingHeader(u8"快捷键##time_hotkeys")) {
+    ImGui::TextDisabled(u8"点右侧齿轮可改键；这些键只负责设倍率/恢复，仍受上面的「写入目标」约束。");
+    end_chip_flow();
+    end_pair_flow();
+    int tk_count = 0;
+    const char* const* tk = game_api::time_feature_keys(&tk_count);
+    for (int i = 0; i < tk_count; ++i) {
+      draw_feature_row(game_api::find_feature(tk[i]));
+    }
+  }
+
+  // ---- 快进 ----
   ImGui::Spacing();
   ImGui::Separator();
   ImGui::Spacing();
@@ -3461,7 +3975,7 @@ void draw_time_panel() {
   }
 
   static float s_ff_target = 60.f;
-  static float s_ff_speed = 8.f;
+  static float s_ff_speed = 4.f;
   static bool  s_ff_auto = false;
   static bool  s_ff_inited = false;
   if (!s_ff_inited) {
@@ -3477,7 +3991,7 @@ void draw_time_panel() {
   if (have_clock && ImGui::SmallButton(u8"+2 分##ff_add120")) s_ff_target = now_s + 120.f;
 
   ImGui::SetNextItemWidth(200.f);
-  ImGui::SliderFloat(u8"##ff_speed", &s_ff_speed, 1.0f, 20.0f, u8"快进倍率 %.1fx");
+  ImGui::SliderFloat(u8"##ff_speed", &s_ff_speed, 1.0f, 8.0f, u8"快进倍率 %.1fx");
 
   if (ImGui::Checkbox(u8"到达目标时间后自动开始快进##ff_auto", &s_ff_auto)) {
     game_api::time_control_set_ff_auto(s_ff_auto);
@@ -3490,11 +4004,12 @@ void draw_time_panel() {
     if (ImGui::Button(u8"快进至目标时间")) {
       game_api::time_control_ff_start(s_ff_target, s_ff_speed);
       s_scale = game_api::time_control_scale();
+      s_enabled = true;
       g_last_msg = u8"已开始快进";
     }
     ImGui::EndDisabled();
     ImGui::SameLine();
-    ImGui::TextDisabled(u8"把倍率拉到快进倍率，到达目标时间自动暂停。");
+    ImGui::TextDisabled(u8"把倍率拉到快进倍率，到达目标时间后自动回到常速。");
   } else {
     ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.35f, 1.f), u8"快进中：目标 %s，倍率 %.1fx",
                        fmt_clock(game_api::time_control_ff_target()).c_str(),
@@ -3502,13 +4017,27 @@ void draw_time_panel() {
     if (ImGui::Button(u8"取消快进")) {
       game_api::time_control_ff_cancel();
       s_scale = game_api::time_control_scale();
+      s_enabled = game_api::time_control_enabled();
     }
   }
 }
 
+// 原「动画 / Lua」分组已并入本面板页，这里提供同一批快捷键的绑定入口。
+static void draw_lua_hotkey_section() {
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+  if (!ImGui::CollapsingHeader(u8"快捷键##lua_hotkeys")) return;
+  ImGui::TextDisabled(u8"点右侧齿轮可改键。");
+  end_chip_flow();
+  end_pair_flow();
+  int n = 0;
+  const char* const* keys = game_api::lua_feature_keys(&n);
+  for (int i = 0; i < n; ++i) draw_feature_row(game_api::find_feature(keys[i]));
+}
+
 void draw_lua_panel() {
-  const bool ready = game_api::lua_bridge_ready();
-  const int hooks = game_api::lua_bridge_hook_state();
+  const bool ready = game_api::lua_bridge_ready();  const int hooks = game_api::lua_bridge_hook_state();
 
   ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"动画 / Lua");
   ImGui::SameLine();
@@ -3530,6 +4059,7 @@ void draw_lua_panel() {
     ImGui::TextWrapped(u8"请先进入遭遇战对局（脚本开始运行）再回来。如果一直读不到，"
                        u8"请把 ra3_overlay.log 里以 lua: 开头的行发给我。");
     ImGui::TextDisabled(u8"hook 状态：%d（-1 = 尚未安装，1 = 已安装）", hooks);
+    draw_lua_hotkey_section();
     return;
   }
 
@@ -3539,7 +4069,7 @@ void draw_lua_panel() {
   ImGui::Spacing();
   ImGui::Separator();
   ImGui::Spacing();
-  ImGui::TextDisabled(u8"动画跟踪（原版动画窗口读的就是这几个全局变量，缓存每秒刷新 4 次）");
+  ImGui::TextDisabled(u8"动画跟踪（原版动画窗口读的就是这几个全局变量，缓存由游戏线程 4Hz 刷新）");
 
   struct Row {
     const char* name;
@@ -3602,40 +4132,55 @@ void draw_lua_panel() {
 
   ImGui::Spacing();
   if (ImGui::Button(u8"读取")) {
+    if (game_api::lua_request_read(s_name)) {
+      s_result = u8"已请求读取：游戏线程执行后在这里显示结果（同时写日志）";
+    } else {
+      s_result = u8"请求失败（队列满 / 名字过长）";
+    }
+  }
+  // 异步读取结果：游戏线程执行完后在这里取回（每帧 poll，只取一次）。
+  {
     game_api::LuaGlobal v{};
-    if (game_api::lua_global_read(s_name, &v)) {
-      char buf[320];
-      std::snprintf(buf, sizeof(buf), u8"%s → 类型 %s，值 %s", s_name,
+    char got_name[128] = {};
+    if (game_api::lua_read_take(&v, got_name, sizeof(got_name))) {
+      char buf[360];
+      std::snprintf(buf, sizeof(buf), u8"%s → 类型 %s，值 %s", got_name,
                     game_api::lua_type_name(v.type), v.text[0] ? v.text : "<空>");
       s_result = buf;
-    } else {
-      s_result = u8"读取失败（Lua 未就绪，或变量不存在）";
     }
   }
   ImGui::SameLine();
   if (ImGui::Button(u8"写字符串")) {
     s_result = game_api::lua_global_write_string(s_name, s_value)
-                   ? u8"写入成功（字符串）"
-                   : u8"写入失败";
+                   ? u8"已提交字符串（游戏线程下一帧执行，见日志）"
+                   : u8"提交失败（队列满 / 名字过长）";
   }
   ImGui::SameLine();
   if (ImGui::Button(u8"写数字")) {
     const double n = std::atof(s_value);
-    s_result = game_api::lua_global_write_number(s_name, n) ? u8"写入成功（数字）"
-                                                            : u8"写入失败";
+    s_result = game_api::lua_global_write_number(s_name, n)
+                   ? u8"已提交数字（游戏线程下一帧执行，见日志）"
+                   : u8"提交失败（队列满 / 名字过长）";
   }
   ImGui::SameLine();
   if (ImGui::Button(u8"置为 nil")) {
-    s_result = game_api::lua_global_write_nil(s_name) ? u8"已置为 nil" : u8"写入失败";
+    s_result = game_api::lua_global_write_nil(s_name)
+                   ? u8"已提交 nil（游戏线程下一帧执行，见日志）"
+                   : u8"提交失败（队列满 / 名字过长）";
   }
 
   if (!s_result.empty()) ImGui::TextWrapped("%s", s_result.c_str());
+
+  ImGui::Spacing();
+  ImGui::TextDisabled(u8"读写都在游戏线程执行（渲染线程只读快照/排队），待执行的写入：%d",
+                      game_api::lua_pending_writes());
 
   ImGui::Spacing();
   ImGui::TextWrapped(u8"注意：这个定制版 Lua 的类型表里没有独立的 boolean 标签"
                      u8"（只有 userdata / nil / number / string / table / function）。"
                      u8"如果脚本里的开关量实际是布尔值，写数字不一定会被当成真/假，"
                      u8"请先「读取」看它原本的类型，再决定写什么。");
+  draw_lua_hotkey_section();
 }
 
 static void draw_misc_panel() {
@@ -3656,13 +4201,14 @@ static void draw_misc_panel() {
   ImGui::Separator();
   ImGui::Spacing();
 
-  static bool s_hide_hp = false;
-  static bool s_hide_sil = false;
-  static bool s_take = true;
+  // 这三项也持久化：优先用 ini 里保存的意图，读不到才取游戏当前值。
+  bool s_hide_hp = g_misc_hide_hp;
+  bool s_hide_sil = g_misc_hide_sil;
+  bool s_take = g_misc_take;
   static bool s_ui_inited = false;
   if (!s_ui_inited && st.flags_ok) {
-    s_hide_hp = !st.show_health;
-    s_hide_sil = !st.show_silhouette;
+    if (!s_hide_hp && !st.show_health) s_hide_hp = true;
+    if (!s_hide_sil && !st.show_silhouette) s_hide_sil = true;
     s_ui_inited = true;
   }
 
@@ -3672,12 +4218,18 @@ static void draw_misc_panel() {
     std::string msg;
     ImGui::BeginDisabled(!st.flags_ok);
     if (ImGui::Checkbox(u8"不显示血条和维修标志", &s_hide_hp)) {
+      g_misc_hide_hp = s_hide_hp;
+      mark_settings_dirty();
       game_api::misc_set_hide_health(s_hide_hp, s_take, &msg);
     }
     if (ImGui::Checkbox(u8"不显示建筑背后的单位剪影", &s_hide_sil)) {
+      g_misc_hide_sil = s_hide_sil;
+      mark_settings_dirty();
       game_api::misc_set_hide_silhouette(s_hide_sil, s_take, &msg);
     }
     if (ImGui::Checkbox(u8"每帧保持（换局、改画质后仍生效）", &s_take)) {
+      g_misc_take = s_take;
+      mark_settings_dirty();
       game_api::misc_set_hide_health(s_hide_hp, s_take, &msg);
       game_api::misc_set_hide_silhouette(s_hide_sil, s_take, &msg);
     }
@@ -3694,13 +4246,21 @@ static void draw_misc_panel() {
   ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"阴影");
   ImGui::Spacing();
 
-  static int s_size = 1024;
+  // 下拉/滑条显示「想要的值」：优先 ini 里保存的，其次才是游戏当前值。
+  // 这样重开游戏后不用再设一遍——tick 会在每一局进场后自动下发。
+  const int s_size = (g_misc_shadow_size > 0)
+                         ? g_misc_shadow_size
+                         : (st.shadow_size_ok ? st.shadow_size : 1024);
   static float s_dist = 0.f;
-  static bool s_shadow_inited = false;
-  if (st.shadow_size_ok) s_size = st.shadow_size;
-  if (!s_shadow_inited && st.shadow_dist_ok) {
-    s_dist = st.shadow_dist;
-    s_shadow_inited = true;
+  static bool s_dist_inited = false;
+  if (!s_dist_inited) {
+    if (g_misc_shadow_dist > 0.f) {
+      s_dist = g_misc_shadow_dist;
+      s_dist_inited = true;
+    } else if (st.shadow_dist_ok) {
+      s_dist = st.shadow_dist;
+      s_dist_inited = true;
+    }
   }
 
   {
@@ -3712,16 +4272,25 @@ static void draw_misc_panel() {
     }
     ImGui::SetNextItemWidth(220.f);
     if (ImGui::Combo(u8"阴影贴图大小##misc_size", &cur, items, 4)) {
+      g_misc_shadow_size = kSizes[cur];
+      g_misc_shadow_take = true;
+      mark_settings_dirty();
       std::string msg;
       game_api::misc_set_shadow_size(kSizes[cur], &msg);
-      if (!msg.empty()) g_last_msg = msg;
+      if (msg.empty()) g_last_msg = u8"阴影贴图大小已保存，重新开始一局后生效";
+      else g_last_msg = msg + u8"（已保存，下一局自动下发）";
     }
     ImGui::SameLine();
-    ImGui::TextDisabled(u8"（1024/2048/4096/8192，重新开始一局后生效）");
+    ImGui::TextDisabled(u8"（1024/2048/4096/8192，重新开始一局后生效，设置会保存）");
   }
 
   ImGui::SetNextItemWidth(320.f);
-  if (ImGui::SliderFloat(u8"最大阴影距离##misc_dist", &s_dist, 0.f, 20000.f, u8"%.0f")) {
+  ImGui::SliderFloat(u8"最大阴影距离##misc_dist", &s_dist, 0.f, 20000.f, u8"%.0f");
+  // 松手后再写入，避免拖动时每帧改全局、退局拆设备时卡死。
+  if (ImGui::IsItemDeactivatedAfterEdit()) {
+    g_misc_shadow_dist = s_dist;
+    g_misc_shadow_take = true;
+    mark_settings_dirty();
     std::string msg;
     game_api::misc_set_shadow_distance(s_dist, &msg);
     if (!msg.empty()) g_last_msg = msg;
@@ -3729,6 +4298,18 @@ static void draw_misc_panel() {
   ImGui::SameLine();
   if (ImGui::SmallButton(u8"默认##misc_dist_def")) {
     s_dist = 1000.f;
+    g_misc_shadow_dist = s_dist;
+    g_misc_shadow_take = true;
+    mark_settings_dirty();
+    std::string msg;
+    game_api::misc_set_shadow_distance(s_dist, &msg);
+    if (!msg.empty()) g_last_msg = msg;
+  }
+  ImGui::SameLine();
+  if (ImGui::SmallButton(u8"应用##misc_dist_apply")) {
+    g_misc_shadow_dist = s_dist;
+    g_misc_shadow_take = true;
+    mark_settings_dirty();
     std::string msg;
     game_api::misc_set_shadow_distance(s_dist, &msg);
     if (!msg.empty()) g_last_msg = msg;
@@ -3742,7 +4323,7 @@ static void draw_misc_panel() {
   ImGui::Spacing();
   ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"光照颜色");
   ImGui::SameLine();
-  ImGui::TextDisabled(u8"分量是 0..1 的浮点（1.000 = 255），可输入更大或更小的值");
+  ImGui::TextDisabled(u8"点击色块打开调色盘（1.000 = 255）");
 
   static float s_light[4][3] = {};
   static bool s_light_inited = false;
@@ -3770,12 +4351,13 @@ static void draw_misc_panel() {
   ImGui::Spacing();
   static const char* kLightLabel[4] = {u8"环境光颜色##misc_l0", u8"主光源颜色##misc_l1",
                                        u8"调色颜色 #1##misc_l2", u8"调色颜色 #2##misc_l3"};
+  // 只显示色块，点开就是调色盘；不再并排三个 RGB 滑块。
+  const ImGuiColorEditFlags light_flags =
+      ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR | ImGuiColorEditFlags_NoInputs |
+      ImGuiColorEditFlags_PickerHueBar | ImGuiColorEditFlags_DisplayHex;
   ImGui::BeginDisabled(!st.light.ok);
   for (int g = 0; g < 4; ++g) {
-    ImGui::SetNextItemWidth(360.f);
-    if (ImGui::ColorEdit3(kLightLabel[g], s_light[g],
-                          ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR |
-                              ImGuiColorEditFlags_PickerHueBar)) {
+    if (ImGui::ColorEdit3(kLightLabel[g], s_light[g], light_flags)) {
       std::string msg;
       game_api::misc_set_light(g, s_light[g], &msg);
       if (!msg.empty()) g_last_msg = msg;
@@ -3796,20 +4378,25 @@ static void draw_misc_panel() {
 }
 
 static void draw_unit_inspector() {
-  game_api::UnitInspect info{};
-  game_api::inspect_first_selected(&info);
-
   static bool s_edit_open = false;
   static bool s_open_popup = false;
   static char s_edit_key[96] = {};
   static char s_edit_name[96] = {};
   static std::string s_edit_msg;
+  static int s_sel_total = 0;
+  static double s_sel_t = -1.0;
+
+  // Header only needs a cheap selection count; full inspect waits until open.
+  const double now = ImGui::GetTime();
+  if (s_sel_t < 0.0 || (now - s_sel_t) >= 0.35) {
+    s_sel_total = game_api::selected_count();
+    s_sel_t = now;
+  }
 
   char header[96];
-  if (info.selected_total > 1) {
-    std::snprintf(header, sizeof(header), u8"单位属性（已选 %d）###unit_insp",
-                  info.selected_total);
-  } else if (info.selected_total == 1) {
+  if (s_sel_total > 1) {
+    std::snprintf(header, sizeof(header), u8"单位属性（已选 %d）###unit_insp", s_sel_total);
+  } else if (s_sel_total == 1) {
     std::snprintf(header, sizeof(header), u8"单位属性（已选 1）###unit_insp");
   } else {
     std::snprintf(header, sizeof(header), u8"单位属性（未选中）###unit_insp");
@@ -3833,6 +4420,13 @@ static void draw_unit_inspector() {
     ImGui::SetWindowSize(sz);
   }
   if (!open) return;
+
+  game_api::UnitInspect info{};
+  game_api::inspect_first_selected(&info);
+  if (info.selected_total != s_sel_total) {
+    s_sel_total = info.selected_total;
+    s_sel_t = now;
+  }
 
   ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.10f, 0.12f, 0.16f, 0.80f));
   ImGui::BeginChild("##inspect", ImVec2(0, 210), ImGuiChildFlags_Borders);
@@ -3894,9 +4488,17 @@ static void draw_unit_inspector() {
     ImGui::NextColumn();
 
     if (info.has_hp) {
-      ImGui::Text(u8"血量  %.0f / %.0f", info.hp_cur, info.hp_max);
+      const bool over = info.hp_max > 0.f && info.hp_cur > info.hp_max * 1.01f;
+      if (over) {
+        ImGui::Text(u8"血量  已锁满（上限 %.0f）", info.hp_max);
+      } else {
+        ImGui::Text(u8"血量  %.0f / %.0f", info.hp_cur, info.hp_max);
+      }
       if (info.hp_max > 0.f) {
-        ImGui::ProgressBar(info.hp_cur / info.hp_max, ImVec2(-1, 14), nullptr);
+        float frac = info.hp_cur / info.hp_max;
+        if (frac < 0.f) frac = 0.f;
+        if (frac > 1.f) frac = 1.f;
+        ImGui::ProgressBar(frac, ImVec2(-1, 14), nullptr);
       }
     } else {
       ImGui::TextDisabled(u8"血量  （无组件）");
@@ -3978,7 +4580,6 @@ static void draw_unit_inspector() {
 // ---------------------------------------------------------------------------
 static uint32_t g_unit_scope_player_ui = 0;
 static uint32_t g_unit_team_player_ui = 0;
-static uint32_t g_unit_color_player_ui = 0;
 
 static void draw_unit_ops_extra() {
   ImGui::Spacing();
@@ -4024,7 +4625,14 @@ static void draw_unit_ops_extra() {
   }
 
   static uint32_t s_scope_buf[512];
-  const int n = game_api::unit_collect_scope(s_scope_buf, 512);
+  static int s_scope_n = 0;
+  static double s_scope_t = -1.0;
+  const double scope_now = ImGui::GetTime();
+  if (s_scope_t < 0.0 || (scope_now - s_scope_t) >= 0.25) {
+    s_scope_n = game_api::unit_collect_scope(s_scope_buf, 512);
+    s_scope_t = scope_now;
+  }
+  const int n = s_scope_n;
   ImGui::SameLine();
   ImGui::TextDisabled(u8"当前范围命中 %d 个单位", n);
 
@@ -4038,13 +4646,20 @@ static void draw_unit_ops_extra() {
   const uint32_t target = draw_player_picker("unit_team", &g_unit_team_player_ui);
 
   static bool s_enable_ai = true;
-  ImGui::Checkbox(u8"启用 AI 操控##unit_team_ai", &s_enable_ai);
+  if (ImGui::Checkbox(u8"启用 AI 操控##unit_team_ai", &s_enable_ai)) {
+    // 勾上时立刻把之前被压成 0 的速度还回来，不必再切一次队伍才动。
+    if (s_enable_ai) {
+      std::string msg;
+      if (game_api::unit_thaw_team_freeze(target, &msg) && !msg.empty()) g_last_msg = msg;
+    }
+    game_api::beep("click");
+  }
   ImGui::SameLine();
   ImGui::TextDisabled(u8"不勾选时：改完归属顺手把单位速度压成 0，免得 AI 把它调走");
 
   ImGui::Spacing();
   ImGui::BeginDisabled(target == 0 || n <= 0);
-  if (ImGui::Button(u8"把范围内单位切换给该玩家")) {
+  if (ImGui::Button(u8"把选中单位切换给该玩家")) {
     std::string msg;
     const bool ok = game_api::unit_change_team_ex(target, s_enable_ai, &msg);
     g_last_msg = msg;
@@ -4056,64 +4671,23 @@ static void draw_unit_ops_extra() {
     ImGui::TextDisabled(u8"范围内没有单位（先选中单位，或把范围改成「所有的单位」）");
   }
   ImGui::TextDisabled(u8"注意：改变队伍会让正在录制的录像不同步。");
+}
 
-  ImGui::Spacing();
-  ImGui::Separator();
-  ImGui::Spacing();
-
-  // ---- 切换单位的颜色 ----
-  ImGui::TextUnformatted(u8"切换单位的颜色");
-  ImGui::TextDisabled(u8"选择谁的单位（RA3 的单位颜色来自所属玩家，改色会波及该玩家全部单位）");
-  const uint32_t color_who = draw_player_picker("unit_color", &g_unit_color_player_ui);
-
-  static float s_unit_color[3] = { 1.f, 0.f, 0.f };
-  ImGui::SetNextItemWidth(240.f);
-  ImGui::ColorEdit3(u8"颜色##unit_color", s_unit_color,
-                    ImGuiColorEditFlags_Float | ImGuiColorEditFlags_PickerHueBar |
-                        ImGuiColorEditFlags_DisplayRGB);
-  if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip(u8"点击右侧有颜色的按钮可以打开调色板；在左侧输入框按 Ctrl 再单击左键"
-                      u8"就可以输入大于 255 或者小于 0 的数值");
-  }
-
-  if (color_who != 0) {
-    uint8_t cr = 0, cg = 0, cb = 0;
-    if (game_api::unit_color_read(color_who, &cr, &cg, &cb)) {
-      ImGui::TextDisabled(u8"该队伍当前颜色：(%u, %u, %u)%s", (unsigned)cr, (unsigned)cg,
-                          (unsigned)cb,
-                          game_api::unit_color_has_backup(color_who) ? u8"（已记录原色）" : "");
-    } else {
-      ImGui::TextDisabled(u8"读不到该队伍的颜色字段（先进入对局）");
-    }
-  }
-
-  ImGui::Spacing();
-  ImGui::BeginDisabled(color_who == 0);
-  if (ImGui::Button(u8"应用颜色")) {
-    std::string msg;
-    const bool ok = game_api::unit_color_write(
-        color_who, (uint8_t)(s_unit_color[0] * 255.f + 0.5f),
-        (uint8_t)(s_unit_color[1] * 255.f + 0.5f), (uint8_t)(s_unit_color[2] * 255.f + 0.5f),
-        &msg);
-    g_last_msg = msg;
-    game_api::beep(ok ? "click" : "error");
-  }
-  ImGui::SameLine();
-  if (ImGui::Button(u8"恢复原来的颜色")) {
-    std::string msg;
-    const bool ok = game_api::unit_color_restore(color_who, &msg);
-    g_last_msg = msg;
-    game_api::beep(ok ? "click" : "error");
-  }
-  ImGui::EndDisabled();
-  if (color_who != 0 && game_api::unit_color_read(color_who, nullptr, nullptr, nullptr)) {
-    uint8_t cr = 0, cg = 0, cb = 0;
-    game_api::unit_color_read(color_who, &cr, &cg, &cb);
-    ImGui::SameLine();
-    ImGui::ColorButton("##unit_color_now", ImVec4(cr / 255.f, cg / 255.f, cb / 255.f, 1.f),
-                       ImGuiColorEditFlags_NoTooltip, ImVec2(22.f, 22.f));
-  }
-  ImGui::TextDisabled(u8"说明：改的是玩家对象的颜色字段（+0x80），相当于把该队伍的部队整体换色。");
+void pump_pending_settings() {
+  if (!g_misc_restore_pending) return;
+  game_api::MiscPersist p{};
+  p.shadow_take = g_misc_shadow_take;
+  p.shadow_size = g_misc_shadow_size;
+  p.shadow_dist = g_misc_shadow_dist;
+  p.take = g_misc_take;
+  p.hide_health = g_misc_hide_hp;
+  p.hide_silhouette = g_misc_hide_sil;
+  p.light_lock = g_misc_light_lock;
+  std::string msg;
+  if (!game_api::misc_apply_persist(p, &msg)) return;  // 杂项还没装好，下一帧再来
+  g_misc_restore_pending = false;
+  game_api::crate_select(g_crate_kind_persist, g_crate_count_persist);
+  if (!msg.empty()) g_last_msg = msg;
 }
 
 void draw() {
@@ -4163,10 +4737,16 @@ void draw() {
 
     ImGui::TextColored(ImVec4(0.55f, 0.75f, 1.0f, 1.f), u8"RA3 Overlay");
     ImGui::SameLine();
-    ImGui::TextDisabled(u8"|  %s  |  选中 %d", game_api::mode_label(),
-                        game_api::selected_count());
-    ImGui::TextWrapped("%s", game_api::status_text());
-    ImGui::Spacing();
+    {
+      static int s_sel_n = 0;
+      static double s_sel_t = -1.0;
+      const double t = ImGui::GetTime();
+      if (s_sel_t < 0.0 || (t - s_sel_t) >= 0.35) {
+        s_sel_n = game_api::selected_count();
+        s_sel_t = t;
+      }
+      ImGui::TextDisabled(u8"|  %s  |  选中 %d", game_api::mode_label(), s_sel_n);
+    }
 
     const bool busy = InterlockedCompareExchange(&g_injecting, 0, 0) != 0;
     if (busy) ImGui::BeginDisabled();
@@ -4203,11 +4783,25 @@ void draw() {
     }
     ImGui::SameLine();
     if (ImGui::Button(u8"隐藏", ImVec2(60, 0))) input::set_menu_visible(false);
+    ImGui::SameLine();
+    ImGui::Checkbox(u8"调试", &g_show_debug_status);
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(u8"在下方固定高度的信息框内显示底层状态；默认关闭，避免长日志把窗口撑高跳动。");
+    }
 
     ImGui::Spacing();
     ImGui::PushStyleColor(ImGuiCol_ChildBg,
                           ImVec4(0.12f, 0.14f, 0.18f, g_ui_opacity));
-    ImGui::BeginChild("##msg", ImVec2(0, 44), true);
+    // 固定高度：内容超出时在框内滚动，绝不改变主窗口布局。
+    const float msg_h = g_show_debug_status ? 72.f : 44.f;
+    ImGui::BeginChild("##msg", ImVec2(0, msg_h), true,
+                      ImGuiWindowFlags_None);
+    if (g_show_debug_status) {
+      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.72f, 0.78f, 0.88f, 1.f));
+      ImGui::TextUnformatted(game_api::status_text());
+      ImGui::PopStyleColor();
+      ImGui::Separator();
+    }
     ImGui::TextWrapped("%s", g_last_msg.c_str());
     ImGui::EndChild();
     ImGui::PopStyleColor();
@@ -4331,9 +4925,14 @@ void draw() {
       const bool res_page = std::strcmp(g.name, u8"资源") == 0;
       for (int i = 0; i < g.key_count; ++i) {
         const game_api::FeatureInfo* feat = game_api::find_feature(g.keys[i]);
-        const bool unit_full = feat && (std::strcmp(feat->key, "spawn_mcv") == 0 ||
-                                        std::strcmp(feat->key, "spawn_rank") == 0 ||
-                                        std::strcmp(feat->key, "summon_troops") == 0);
+        const bool unit_full =
+            feat && (std::strcmp(feat->key, "spawn_mcv") == 0 ||
+                     std::strcmp(feat->key, "spawn_rank") == 0 ||
+                     std::strcmp(feat->key, "summon_troops") == 0 ||
+                     std::strcmp(feat->key, "invincible") == 0 ||
+                     std::strcmp(feat->key, "airdrop") == 0 ||
+                     // 危险等级是三段滑条，得整行画
+                     std::strcmp(feat->key, "danger") == 0);
         const bool money_cell = feat && std::strcmp(feat->type, "money") == 0;
         const bool money_pick = feat && std::strcmp(feat->key, "money_sel") == 0;
         if (unit_page && feat && !unit_full) {
@@ -4375,6 +4974,8 @@ bool overlay_visible() {
   if (input::menu_visible()) return true;
   return g_inited && g_stats_open && g_stats_pinned;
 }
+
+bool stats_roster_wanted() { return g_inited && g_stats_open; }
 
 bool want_capture_mouse() {
   if (!overlay_visible()) return false;

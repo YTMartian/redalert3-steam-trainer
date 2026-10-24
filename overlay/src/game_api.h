@@ -134,6 +134,10 @@ struct MatchEconomy {
 };
 
 bool collect_match_economy(MatchEconomy* out);
+// Cheap in-place refresh of money / power only (no roster / protocol / seat walk).
+// Call every frame or ~100ms while 战况统计 is open; keep collect_match_economy
+// for units/buildings on the slower poll.
+bool refresh_match_resources(MatchEconomy* inout);
 bool inspect_first_selected(UnitInspect* out);
 
 // Per-player production lock. The game keeps a disabled-type list on each
@@ -156,6 +160,15 @@ const BuildLockEntry* build_lock_catalog(int* count);
 bool build_lock_set(const char* type_id, bool locked, std::string* out_msg);
 bool build_lock_selected(bool locked, std::string* out_msg);
 void build_lock_tick();
+// Drain Create/Destroy / seed-enqueue queues a little each Present frame
+// (~12 catalog resolves while seeding). Keeps open-panel seed off the UI poll.
+void roster_tick();
+// When false, Present only drains Destroy queues lightly (no classify / scan).
+// Rising edge arms an amortized seed: one cheap list walk + Present classify.
+void roster_set_active(bool on);
+bool roster_active();
+// True while open-panel seed still has a pending enqueue walk or classify queue.
+bool roster_seed_pending();
 // 协议无冷却 / 超级武器：清掉己方超级武器计时表里的每一项（含超能波毁灭装置）。
 void refresh_power_cooldowns();
 void build_lock_sync_disable_superweapon();
@@ -204,6 +217,33 @@ void set_money_player(uint32_t player);
 // 召唤部队：先记下玩家、每种数量和选中的兵种，再由 run_engine("summon_troops") 生成。
 bool summon_prepare(uint32_t player, int count, const char* const* type_ids, int type_count,
                     std::string* out_msg);
+// 召唤时为所有单位额外抬升的高度（游戏世界单位）。气球炸弹之类会自己再抬一截。
+float summon_extra_lift();
+void set_summon_extra_lift(float meters);
+// 召唤后清掉「隐形 / 未入世」标志（默认开）。关掉就保持引擎刚造出来的原始状态。
+bool summon_visible_fix();
+void set_summon_visible_fix(bool on);
+// 被抬高的召唤物（气球炸弹这类落地即爆的）每帧按回召唤高度，让它们停在空中。
+void air_hold_tick();
+bool air_hold_enabled();
+void set_air_hold_enabled(bool on);
+int air_hold_count();
+void air_hold_release_all();   // 「放手」：清掉托举表，让它们自然下落
+void air_hold_shutdown();      // 卸载前停掉高频夹持线程（否则 FreeLibrary 后还在写内存）
+void air_hold_forget(uint32_t obj);
+// 对象模板库（ThingFactory）里登记的全部对象类型名，按名字排序。
+// 和建造面板不同，这里也包含战役 / 特殊 / Mod 单位（将军刽子手、天皇机甲……），
+// 引擎的 CreateUnit 对它们同样有效。召唤面板的「按名字搜索」用这份名单。
+const std::vector<std::string>& object_type_names();
+// 丢掉缓存，重新扫一遍模板库（切换对局 / 换 Mod 后调用）。
+void refresh_object_type_names();
+// 类型名的中文显示名（读 unit_names*.txt）；没有记录时返回 nullptr。
+const char* type_display_name(const char* type_id);
+// 类型名是否登记在对象模板库里（= 这个版本有这个东西）。用模板库名单做精确匹配，
+// 不触发模板内存扫描，可以每帧调。
+bool object_type_exists(const char* type_id);
+// 名单是否已经读全（>=500 条）。没读全时 object_type_exists 的结果不可信。
+bool object_type_list_ready();
 // 在 EndScene/Present（游戏线程）上把排队的 CreateUnit 做完，避免和模拟线程抢单位。
 void drain_unit_spawns();
 // 该玩家的出场等级。-1 没有这个玩家，-2 还没读到升级数据。0..3 为等级。
@@ -329,24 +369,28 @@ const char* camera_file_path();
 bool camera_engine_cmd(const char* key, bool* handled, std::string* out_msg);
 
 // ---------------------------------------------------------------------------
-// 游戏时间控制（对应 CameraBridge 的 RA3TimePausePlugin）
+// 游戏时间控制（加速）
 //
-// 全局变量 0x00CE8138 指向全局数据对象：
-//   +0x30  GameSpeedFactor（展示用）
-//   +0x54  游戏时间倍率（0.6 最慢 / 1.0 正常 / 2.0 最快；0 相当于暂停）
-// 改 +0x54 即可控制游戏速度。写前会严格校验指针与当前值，绝不盲写。
+// 真正的速度量是 [0x00CB409C]：引擎 0x00655166 读它算「每帧逻辑更新次数」
+//     00655166  mov eax, [0xcb409c]
+//     0065516D  div dword ptr [0xcb4098]   ; / logic FPS(=15)
+//     0065519A  idiv edi                   ; edi == 0 → DIVIDE_BY_ZERO（实测崩过）
+// 所以该值必须 >= logic FPS：**只能加速（>=1x），不能减速/暂停**。
+// 倍率相对“进入对局时读到的原值”（正常局 30：1x=30、4x=120、8x=240）。
+// 旧实现写的 [[0xCE8138]+0x54] 其实是亮度，已停止写入。
 // ---------------------------------------------------------------------------
 void time_control_install();
 void time_control_tick();  // 由 Present 每帧调用
-// 读取当前倍率 / GameSpeedFactor。返回是否读到了合法值。
+// 读取显示选项字段：scale_out = [[0xCE8138]+0x54]（亮度），
+// factor_out = [[0xCE8138]+0x30]（GameSpeedFactor）。返回是否读到合法值。
 bool time_control_read(float* scale_out, float* factor_out, bool* valid_out);
-// 启用/停用持续覆盖。
+// 启用/停用加速（停用会把 updateFps 写回进局原值）。
 void time_control_set_enabled(bool on);
 bool time_control_enabled();
-// 设置目标倍率并启用覆盖（0.0 = 暂停逻辑，1.0 = 常速）。
+// 设置加速倍率并启用覆盖。只接受 [1, 8]；低于 1 会被抬到 1。
 void time_control_set_scale(float scale);
 float time_control_scale();
-// 恢复原始倍率并停用。
+// 恢复原始速度并停用。
 void time_control_restore();
 // 最近一次实际读到的值（不必启用）。
 float time_control_seen_scale();
@@ -366,6 +410,32 @@ float time_control_ff_speed();
 // 是否在到达目标时间后自动开始快进（「自动快进至目标时间」勾选项）。
 void time_control_set_ff_auto(bool on);
 bool time_control_ff_auto();
+
+// ---- 原始时钟诊断（只读）--------------------------------------------------
+// 供 UI 显示 / 日志对照；全部只读，不会改动游戏。
+struct TimeProbe {
+  bool have_obj = false;          // [[0xCE8138]+0x30/+0x54] 可读
+  float game_speed_factor = 0.f;  // +0x30 GameSpeedFactor（显示选项字段）
+  float brightness = 0.f;         // +0x54 亮度（旧实现误写的字段）
+  bool have_logic_fps = false;
+  int logic_fps = 0;              // [0x00CB4098] 15
+  bool have_update_fps = false;
+  int update_fps = 0;             // [0x00CB409C] 当前值（= 原值 × 倍率）
+  unsigned session = 0;           // [0x00CE811C] 每场对局的会话对象
+  bool have_session_fps = false;
+  int session_fps = 0;            // 已停用：不在渲染线程调用游戏的 vtbl getter
+  float applied_scale = 0.f;      // 最近生效的倍率（0 = 未写过）
+  int original_logic_fps = 0;     // 进入对局时的 logicFps 原值（0 = 还没记录）
+  int original_update_fps = 0;    // 进入对局时的 updateFps 原值（0 = 还没记录）
+  int target = 0;                 // 0=不改内存 1=logicFps 2=updateFps 3=两者
+  int writes = 0;                 // 已写入次数
+};
+void time_control_probe_snapshot(TimeProbe* out);
+// 速度写入目标：0 = 不改内存；1 = 只改 logic FPS；2 = 只改 update FPS；3 = 两者同步。
+int time_control_speed_target();
+void time_control_set_speed_target(int target);
+// 打印一次会话对象的字段扫描（为将来找“减速/暂停”挂载点用）。
+void time_control_probe_dump_session();
 
 // ---- 禁用游戏中的鼠标输入（对应 CameraBridge 的「在游戏中禁用输入」）--------
 // 勾选后 overlay 吞掉发往游戏窗口的鼠标消息：游戏不再响应悬停/点击
@@ -393,16 +463,11 @@ int unit_collect_scope(uint32_t* out, int max_out);
 // 「切换单位的队伍」：把作用范围内的单位改到 target_player 名下（写归属 0x418）。
 bool unit_change_team(uint32_t target_player, std::string* out_msg);
 // 同上的扩展版。enable_ai = false 时改完归属再把单位速度压成 0（原地冻结），
-// 对应 CameraBridge 的「启用 AI 操控」未勾选的情况。
+// 对应 CameraBridge 的「启用 AI 操控」未勾选的情况；enable_ai = true 时会把
+// 之前压成 0 的速度还原，否则勾回来单位也不会动。
 bool unit_change_team_ex(uint32_t target_player, bool enable_ai, std::string* out_msg);
-
-// 「切换单位的颜色」：零售版 1.12 里单位颜色来自所属玩家对象，颜色以 ARGB
-// 存在玩家对象 +0x80（个别版本在 +0x84）。读写这个字段就等于给该玩家的
-// 部队整体换色；「恢复原来的颜色」写回第一次改色前缓存的原值。
-bool unit_color_read(uint32_t player, uint8_t* r, uint8_t* g, uint8_t* b);
-bool unit_color_write(uint32_t player, uint8_t r, uint8_t g, uint8_t b, std::string* out_msg);
-bool unit_color_restore(uint32_t player, std::string* out_msg);
-bool unit_color_has_backup(uint32_t player);
+// 把因「不启用 AI 操控」被冻结的速度还原（勾上「启用 AI 操控」时立即调用）。
+bool unit_thaw_team_freeze(uint32_t target_player, std::string* out_msg);
 
 // ---------------------------------------------------------------------------
 // 杂项操作（对应 CameraBridge 的「杂项操作」）
@@ -460,6 +525,21 @@ bool misc_set_hide_silhouette(bool hide, bool take_over, std::string* out_msg);
 bool misc_set_shadow_size(int size, std::string* out_msg);
 bool misc_set_shadow_distance(float dist, std::string* out_msg);
 void misc_set_shadow_takeover(bool on);
+
+// 杂项设置的持久化快照（写进 overlay_ui.ini，启动时自动恢复）。
+struct MiscPersist {
+  bool shadow_take = false;   // 每帧保持阴影设置
+  int shadow_size = 0;        // 0 = 没设置过
+  float shadow_dist = 0.f;    // 0 = 没设置过
+  bool take = false;          // 每帧保持隐藏项
+  bool hide_health = false;
+  bool hide_silhouette = false;
+  bool light_lock = true;
+};
+// 读当前意图（含 take 标志），供保存用。
+void misc_get_persist(MiscPersist* out);
+// 恢复上次保存的设置；不需要进对局，进对局后 tick 会自动下发。
+bool misc_apply_persist(const MiscPersist& in, std::string* out_msg);
 // which: 0 环境光 / 1 主光源 / 2 调色 #1 / 3 调色 #2。分量是 0..1（可以更大/更小）。
 bool misc_set_light(int which, const float rgb[3], std::string* out_msg);
 void misc_set_light_lock(bool on);
@@ -489,7 +569,7 @@ struct LuaAnimInfo {
 
 // 安装 Lua API hook（init 时自动调用，可重复调用）。
 void lua_bridge_install();
-// 由 Present 每帧调用：重试安装、刷新动画全局变量缓存。
+// 由 Present 每帧调用：只重试安装 / 打印状态，不再碰 lua_State（读脚本必须留在游戏线程）。
 void lua_bridge_tick();
 bool lua_bridge_ready();
 uint32_t lua_bridge_state();   // 捕获到的 lua_State*（0 = 还没有）
@@ -498,12 +578,16 @@ int lua_bridge_api_hits();
 const char* lua_type_name(int type);
 
 // 读 / 写 Lua 全局变量。全部做了地址与栈校验，失败返回 false 而不是乱写。
-bool lua_global_read(const char* name, LuaGlobal* out);
-bool lua_global_read_text(const char* name, char* out, size_t out_len);
-bool lua_global_read_number(const char* name, double* out);
+// 读、写都只入队，真正的 Lua 调用由游戏线程在下一次 Lua API 调用时执行
+// （Lua 的读写会分配内存、改栈，渲染线程做会和脚本析构/GC 撞车）。
+bool lua_request_read(const char* name);
+// 取回上一次异步读取的结果；每次新结果只返回一次。
+bool lua_read_take(LuaGlobal* out, char* name_out, size_t name_len);
 bool lua_global_write_string(const char* name, const char* value);
 bool lua_global_write_number(const char* name, double value);
 bool lua_global_write_nil(const char* name);
+// 还没被游戏线程执行的请求条数（面板上显示）。
+int lua_pending_writes();
 
 // 动画探针
 bool lua_anim_read(LuaAnimInfo* out);
@@ -515,6 +599,11 @@ bool lua_bridge_engine_cmd(const char* key, bool* handled, std::string* out_msg)
 
 // 对局时钟（秒）。返回 false 表示当前没有进行中的对局。
 bool battle_clock(float* seconds_out);
+// 对局结束代次：每次"真正退局"（离开对局后连续 500ms 都不在对局里）自增一次。
+// 对局结束的瞬间 TheGameLogic / ThePlayerList 正在拆，头几帧读到 "不在对局" 并不代表拆完了，
+// 直接在那几帧里做恢复动作（改倍率、写全局、解引用玩家列表）就是崩溃来源。
+// 用代次而不是 bool：多个每帧调用者各自记住上次看到的值，谁都不会吞掉别人的事件。
+uint32_t battle_left_generation();
 
 struct FeatureInfo {
   const char* key;
@@ -533,6 +622,10 @@ struct GroupInfo {
 const FeatureInfo* features(int* count);
 const FeatureInfo* find_feature(const char* key);
 const GroupInfo* groups(int* count);
+// 时间类快捷键的 key 列表（原本是「时间控制（快捷键）」分组；现已并入时间控制面板页）。
+const char* const* time_feature_keys(int* count);
+// 动画 / Lua 快捷键的 key 列表（同上，原分组已并入面板页）。
+const char* const* lua_feature_keys(int* count);
 bool feature_enabled(const char* key);
 const char* hotkey_hint(const char* key);  // live binding, e.g. "Ctrl+F1"; null if none
 
@@ -547,5 +640,30 @@ int hotkey_slots_for_feature(const char* feature, int* indices, int cap);
 bool apply_hotkey_text(const char* slot_id, const char* text);
 bool hotkey_capture_active();
 void set_hotkey_capture(bool on);
+
+// ---- 无敌（锁血） ------------------------------------------------------------
+// 只有「无敌 / 解除无敌」两个动作。点一次无敌：先把当时选中的单位血量拉满，
+// 再把它们记进名单，之后每 50ms 给名单里的单位续满血（换选、点别的单位
+// 都不会被加进来）；解除时恢复成正常血量并清空名单。
+bool invincible_apply(bool on, float seconds, int flavor, std::string* out_msg);
+// 当前是否已开启（悬停/状态行用）。
+bool invincible_lock();
+const char* invincible_status();
+// 由 Present 每帧调用（只给名单里的单位续血，不会扩大目标范围）。
+void invincible_tick();
+
+// ---- 空投（箱子） -----------------------------------------------------------
+// 内置箱子表：MoneyCrate / MoneyCrateMP / HealCrate / VeterancyCrate /
+// RandomCrate / BombCrate / UnitCrate / ShroudCrate / AttributeCrate
+int crate_kind_count();
+const char* crate_kind_name(int idx);
+const char* crate_kind_label(int idx);
+// 记录 UI 当前选中的箱子（快捷键与「空投」按钮共用这份选择）。
+void crate_select(int idx, int count);
+int crate_kind_sel();
+// UI 里设置的数量（1..20）。
+int crate_sel_count();
+// 在鼠标落点空投 count 个指定箱子；height 为落地高度偏移。
+bool spawn_crate(int crate_idx, int count, float height, std::string* out_msg);
 
 }  // namespace game_api

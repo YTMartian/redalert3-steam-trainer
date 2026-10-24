@@ -17,6 +17,9 @@ namespace {
 
 IDirect3DDevice9* g_device = nullptr;
 bool g_indexed = false;
+// WIC→D3D texture create is expensive; never decode a whole roster in one frame.
+constexpr int kDecodeBudgetPerFrame = 3;
+int g_decode_left = kDecodeBudgetPerFrame;
 
 struct FileRef {
   const unsigned char* bytes = nullptr;
@@ -613,11 +616,14 @@ std::string cache_key_for(const FileRef& f) {
 
 void set_device(IDirect3DDevice9* device) { g_device = device; }
 
+void begin_frame() { g_decode_left = kDecodeBudgetPerFrame; }
+
 void init(IDirect3DDevice9* device) {
   g_device = device;
   g_indexed = false;
   g_files.clear();
   g_by_name.clear();
+  g_decode_left = kDecodeBudgetPerFrame;
   index_embedded();
 }
 
@@ -643,6 +649,8 @@ IDirect3DTexture9* get(const char* type_key, const char* disp_name, bool is_buil
   const std::string ck = cache_key_for(*ref);
   TexCache& c = g_tex[ck];
   if (c.tried) return c.tex;
+  if (g_decode_left <= 0) return nullptr;  // try again next frame
+  --g_decode_left;
   c.tried = true;
   c.tex = load_png(ref->bytes, ref->size);
   return c.tex;

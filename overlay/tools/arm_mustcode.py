@@ -8,6 +8,10 @@ keystone output and crashed on match).
 Usage:
   python arm_mustcode.py <pid> <mc> <mc2> <flags> <idb> [spectate=0|1]
 
+Every hook site is checked against its recorded AOB before any byte is written;
+sites that disagree are skipped (and named on the result line) instead of being
+blindly overwritten with an E9 jump.
+
 Writes %TEMP%\\ra3_overlay_arm_result.txt with OK/FAIL line.
 """
 from __future__ import print_function
@@ -151,7 +155,9 @@ def main():
     idb = int(sys.argv[5], 0)
     spectate = int(sys.argv[6], 0) if len(sys.argv) > 6 else 0
 
-    module_base = MOD_BASE  # RA3 1.12 has no ASLR
+    # Both ra3_1.12.game and ra3ep1_1.0.game load at 0x400000 with ASLR off and
+    # zero base relocations, so the PE's own image base is the runtime base.
+    module_base = MOD_BASE
 
     h = kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, pid)
     if not h:
@@ -174,36 +180,61 @@ def main():
         write_mem(h, flags + 0x24, b'\xA0\xA5\x86\x65')
         write_mem(h, flags + 0x20, b'\x00\x00\x00\x00')
 
-        # probe PlayerID
-        probe = next(x for x in hooks if x[0] == 'PlayerID')
-        probe_va, probe_aob = probe[1], probe[2]
-        expect = bytes.fromhex(probe_aob)
-        got = read_mem(h, va_of(module_base, probe_va), len(expect))
-        if got != expect:
-            return result(False, 'probe failed @0x%X got %s expect %s' % (
-                va_of(module_base, probe_va), got.hex(), expect.hex()))
+        # Pass 1: verify every site against its AOB before touching any code.
+        # A mismatch means the binary (or another tool) differs, so that hook's
+        # 5-byte E9 would corrupt live instructions -- skip it, keep the rest.
+        def already_armed(addr):
+            head = read_mem(h, addr, 5)
+            if len(head) != 5 or head[0] != 0xE9:
+                return False
+            rel = struct.unpack('<i', head[1:5])[0]
+            dest = addr + 5 + rel
+            return mc <= dest < mc + len(mc_bytes)
 
-        installed = 0
+        todo, skipped = [], []
         for name, hook_va_abs, aob, target_off in hooks:
             if spectate and name in PLAYER_HOOK_NAMES:
                 continue
-            if not spectate:
-                pass  # install all in normal mode (same as trainer normal attach)
             aob_len = len(aob) // 2
+            hook_va = va_of(module_base, hook_va_abs)
+            if aob_len < 5:
+                skipped.append('%s(aob %d<5)' % (name, aob_len))
+                continue
+            expect = bytes.fromhex(aob)
+            got = read_mem(h, hook_va, aob_len)
+            patched = already_armed(hook_va)
+            if got != expect and not patched:
+                note = 'unreadable' if not got else got.hex()
+                if got[:1] == b'\xE9':
+                    note += ' e9-patched'
+                skipped.append('%s(@0x%X %s)' % (name, hook_va, note))
+                continue
             tag = 'mc_' + format(target_off, 'x')
             label_off = LABELS['MC'].get(tag)
             if label_off is None:
-                return result(False, 'missing label %s' % tag)
-            hook_va = va_of(module_base, hook_va_abs)
-            jmp_target = mc + label_off
-            rel = jmp_target - (hook_va + 5)
-            patch = b'\xE9' + struct.pack('<i', rel) + b'\x90' * (aob_len - 5)
-            if not write_code(h, hook_va, patch):
-                return result(False, 'patch %s failed' % name)
-            installed += 1
+                skipped.append('%s(no label %s)' % (name, tag))
+                continue
+            todo.append((name, hook_va, aob_len, mc + label_off, not patched))
 
-        return result(True, 'armed %d hooks for %s mc=0x%X' % (
-            installed, game_name, mc))
+        # Pass 2: patch only the verified sites, and count real successes.
+        armed = 0
+        for name, hook_va, aob_len, jmp_target, needs_patch in todo:
+            if needs_patch:
+                rel = jmp_target - (hook_va + 5)
+                patch = b'\xE9' + struct.pack('<i', rel) + b'\x90' * (aob_len - 5)
+                if not write_code(h, hook_va, patch):
+                    skipped.append('%s(write failed)' % name)
+                    continue
+            armed += 1
+
+        if armed == 0:
+            return result(False, 'no hook armed for %s; rejected: %s' % (
+                game_name, '; '.join(skipped) or 'none matched'))
+        msg = 'armed %d/%d hooks for %s mc=0x%X' % (
+            armed, armed + len(skipped), game_name, mc)
+        if skipped:
+            msg += ' skipped: ' + '; '.join(skipped)
+        return result(True, msg)
     except Exception as exc:
         return result(False, 'exception: %s' % exc)
     finally:

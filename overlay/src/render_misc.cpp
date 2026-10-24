@@ -241,6 +241,19 @@ void misc_read(MiscState* out) {
 void misc_tick() {
   if (!g_cs_ready) return;
 
+  const bool in_battle = battle_clock(nullptr);
+  // 去抖后的"真的退局了"，只用来打一行日志；不再每帧自己判边沿。
+  static uint32_t s_seen_left = 0;
+  const uint32_t left_gen = battle_left_generation();
+  if (left_gen != s_seen_left) {
+    s_seen_left = left_gen;
+    log("misc: battle left — pausing overrides (will resume next match)");
+  }
+
+  // 退出战局 / 不在对局里：绝不写内存。退局时 D3D 与光照对象正在拆掉，
+  // 继续写阴影/光照会卡死 Present。目标值保留，下一局进场后自动再应用。
+  if (!in_battle) return;
+
   // 先把需要的目标值取出来（不要在 __try 里拿锁）。
   bool want_hp = false, hp_val = false;
   bool want_sil = false, sil_val = false;
@@ -483,6 +496,46 @@ bool misc_set_light(int which, const float rgb[3], std::string* out_msg) {
                   rgb[0], rgb[1], rgb[2]);
     *out_msg = buf;
   }
+  return true;
+}
+
+void misc_get_persist(MiscPersist* out) {
+  if (!out) return;
+  *out = MiscPersist{};
+  if (!g_cs_ready) return;
+  EnterCriticalSection(&g_cs);
+  out->shadow_take = g_shadow_take;
+  out->shadow_size = g_shadow_size;
+  out->shadow_dist = g_have_shadow_dist ? g_shadow_dist : 0.f;
+  out->take = g_take_health || g_take_silhouette;
+  out->hide_health = g_hide_health;
+  out->hide_silhouette = g_hide_silhouette;
+  out->light_lock = g_light_lock;
+  LeaveCriticalSection(&g_cs);
+}
+
+bool misc_apply_persist(const MiscPersist& in, std::string* out_msg) {
+  if (!g_cs_ready) {
+    if (out_msg) *out_msg = u8"杂项：还没初始化完成";
+    return false;
+  }
+  EnterCriticalSection(&g_cs);
+  g_take_health = in.take;
+  g_hide_health = in.hide_health;
+  g_take_silhouette = in.take;
+  g_hide_silhouette = in.hide_silhouette;
+  g_shadow_take = in.shadow_take;
+  if (in.shadow_size > 0) g_shadow_size = in.shadow_size;
+  if (in.shadow_dist > 0.f) {
+    g_shadow_dist = in.shadow_dist;
+    g_have_shadow_dist = true;
+  }
+  g_light_lock = in.light_lock;
+  LeaveCriticalSection(&g_cs);
+  log("misc: restored saved settings (size=%d dist=%.0f hideHp=%d hideSil=%d take=%d shadowTake=%d)",
+      in.shadow_size, in.shadow_dist, in.hide_health ? 1 : 0, in.hide_silhouette ? 1 : 0,
+      in.take ? 1 : 0, in.shadow_take ? 1 : 0);
+  if (out_msg) *out_msg = u8"杂项：已恢复上次保存的阴影/隐藏设置";
   return true;
 }
 

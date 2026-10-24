@@ -35,8 +35,12 @@ Present_t g_orig_present = nullptr;
 Reset_t g_orig_reset = nullptr;
 SwapPresent_t g_orig_swap_present = nullptr;
 
+using BeginScene_t = HRESULT(APIENTRY*)(IDirect3DDevice9*);
+BeginScene_t g_orig_begin_scene = nullptr;
+
 void* g_target_end_scene = nullptr;
 void* g_target_present = nullptr;
+void* g_target_begin_scene = nullptr;
 void* g_target_reset = nullptr;
 void* g_target_swap_present = nullptr;
 
@@ -47,6 +51,11 @@ HWND g_game_hwnd = nullptr;
 HANDLE g_hook_thread = nullptr;
 HANDLE g_input_thread = nullptr;
 volatile bool g_stop = false;
+// 卸载时用：还有几帧正卡在 hk_present 里没返回。必须等它归零再让 DLL 走。
+volatile LONG g_present_inflight = 0;
+// 正在卸载：所有 D3D detour 直接转发原函数。FreeLibrary 时游戏还在跑渲染线程，
+// 如果 detour 继续执行 ImGui / 游戏调用，等 DLL 被映射掉就会在裸内存里崩。
+volatile bool g_unloading = false;
 volatile LONG g_endscene_count = 0;
 volatile LONG g_present_count = 0;
 volatile LONG g_swap_present_count = 0;
@@ -252,13 +261,43 @@ void render_overlay_seh(IDirect3DDevice9* device) {
   }
 }
 
+static double qpc_ms_since(LARGE_INTEGER start, LARGE_INTEGER freq) {
+  LARGE_INTEGER now{};
+  QueryPerformanceCounter(&now);
+  if (freq.QuadPart <= 0) return 0.0;
+  return (double)(now.QuadPart - start.QuadPart) * 1000.0 / (double)freq.QuadPart;
+}
+
 void render_overlay(IDirect3DDevice9* device) {
   if (!device || g_skip_draw) {
     return;
   }
+  LARGE_INTEGER freq{}, t0{}, t1{};
+  QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&t0);
+
   game_api::build_lock_tick();
+  LARGE_INTEGER t_bl{};
+  QueryPerformanceCounter(&t_bl);
   game_api::refresh_power_cooldowns();
   game_api::sync_dispel_shroud();
+  LARGE_INTEGER t_pw{};
+  QueryPerformanceCounter(&t_pw);
+  // Roster classify/scan only while 战况统计 is open; otherwise forget-only.
+  game_api::roster_set_active(ui::stats_roster_wanted());
+  game_api::roster_tick();
+  QueryPerformanceCounter(&t1);
+  const double ms_ticks = qpc_ms_since(t0, freq);
+  const double ms_build = (freq.QuadPart > 0)
+                              ? (double)(t_bl.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart
+                              : 0.0;
+  const double ms_pwr = (freq.QuadPart > 0)
+                            ? (double)(t_pw.QuadPart - t_bl.QuadPart) * 1000.0 / (double)freq.QuadPart
+                            : 0.0;
+  const double ms_roster = (freq.QuadPart > 0)
+                               ? (double)(t1.QuadPart - t_pw.QuadPart) * 1000.0 / (double)freq.QuadPart
+                               : 0.0;
+
   // Avoid touching D3D/ImGui during load screens when overlay is closed.
   if (!ui::overlay_visible() && g_ui_ready) {
     return;
@@ -280,36 +319,94 @@ void render_overlay(IDirect3DDevice9* device) {
   }
   // Game may re-disable IME every frame; re-associate while typing.
   // Check after draw so WantTextInput reflects the active InputText this frame.
+  LARGE_INTEGER t_draw0{};
+  QueryPerformanceCounter(&t_draw0);
   ui::begin_frame();
   ui::draw();
   if (ImGui::GetIO().WantTextInput) {
     ensure_ime_enabled(g_game_hwnd);
   }
+  LARGE_INTEGER t_draw1{};
+  QueryPerformanceCounter(&t_draw1);
   ui::end_frame(device);
+  const double ms_ui = qpc_ms_since(t_draw0, freq);
+  const double ms_end = qpc_ms_since(t_draw1, freq);
+  const double ms_total = qpc_ms_since(t0, freq);
+
+  // Log only slow Present draws so we can see which segment hitchs.
+  static DWORD s_next_perf_log = 0;
+  const DWORD now = GetTickCount();
+  if (ms_total >= 8.0 && (int32_t)(now - s_next_perf_log) >= 0) {
+    s_next_perf_log = now + 1000;
+    ImDrawData* dd = ImGui::GetDrawData();
+    game_api::log("perf: overlay total=%.1fms ticks=%.1f (bl=%.1f pwr=%.1f rost=%.1f) "
+                  "ui=%.1f render=%.1f vtx=%d idx=%d cmdlists=%d menu=%d",
+                  ms_total, ms_ticks, ms_build, ms_pwr, ms_roster, ms_ui - ms_end, ms_end,
+                  dd ? dd->TotalVtxCount : 0, dd ? dd->TotalIdxCount : 0,
+                  dd ? dd->CmdListsCount : 0, input::menu_visible() ? 1 : 0);
+  }
 }
 
 HRESULT APIENTRY hk_end_scene(IDirect3DDevice9* device) {
+  if (g_unloading) return g_orig_end_scene(device);
   game_api::drain_unit_spawns();
   InterlockedIncrement(&g_endscene_count);
   // Draw only from Present. Creating the font texture inside EndScene faults d3d9.
   return g_orig_end_scene(device);
 }
 
+// BeginScene 是"场景逻辑已经走完、刚开始画这一帧"的位置：在这里写对象位置，
+// 本帧渲染就会用到我们的值。光在 Present 里写是来不及的——Present 在逻辑之后，
+// 下一次物理更新又会把 z 按回地面，画面就一直是贴地的。
+HRESULT APIENTRY hk_begin_scene(IDirect3DDevice9* device) {
+  if (g_unloading) return g_orig_begin_scene(device);
+  InterlockedIncrement(&g_present_inflight);
+  __try {
+    game_api::air_hold_tick();
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  InterlockedDecrement(&g_present_inflight);
+  return g_orig_begin_scene(device);
+}
+
 HRESULT APIENTRY hk_present(IDirect3DDevice9* device, const RECT* src, const RECT* dst,
                             HWND hwnd, const RGNDATA* dirty) {
+  // 卸载中：立刻转发，绝不再碰 ImGui / 游戏对象。否则这个 detour 会拿着
+  // 即将被 FreeLibrary 掉的代码和资源继续干活（典型表现就是退出/重注入时崩）。
+  if (g_unloading) return g_orig_present(device, src, dst, hwnd, dirty);
+  InterlockedIncrement(&g_present_inflight);
+  LARGE_INTEGER freq{}, t0{};
+  QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&t0);
   game_api::drain_unit_spawns();
+  game_api::air_hold_tick();
   game_api::camera_tick();
   game_api::time_control_tick();
   game_api::lua_bridge_tick();
   game_api::misc_tick();
+  game_api::invincible_tick();
+  ui::pump_pending_settings();
+  LARGE_INTEGER t1{};
+  QueryPerformanceCounter(&t1);
   InterlockedIncrement(&g_present_count);
   render_overlay_seh(device);
+  const double ms_pre = (freq.QuadPart > 0)
+                            ? (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart
+                            : 0.0;
+  static DWORD s_next_pre_log = 0;
+  const DWORD now = GetTickCount();
+  if (ms_pre >= 5.0 && (int32_t)(now - s_next_pre_log) >= 0) {
+    s_next_pre_log = now + 1000;
+    game_api::log("perf: present-pre=%.1fms (drain+camera+time+lua+misc)", ms_pre);
+  }
   const HRESULT hr = g_orig_present(device, src, dst, hwnd, dirty);
   InterlockedExchange(&g_drew_this_frame, 0);
+  InterlockedDecrement(&g_present_inflight);
   return hr;
 }
 
 HRESULT APIENTRY hk_reset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* params) {
+  if (g_unloading) return g_orig_reset(device, params);
   // Do not touch ImGui inside Reset — RA3 match transitions are fragile here.
   InterlockedExchange(&g_skip_draw, 1);
   InterlockedExchange(&g_drew_this_frame, 0);
@@ -324,6 +421,7 @@ HRESULT APIENTRY hk_reset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* param
 
 HRESULT APIENTRY hk_swap_present(IDirect3DSwapChain9* swap, const RECT* src, const RECT* dst,
                                  HWND hwnd, const RGNDATA* dirty, DWORD flags) {
+  if (g_unloading) return g_orig_swap_present(swap, src, dst, hwnd, dirty, flags);
   game_api::drain_unit_spawns();
   InterlockedIncrement(&g_swap_present_count);
   IDirect3DDevice9* device = nullptr;
@@ -396,8 +494,10 @@ bool install_minhooks_from_device(IDirect3DDevice9* device) {
   void* present = vtable[17];
   void* reset = vtable[16];
   void* end_scene = vtable[42];
+  void* begin_scene = vtable[41];
 
-  game_api::log("vtable Present=%p EndScene=%p Reset=%p", present, end_scene, reset);
+  game_api::log("vtable Present=%p EndScene=%p Reset=%p BeginScene=%p", present, end_scene,
+                reset, begin_scene);
 
   if (is_our_module(present) || is_our_module(end_scene)) {
     game_api::log("ERROR: vtable already points into overlay DLL — restart the game, then inject once");
@@ -438,6 +538,18 @@ bool install_minhooks_from_device(IDirect3DDevice9* device) {
       game_api::log("hooked EndScene @ %p", end_scene);
     } else {
       game_api::log("MH_CreateHook EndScene failed: %d", (int)st);
+    }
+  }
+
+  if (is_usable_target(begin_scene) && !g_target_begin_scene) {
+    st = MH_CreateHook(begin_scene, reinterpret_cast<void*>(&hk_begin_scene),
+                       reinterpret_cast<void**>(&g_orig_begin_scene));
+    if (st == MH_OK) {
+      g_target_begin_scene = begin_scene;
+      any = true;
+      game_api::log("hooked BeginScene @ %p (air hold pin point)", begin_scene);
+    } else {
+      game_api::log("MH_CreateHook BeginScene failed: %d", (int)st);
     }
   }
 
@@ -579,31 +691,52 @@ bool start() {
 }
 
 void stop() {
+  // 卸载顺序很重要。游戏这时还在跑渲染线程，注入器是用 FreeLibrary 远程卸载我们的，
+  // 所以：
+  //   1) 先立 unload 旗标 —— 之后的 Present/EndScene 直接转发，不再碰 ImGui / 游戏对象
+  //   2) 还原窗口过程（它是游戏消息循环会进来的指针，必须最先从我们代码上摘掉）
+  //   3) 卸 MinHook（内部会挂起线程，保证没人在 detour/trampoline 里）
+  //   4) 等一下，让还在 detour 尾巴上的帧走完，再停线程
+  //   5) 界面资源不在这里释放：跨线程动 D3D 设备是这套崩溃的另一半原因，
+  //      而且进程随后就没了，泄漏几 MB 纹理远比崩掉划算
+  g_unloading = true;
   g_stop = true;
-  if (g_input_thread) {
-    WaitForSingleObject(g_input_thread, 2000);
-    CloseHandle(g_input_thread);
-    g_input_thread = nullptr;
+  // 先把高频夹持线程停掉：它每 8ms 往游戏内存里写位置，DLL 被卸掉之后还在跑就是
+  // "退出时崩在 dll_unloaded"那一类。它不碰钩子，停在这里最安全。
+  __try {
+    game_api::air_hold_shutdown();
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
   }
-  if (g_hook_thread) {
-    WaitForSingleObject(g_hook_thread, 3000);
-    CloseHandle(g_hook_thread);
-    g_hook_thread = nullptr;
-  }
-  if (g_ui_ready && g_game_hwnd && g_orig_wndproc) {
+  if (g_game_hwnd && g_orig_wndproc) {
     SetWindowLongPtrW(g_game_hwnd, GWLP_WNDPROC,
                       reinterpret_cast<LONG_PTR>(g_orig_wndproc));
     g_orig_wndproc = nullptr;
   }
-  ui::shutdown();
-  g_ui_ready = false;
-  g_game_hwnd = nullptr;
-  g_ui_device = nullptr;
-  if (g_hooked) {
+  if (g_hooked || g_target_present || g_target_end_scene || g_target_reset ||
+      g_target_swap_present || g_target_begin_scene) {
     MH_DisableHook(MH_ALL_HOOKS);
+  }
+  // 等还在 hk_present 里的帧走完（Present 可能被 vsync 卡住），最多等 800ms。
+  for (int i = 0; i < 160; ++i) {
+    if (InterlockedCompareExchange(&g_present_inflight, 0, 0) <= 0) break;
+    Sleep(5);
+  }
+  if (g_hooked) {
     MH_Uninitialize();
     g_hooked = false;
   }
+  auto stop_thread = [](HANDLE& h) {
+    if (!h) return;
+    if (WaitForSingleObject(h, 1200) == WAIT_TIMEOUT) {
+      // 线程要是卡在游戏函数里出不来，就强杀：留着它，等 DLL 被映射掉照样是崩。
+      TerminateThread(h, 0);
+    }
+    CloseHandle(h);
+    h = nullptr;
+  };
+  stop_thread(g_input_thread);
+  stop_thread(g_hook_thread);
+  game_api::log("overlay unhooked (safe unload path)");
 }
 
 }  // namespace d3d9_hook

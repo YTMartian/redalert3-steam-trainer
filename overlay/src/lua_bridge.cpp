@@ -108,6 +108,42 @@ DWORD g_anim_next = 0;
 
 constexpr int kMaxName = 200;
 
+// ---- 跨线程队列：渲染线程只入队，游戏线程执行 -------------------------------
+// 为什么要这么绕：lua_pushstring / lua_pushnumber / lua_tostring(数字) 都会从
+// Lua 堆里分配内存。退对局时脚本状态正在析构，这时从 Present 线程再去分配 /
+// 改栈，游戏随后释放那块内存时就会踩到自己刚被改坏的结构（日志里
+// RA3_1.12.game+00601643 那次 AV 就是这么来的）。
+constexpr int kWriteQueueSize = 16;
+
+struct LuaWrite {
+  int kind;  // 0 = string, 1 = number, 2 = nil, 3 = read (结果写 g_read_result)
+  double number;
+  char name[kMaxName + 1];
+  char value[1025];
+};
+
+LuaWrite g_wq[kWriteQueueSize];
+volatile LONG g_wq_head = 0;   // 渲染线程写
+volatile LONG g_wq_tail = 0;   // 游戏线程读
+volatile LONG g_refresh_req = 0;   // 动画探针刷新请求
+volatile LONG g_probe_log_req = 0; // 刷新后把结果写日志
+volatile LONG g_busy = 0;
+
+// 任意全局变量的异步读取结果（面板「读取」用）。
+struct LuaReadResult {
+  char name[kMaxName + 1];
+  game_api::LuaGlobal value;
+};
+LuaReadResult g_read_result;
+CRITICAL_SECTION g_read_cs;
+bool g_read_cs_ready = false;
+volatile LONG g_read_seq = 0;  // 游戏线程每写一次结果 +1
+
+// 在游戏线程里执行的 Lua 动作（刷新缓存 / 应用写入队列）。
+void game_thread_work(void* L);
+void refresh_anim_game_thread(void* L);
+bool read_global_api(void* L, const char* name, game_api::LuaGlobal* out);
+
 // 捕获候选（在 hook 里跑，只做最轻的事）。
 inline void capture_lua(void* L) {
   ++g_cap_hits;  // 非原子计数，只做「桥是否在工作」的粗略指标
@@ -126,7 +162,7 @@ inline void capture_lua(void* L) {
     if (++g_cand_hits >= 64) {
       InterlockedExchange(&g_lua, static_cast<LONG>(v));
       g_cand_hits = 0;
-      g_announced = false;
+      // Keep g_announced — re-logging on every L flap fopen-hitched Present.
     }
   } else {
     InterlockedExchange(&g_cand, static_cast<LONG>(v));
@@ -135,38 +171,47 @@ inline void capture_lua(void* L) {
 }
 
 // ---- detour ---------------------------------------------------------------
+// 每个 hook 在转发之前，先借"游戏线程正在调用 Lua API"这个时机做本 DLL 的
+// Lua 读写（刷新动画快照、应用写入队列）。这样所有 Lua 访问都发生在游戏线程。
 int __cdecl hk_gettop(void* L) {
   capture_lua(L);
+  game_thread_work(L);
   return g_gettop ? g_gettop(L) : 0;
 }
 
 int __cdecl hk_type(void* L, int idx) {
   capture_lua(L);
+  game_thread_work(L);
   return g_type ? g_type(L, idx) : -1;
 }
 
 const char* __cdecl hk_tostring(void* L, int idx) {
   capture_lua(L);
+  game_thread_work(L);
   return g_tostring ? g_tostring(L, idx) : nullptr;
 }
 
 void __cdecl hk_pushnumber(void* L, double v) {
   capture_lua(L);
+  game_thread_work(L);
   if (g_pushnumber) g_pushnumber(L, v);
 }
 
 void __cdecl hk_pushstring(void* L, const char* s) {
   capture_lua(L);
+  game_thread_work(L);
   if (g_pushstring) g_pushstring(L, s);
 }
 
 void __cdecl hk_getglobal(void* L, const char* name) {
   capture_lua(L);
+  game_thread_work(L);
   if (g_getglobal) g_getglobal(L, name);
 }
 
 void __cdecl hk_setglobal(void* L, const char* name) {
   capture_lua(L);
+  game_thread_work(L);
   if (g_setglobal) g_setglobal(L, name);
 }
 
@@ -199,17 +244,6 @@ bool stack_sane(void* L) {
   return true;
 }
 
-// 弹掉栈顶一个值。用当前的 L->top 计算，所以即使 Lua 自己扩过栈也算对。
-void pop_one(void* L) {
-  __try {
-    uint8_t* p = static_cast<uint8_t*>(L);
-    const uint32_t top = *reinterpret_cast<uint32_t*>(p);
-    const uint32_t base = *reinterpret_cast<uint32_t*>(p + 0x10);
-    if (top >= base + 16u) *reinterpret_cast<uint32_t*>(p) = top - 16u;
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-  }
-}
-
 // 把 Lua 的 double 转成可显示文本（Lua 的 %g 语义）。
 void fmt_number(double v, char* out, size_t len) {
   const double a = v < 0 ? -v : v;
@@ -220,6 +254,148 @@ void fmt_number(double v, char* out, size_t len) {
   } else {
     std::snprintf(out, len, "%.6g", v);
   }
+}
+
+// ---- 游戏线程内的 Lua 操作 --------------------------------------------------
+// 读一个全局变量。只做"压入 -> 取值 -> 还原栈顶"，且不调用会分配内存的
+// lua_tostring（数字直接从 TValue+8 读 double）。调用方必须保证这是游戏线程。
+bool read_global_api(void* L, const char* name, game_api::LuaGlobal* out) {
+  if (out) {
+    out->type = -1;
+    out->number = 0.0;
+    out->text[0] = '\0';
+  }
+  if (!L || !name || !name[0]) return false;
+  if (!g_getglobal || !g_type) return false;
+  if (!stack_sane(L)) return false;
+
+  uint32_t top0 = 0;
+  __try {
+    top0 = *reinterpret_cast<const uint32_t*>(L);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+
+  int type = -1;
+  double num = 0.0;
+  char text[256];
+  text[0] = '\0';
+
+  __try {
+    g_getglobal(L, name);  // 需要 1 个空槽，stack_sane 已保证至少 2 个
+    type = g_type(L, -1);
+    if (type == kTyNumber) {
+      const uint32_t top = *reinterpret_cast<const uint32_t*>(L);
+      if (top >= top0 + 16u) {
+        num = *reinterpret_cast<const double*>(top - 16u + 8u);
+        fmt_number(num, text, sizeof(text));
+      }
+    } else if (type != -1 && type != kTyNil && type != kTyUserdata &&
+               type != kTyLightUserdata && g_tostring) {
+      const char* s = g_tostring(L, -1);
+      if (s) {
+        size_t n = std::strlen(s);
+        if (n > sizeof(text) - 1) n = sizeof(text) - 1;
+        std::memcpy(text, s, n);
+        text[n] = '\0';
+      }
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    type = -1;
+  }
+
+  // 精确还原栈顶：等价于弹掉刚压入的值，即使中途被游戏自身改动过也回到原值。
+  __try {
+    *reinterpret_cast<uint32_t*>(L) = top0;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+
+  if (type == -1) return false;
+  if (out) {
+    out->type = type;
+    out->number = num;
+    std::snprintf(out->text, sizeof(out->text), "%s", text);
+  }
+  return true;
+}
+
+// 应用一条写入请求。必须在游戏线程里调用（pushstring/pushnumber 会分配内存）。
+bool apply_write_locked(void* L, const LuaWrite& w) {
+  if (!L || !g_setglobal || !stack_sane(L)) return false;
+  uint32_t top0 = 0;
+  __try {
+    top0 = *reinterpret_cast<const uint32_t*>(L);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+  bool ok = false;
+  __try {
+    if (w.kind == 0) {
+      if (!g_pushstring) return false;
+      g_pushstring(L, w.value);
+    } else if (w.kind == 1) {
+      if (!g_pushnumber) return false;
+      g_pushnumber(L, w.number);
+    } else {
+      if (!g_pushnil) return false;
+      g_pushnil(L);
+    }
+    g_setglobal(L, w.name);  // 弹掉栈顶
+    ok = true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    ok = false;
+  }
+  __try {
+    *reinterpret_cast<uint32_t*>(L) = top0;  // 异常时也把残留值清掉
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  return ok;
+}
+
+void game_thread_work(void* L) {
+  if (!L) return;
+  if (g_refresh_req == 0 && g_wq_head == g_wq_tail) return;
+  if (InterlockedCompareExchange(&g_busy, 1, 0) != 0) return;
+
+  // 1) 应用渲染线程排队的写入 / 读取。
+  LONG tail = g_wq_tail;
+  const LONG head = g_wq_head;
+  while (tail != head) {
+    const LuaWrite w = g_wq[tail % kWriteQueueSize];
+    if (w.kind == 3) {
+      game_api::LuaGlobal v;
+      if (read_global_api(L, w.name, &v) && g_read_cs_ready) {
+        EnterCriticalSection(&g_read_cs);
+        std::snprintf(g_read_result.name, sizeof(g_read_result.name), "%s", w.name);
+        g_read_result.value = v;
+        LeaveCriticalSection(&g_read_cs);
+        InterlockedIncrement(&g_read_seq);
+        game_api::log("lua: read %s -> %s (%s)", w.name, game_api::lua_type_name(v.type),
+                      v.text[0] ? v.text : "<空>");
+      } else {
+        game_api::log("lua: read %s failed (Lua busy / no such global)", w.name);
+      }
+    } else if (apply_write_locked(L, w)) {
+      if (w.kind == 0) {
+        game_api::log("lua: %s = \"%s\"", w.name, w.value);
+      } else if (w.kind == 1) {
+        char buf[48];
+        fmt_number(w.number, buf, sizeof(buf));
+        game_api::log("lua: %s = %s (number)", w.name, buf);
+      } else {
+        game_api::log("lua: %s = nil", w.name);
+      }
+    } else {
+      game_api::log("lua: write %s failed (Lua busy / stack rejected)", w.name);
+    }
+    ++tail;
+    InterlockedExchange(&g_wq_tail, tail);
+  }
+
+  // 2) 刷新动画探针缓存（真正的读取发生在游戏线程）。
+  if (InterlockedExchange(&g_refresh_req, 0)) refresh_anim_game_thread(L);
+
+  InterlockedExchange(&g_busy, 0);
 }
 
 // ---- 安装 ----------------------------------------------------------------
@@ -308,18 +484,30 @@ const ProbeSlot kAnimProbes[] = {
     {"relativeTime", u8"relativeTime"},
 };
 
-void refresh_anim_locked() {
+// 只在游戏线程（Lua API hook 内部）调用。
+void refresh_anim_game_thread(void* L) {
   game_api::LuaAnimInfo info;
-  game_api::lua_global_read(kAnimProbes[0].name, &info.game_object_address);
-  game_api::lua_global_read(kAnimProbes[1].name, &info.game_object_id);
-  game_api::lua_global_read(kAnimProbes[2].name, &info.will_switch_animation);
-  game_api::lua_global_read(kAnimProbes[3].name, &info.will_switch_pause);
-  game_api::lua_global_read(kAnimProbes[4].name, &info.game_time);
-  game_api::lua_global_read(kAnimProbes[5].name, &info.relative_time);
-  info.valid = true;
+  bool any = false;
+  game_api::LuaGlobal* slots[] = {
+      &info.game_object_address, &info.game_object_id,   &info.will_switch_animation,
+      &info.will_switch_pause,   &info.game_time,        &info.relative_time,
+  };
+  const int count = static_cast<int>(sizeof(slots) / sizeof(slots[0]));
+  for (int i = 0; i < count; ++i) {
+    any = read_global_api(L, kAnimProbes[i].name, slots[i]) || any;
+  }
+  info.valid = any;
   EnterCriticalSection(&g_cs);
   g_anim = info;
   LeaveCriticalSection(&g_cs);
+
+  if (InterlockedExchange(&g_probe_log_req, 0)) {
+    for (int i = 0; i < count; ++i) {
+      game_api::log("lua probe: %s (%s) = %s", kAnimProbes[i].name,
+                    game_api::lua_type_name(slots[i]->type),
+                    slots[i]->text[0] ? slots[i]->text : "<空>");
+    }
+  }
 }
 
 DWORD g_next_diag = 0;
@@ -366,6 +554,10 @@ void lua_bridge_install() {
     InitializeCriticalSection(&g_cs);
     g_cs_ready = true;
   }
+  if (!g_read_cs_ready) {
+    InitializeCriticalSection(&g_read_cs);
+    g_read_cs_ready = true;
+  }
   g_anim = LuaAnimInfo{};
   install_locked();
   log("lua: bridge ready (retail 1.12 only)");
@@ -383,33 +575,17 @@ void lua_bridge_tick() {
       log("lua: captured lua_State* = 0x%X (api hits=%d)", static_cast<uint32_t>(g_lua),
           static_cast<int>(g_cap_hits));
     }
+    // Do not re-log when L pointer flaps; it flooded Present-thread fopen.
+    // 这里只置一个请求标志：真正的读取在游戏线程的下一次 Lua API 调用里。
+    // 对局外不请求，避免在脚本状态析构/重载期间去动 Lua。
     if (!g_anim_next || static_cast<int32_t>(now - g_anim_next) >= 0) {
       g_anim_next = now + 250;  // 4Hz
-      refresh_anim_locked();
+      if (battle_clock(nullptr)) InterlockedExchange(&g_refresh_req, 1);
     }
   }
 
-  if (g_next_diag && static_cast<int32_t>(now - g_next_diag) < 0) return;
-  g_next_diag = now + 5000;
-
-  const PathProbe pp = probe_paths();
-  if (have_lua) {
-    LuaAnimInfo info{};
-    lua_anim_read(&info);
-    log("lua: diag L=0x%X apiHits=%d | animAddr=%s animId=%s switchAnim=%s switchPause=%s"
-        " | path[0xCE231C]=0x%X +0x128=0x%X +0x24=0x%X sane=%d",
-        static_cast<uint32_t>(g_lua), static_cast<int>(g_cap_hits),
-        info.game_object_address.text[0] ? info.game_object_address.text : "-",
-        info.game_object_id.text[0] ? info.game_object_id.text : "-",
-        info.will_switch_animation.text[0] ? info.will_switch_animation.text : "-",
-        info.will_switch_pause.text[0] ? info.will_switch_pause.text : "-", pp.mgr, pp.obj,
-        pp.state, pp.state_sane ? 1 : 0);
-  } else {
-    log("lua: waiting for lua_State* (hook=%d apiHits=%d) | path[0xCE231C]=0x%X +0x128=0x%X"
-        " +0x24=0x%X sane=%d",
-        g_hook_state, static_cast<int>(g_cap_hits), pp.mgr, pp.obj, pp.state,
-        pp.state_sane ? 1 : 0);
-  }
+  // Periodic path/anim diag was fopen-spamming from Present; keep quiet.
+  (void)now;
 }
 
 bool lua_bridge_ready() { return g_hook_state == 1 && g_lua != 0; }
@@ -443,152 +619,71 @@ const char* lua_type_name(int t) {
   }
 }
 
-bool lua_global_read(const char* name, LuaGlobal* out) {
-  if (out) {
-    out->type = -1;
-    out->number = 0.0;
-    out->text[0] = '\0';
+// 异步读取：入队，由游戏线程执行；UI 每帧 poll 一次结果。
+bool lua_request_read(const char* name);
+
+bool lua_read_take(LuaGlobal* out, char* name_out, size_t name_len) {
+  if (!out || !g_read_cs_ready) return false;
+  static LONG s_seen = 0;
+  const LONG seq = g_read_seq;
+  if (seq == s_seen) return false;
+  s_seen = seq;
+  EnterCriticalSection(&g_read_cs);
+  *out = g_read_result.value;
+  if (name_out && name_len) {
+    std::snprintf(name_out, name_len, "%s", g_read_result.name);
   }
+  LeaveCriticalSection(&g_read_cs);
+  return true;
+}
+
+namespace {
+
+// 把一次写入排进队列。真正的 Lua 调用由游戏线程执行（见 game_thread_work）。
+bool enqueue_write(int kind, const char* name, const char* value, double number) {
   if (!name) return false;
   const size_t name_len = std::strlen(name);
   if (name_len == 0 || name_len > kMaxName) return false;
-  if (!g_getglobal || !g_type || !g_tostring) return false;
-
-  void* L = current_lua();
-  if (!L) return false;
-  if (!stack_sane(L)) return false;
-
-  int type = -1;
-  double num = 0.0;
-  char text[256];
-  text[0] = '\0';
-  bool pushed = false;
-
-  __try {
-    g_getglobal(L, name);  // 压入 1 个值
-    pushed = true;
-    type = g_type(L, -1);
-    if (type != -1 && type != kTyNil && type != kTyUserdata && type != kTyLightUserdata) {
-      const char* s = g_tostring(L, -1);
-      if (s) {
-        size_t n = std::strlen(s);
-        if (n > sizeof(text) - 1) n = sizeof(text) - 1;
-        std::memcpy(text, s, n);
-        text[n] = '\0';
-      }
-      if (type == kTyNumber && text[0]) {
-        num = std::strtod(text, nullptr);
-      }
-    }
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    // 异常时也可能已经压进去了，统一在下面弹掉。
+  const LONG head = g_wq_head;
+  if (head - g_wq_tail >= kWriteQueueSize) return false;  // 队列满
+  LuaWrite& w = g_wq[head % kWriteQueueSize];
+  w.kind = kind;
+  w.number = number;
+  std::memcpy(w.name, name, name_len + 1);
+  w.value[0] = '\0';
+  if (value) {
+    const size_t n = std::strlen(value);
+    if (n > sizeof(w.value) - 1) return false;
+    std::memcpy(w.value, value, n + 1);
   }
-  if (pushed) pop_one(L);
-
-  if (type == -1 && text[0] == '\0') return false;
-  if (out) {
-    out->type = type;
-    out->number = num;
-    std::memcpy(out->text, text, sizeof(out->text));
-  }
+  InterlockedExchange(&g_wq_head, head + 1);
   return true;
 }
 
-bool lua_global_read_text(const char* name, char* out, size_t out_len) {
-  if (!out || out_len == 0) return false;
-  out[0] = '\0';
-  LuaGlobal v{};
-  if (!lua_global_read(name, &v)) return false;
-  std::snprintf(out, out_len, "%s", v.text);
-  return true;
-}
+}  // namespace
 
-bool lua_global_read_number(const char* name, double* out) {
-  LuaGlobal v{};
-  if (!lua_global_read(name, &v)) return false;
-  if (out) *out = v.number;
-  return v.type == kTyNumber;
-}
+bool lua_request_read(const char* name) { return enqueue_write(3, name, nullptr, 0.0); }
 
 bool lua_global_write_string(const char* name, const char* value) {
   if (!name || !value) return false;
-  const size_t name_len = std::strlen(name);
-  if (name_len == 0 || name_len > kMaxName) return false;
   if (std::strlen(value) > 1024) return false;
-  if (!g_pushstring || !g_setglobal) return false;
-
-  void* L = current_lua();
-  if (!L || !stack_sane(L)) return false;
-
-  bool ok = false;
-  bool pushed = false;
-  __try {
-    g_pushstring(L, value);
-    pushed = true;
-    g_setglobal(L, name);  // setglobal 会弹掉栈顶那个值
-    pushed = false;
-    ok = true;
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    ok = false;
-  }
-  if (pushed) pop_one(L);
-  if (ok) log("lua: %s = \"%s\"", name, value);
-  return ok;
+  return enqueue_write(0, name, value, 0.0);
 }
 
 bool lua_global_write_number(const char* name, double value) {
   if (!name) return false;
-  const size_t name_len = std::strlen(name);
-  if (name_len == 0 || name_len > kMaxName) return false;
   if (value != value) return false;  // NaN
-  if (!g_pushnumber || !g_setglobal) return false;
-
-  void* L = current_lua();
-  if (!L || !stack_sane(L)) return false;
-
-  bool ok = false;
-  bool pushed = false;
-  __try {
-    g_pushnumber(L, value);
-    pushed = true;
-    g_setglobal(L, name);
-    pushed = false;
-    ok = true;
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    ok = false;
-  }
-  if (pushed) pop_one(L);
-  if (ok) {
-    char buf[48];
-    fmt_number(value, buf, sizeof(buf));
-    log("lua: %s = %s (number)", name, buf);
-  }
-  return ok;
+  return enqueue_write(1, name, nullptr, value);
 }
 
 bool lua_global_write_nil(const char* name) {
   if (!name) return false;
-  const size_t name_len = std::strlen(name);
-  if (name_len == 0 || name_len > kMaxName) return false;
-  if (!g_pushnil || !g_setglobal) return false;
+  return enqueue_write(2, name, nullptr, 0.0);
+}
 
-  void* L = current_lua();
-  if (!L || !stack_sane(L)) return false;
-
-  bool ok = false;
-  bool pushed = false;
-  __try {
-    g_pushnil(L);
-    pushed = true;
-    g_setglobal(L, name);
-    pushed = false;
-    ok = true;
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    ok = false;
-  }
-  if (pushed) pop_one(L);
-  if (ok) log("lua: %s = nil", name);
-  return ok;
+int lua_pending_writes() {
+  const LONG pending = g_wq_head - g_wq_tail;
+  return pending > 0 ? static_cast<int>(pending) : 0;
 }
 
 bool lua_anim_read(LuaAnimInfo* out) {
@@ -624,19 +719,13 @@ bool lua_bridge_engine_cmd(const char* key, bool* handled, std::string* out_msg)
       if (out_msg) *out_msg = u8"Lua 桥未就绪（需要零售版 1.12 且进入对局）";
       return false;
     }
-    char buf[256];
-    int got = 0;
-    for (int i = 0; i < lua_anim_probe_count(); ++i) {
-      LuaGlobal v{};
-      if (!lua_global_read(lua_anim_probe_name(i), &v)) continue;
-      ++got;
-      log("lua probe: %s (%s) = %s", lua_anim_probe_name(i), lua_type_name(v.type),
-          v.text[0] ? v.text : "<空>");
+    // 只发请求：读取必须由游戏线程做，结果写日志。
+    InterlockedExchange(&g_probe_log_req, 1);
+    InterlockedExchange(&g_refresh_req, 1);
+    if (out_msg) {
+      *out_msg = u8"已请求读取动画全局变量：会在游戏线程下一次 Lua 调用时执行，结果见日志";
     }
-    std::snprintf(buf, sizeof(buf), u8"Lua 探针：读到 %d/%d 个动画全局变量（详见日志）", got,
-                  lua_anim_probe_count());
-    if (out_msg) *out_msg = buf;
-    return got > 0;
+    return true;
   }
 
   if (std::strcmp(key, "lua_dump_state") == 0) {

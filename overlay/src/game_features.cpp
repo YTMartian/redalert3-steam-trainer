@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -14,6 +15,8 @@
 #include <map>
 #include <random>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace game_api {
@@ -94,6 +97,19 @@ uint32_t local_owner_for_ops() {
   return 0;
 }
 
+// 归属切换（改动 / 收编）的核心 helper，实现在文件后部（要等 g_live 就位）。
+static uint32_t ent_owner_of(uint32_t ent);
+static uint32_t ent_team_of(uint32_t ent);
+static bool team_owned_by(uint32_t team, uint32_t player);
+static uint32_t player_team_of(uint32_t player);
+static bool engine_set_team(uint32_t ent, uint32_t team);
+static bool assign_entity_to_player(uint32_t ent, uint32_t player, uint32_t team);
+
+// 把指定单位从「无敌」的锁血名单里摘掉（定义在无敌那套静态变量之后）。
+// 返回摘掉的个数。
+// 「残血(1点)」必须能在无敌状态下生效，否则 50ms 后就会被 tick 续满。
+int invincible_release_entities(const std::vector<uint32_t>& ents);
+
 struct SpeedNode {
   uint32_t addr;
 };
@@ -110,14 +126,22 @@ static bool speed_node_sane(uint32_t node) {
   return true;
 }
 
+// 锁血时写进 Body 的血量。
+// 这个数值本身不代表"能扛多少伤害"：真正的不掉血靠每 50ms 把它续满，
+// 所以不需要无限大。1e9 仍在 int32 范围内（引擎内部有 int 转换，
+// 再大就会溢出成负数），同时远远大于任何单次伤害，续血间隔内打不穿。
+constexpr float kHpLockValue = 1.0e9f;
+// 校验上限：要比 kHpLockValue 高一点，否则自己写进去的值下次会被判成脏数据。
+constexpr float kHpSaneMax = 1.5e9f;
+
 static bool hp_object_sane(uint32_t hp) {
   if (!uprising_active()) return true;
   const float cur = read_f32(hp + 4);
   const float mx = read_f32(hp + 0xC);
   const float alt = read_f32(hp + 0x10);
-  if (!(cur >= 0.f && cur <= 1.0e7f)) return false;
-  if (!(mx >= 0.f && mx <= 1.0e7f)) return false;
-  if (!(alt >= 0.f && alt <= 1.0e7f)) return false;
+  if (!(cur >= 0.f && cur <= kHpSaneMax)) return false;
+  if (!(mx >= 0.f && mx <= kHpSaneMax)) return false;
+  if (!(alt >= 0.f && alt <= kHpSaneMax)) return false;
   return true;
 }
 
@@ -171,7 +195,7 @@ bool write_entity_hp(uint32_t ent, const char* mode) {
   if (!is_ptr(hp)) return false;
   if (!hp_object_sane(hp)) return false;
   if (std::strcmp(mode, "max") == 0) {
-    return write_f32(hp + 4, 9999999.f) && write_f32(hp + 0xC, 9999999.f);
+    return write_f32(hp + 4, kHpLockValue) && write_f32(hp + 0xC, kHpLockValue);
   }
   if (std::strcmp(mode, "min") == 0) {
     return write_f32(hp + 4, 1.f);
@@ -186,7 +210,13 @@ bool write_entity_hp(uint32_t ent, const char* mode) {
 // ---- in-process game calls on a worker thread ----
 
 struct CallJob {
-  enum Kind { kCdecl, kThiscallDestroy } kind;
+  enum Kind {
+    kCdecl,
+    kThiscallDestroy,
+    // __thiscall(this, a0[, a1])，被调方自己 ret 4 / ret 8。
+    // 用于引擎的 AttributeModifier 施加 / 解除（它们都是 thiscall + 栈清理）。
+    kThiscallArgs,
+  } kind;
   uint32_t fn = 0;
   uint32_t thisptr = 0;
   uint32_t args[6] = {};
@@ -902,6 +932,28 @@ static DWORD WINAPI call_thread(LPVOID param) {
         call eax
       }
       job->ok = true;
+    } else if (job->kind == CallJob::kThiscallArgs) {
+      const uint32_t fn = job->fn;
+      const uint32_t self = job->thisptr;
+      const uint32_t a0 = job->args[0];
+      const uint32_t a1 = job->args[1];
+      if (job->nargs == 2) {
+        __asm {
+          mov ecx, self
+          push a1
+          push a0
+          mov eax, fn
+          call eax
+        }
+      } else {
+        __asm {
+          mov ecx, self
+          push a0
+          mov eax, fn
+          call eax
+        }
+      }
+      job->ok = true;
     }
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     job->ok = false;
@@ -1116,6 +1168,10 @@ bool apply_hp(const char* mode, const std::vector<uint32_t>* ents_in,
     if (out_msg) *out_msg = u8"没读到选中单位（请先选中）";
     return false;
   }
+  // 「残血(1点)」优先于无敌：先把这些单位从锁血名单里摘掉，再写血量。
+  // 否则无敌 tick 会在 50ms 内把血续满，看起来就像必须手动解除无敌。
+  const int released =
+      std::strcmp(mode, "min") == 0 ? invincible_release_entities(ents) : 0;
   int n = 0;
   for (uint32_t ent : ents) {
     if (write_entity_hp(ent, mode)) ++n;
@@ -1125,8 +1181,13 @@ bool apply_hp(const char* mode, const std::vector<uint32_t>* ents_in,
     return false;
   }
   if (out_msg) {
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), u8"已对 %d 个单位改血量", n);
+    char buf[128];
+    if (released > 0) {
+      std::snprintf(buf, sizeof(buf), u8"已对 %d 个单位改血量（其中 %d 个退出了无敌锁血）", n,
+                    released);
+    } else {
+      std::snprintf(buf, sizeof(buf), u8"已对 %d 个单位改血量", n);
+    }
     *out_msg = buf;
   }
   return true;
@@ -1226,9 +1287,10 @@ bool convert_selected(std::string* out_msg) {
     return false;
   }
   int n = 0;
+  const uint32_t owner_team = player_team_of(owner);
   for (uint32_t ent : ents) {
     if (read_u32(ent + 0x418) == owner) continue;
-    if (write_u32(ent + 0x418, owner)) ++n;
+    if (assign_entity_to_player(ent, owner, owner_team)) ++n;
   }
   if (n == 0) {
     if (out_msg) *out_msg = u8"选中单位已是己方或写入失败";
@@ -1369,19 +1431,44 @@ static void read_player_display_name(uint32_t player, char* out, size_t out_len)
   }
 }
 
+// Case-insensitive substring (RA3 type ids mix CamelCase and ALLCAPS CSF keys).
+static bool id_has_token(const char* id, const char* tok) {
+  if (!id || !tok || !tok[0]) return false;
+  const size_t n = std::strlen(id);
+  const size_t m = std::strlen(tok);
+  if (m > n) return false;
+  for (size_t i = 0; i + m <= n; ++i) {
+    if (_strnicmp(id + i, tok, m) == 0) return true;
+  }
+  return false;
+}
+
+// BFI / Sage KindOf STRUCTURE analogue: name tokens the engine uses for
+// buildings. Units like AlliedAntiStructureVehicle must stay units.
 static bool type_id_is_building(const char* id) {
   if (!id || !id[0]) return false;
+  if (id_has_token(id, "AntiStructure")) return false;
   static const char* kBuild[] = {
-      "Barracks", "WarFactory", "Factory", "PowerPlant", "Refinery",
+      "Barracks", "WarFactory", "PowerPlant", "Refinery",
       "ConstructionYard", "ConYard", "NavalYard", "Shipyard", "Airfield",
-      "Outpost", "Crane", "BaseDefense", "WallHub", "TeslaWallHub",
+      "Outpost", "Crane", "BaseDefense", "WallHub", "TeslaWallHub", "WallPiece",
       "TechStructure", "Chronosphere", "ProtonCollider", "IronCurtain",
       "VacuumImploder", "SuperWeapon", "Nanotech", "Psionic", "Bunker",
-      "Hospital", "Garage", "Observation", "OilDerrick", "OreNode",
+      "VIPBunker", "Hospital", "Garage", "Observation", "OilDerrick", "OreNode",
       "TechBuilding", "ShipYardTech", "AirportTech", "Veterancy",
-      "DefensiveStructure", "CommandHub", "Egg"};
+      "DefensiveStructure", "CommandHub", "Egg", "Nanocore", "NanoHive",
+      "FloatingFortress", "VolcanoFortress", "EconomicStructure",
+  };
   for (const char* b : kBuild) {
-    if (std::strstr(id, b)) return true;
+    if (id_has_token(id, b)) return true;
+  }
+  // Bare "...Factory" (WarFactory already matched); avoid random "Factory" in
+  // non-building ids by requiring a faction / Build prefix nearby.
+  if (id_has_token(id, "Factory") &&
+      (id_has_token(id, "War") || id_has_token(id, "Allied") ||
+       id_has_token(id, "Soviet") || id_has_token(id, "Japan") ||
+       id_has_token(id, "Build"))) {
+    return true;
   }
   return false;
 }
@@ -1389,18 +1476,20 @@ static bool type_id_is_building(const char* id) {
 static bool looks_like_entity(uint32_t ent) {
   if (!is_ptr(ent)) return false;
   uint32_t ow = 0, unit_data = 0;
-  if (!safe_read_u32(ent + 0x418, &ow) || !is_ptr(ow)) return false;
+  if (!safe_read_u32(ent + ent_off(kEntOwner, kEntOwnerEp1), &ow) || !is_ptr(ow)) {
+    return false;
+  }
   if (!safe_read_u32(ent + 4, &unit_data) || !is_ptr(unit_data)) return false;
   return true;
 }
 
 static bool entity_alive(uint32_t ent) {
   uint32_t hp = 0;
-  if (!safe_read_u32(ent + 0x33C, &hp) || !is_ptr(hp)) return true;
+  if (!safe_read_u32(ent + ent_off(kEntHp, kEntHpEp1), &hp) || !is_ptr(hp)) return true;
   float cur = 0.f, mx = 0.f;
   if (!safe_read_bytes(hp + 4, &cur, sizeof(cur))) return true;
   safe_read_bytes(hp + 0x10, &mx, sizeof(mx));
-  if (!(cur == cur) || cur > 1.0e8f || cur < -1.f) return true;  // NaN / garbage
+  if (!(cur == cur) || cur > kHpSaneMax || cur < -1.f) return true;  // NaN / garbage
   // Only drop clearly-dead objects (max HP known and current is ~0).
   if (mx > 1.f && cur <= 0.5f) return false;
   return true;
@@ -1409,11 +1498,704 @@ static bool entity_alive(uint32_t ent) {
 static bool entity_belongs_to(uint32_t ent, uint32_t player, uint32_t /*player_id*/) {
   if (!looks_like_entity(ent) || !is_ptr(player)) return false;
   uint32_t ow = 0;
-  if (!safe_read_u32(ent + 0x418, &ow) || !is_ptr(ow)) return false;
+  if (!safe_read_u32(ent + ent_off(kEntOwner, kEntOwnerEp1), &ow) || !is_ptr(ow)) {
+    return false;
+  }
   // Owner must be this Player object. player+0x20 is shared by faction/team
   // and would dump another seat's army onto the first matching player.
   return ow == player;
 }
+
+// ===========================================================================
+// 真无敌：AttributeModifier 通道
+//
+// 为什么不是"改血量"：把 [Body+4]/[Body+0xC] 写成 9999999.0f 只是把血条拉长，
+// 伤害照样进 —— 按百分比结算的伤害、直接 kill/shatter 的路径、以及引擎重算
+// 血量上限后把当前值 clamp 回去，任何一条都能让它失效（冰冻后掉血快就是这个）。
+//
+// 真正的免疫是引擎自己的 AttributeModifier，原版就有（WBStringHashes.big 可查）：
+//   AttributeModifier_IronCurtain          0x6516AA2D  无敌 + 铁幕外观
+//   AttributeModifier_InvulnerabilityCrate 0x37C61161  无敌、无外观
+//
+// 两条调用链（__thiscall，被调方自己清栈；地址按特征码现场定位，双版本通用）：
+//   施加  AttributeModifier 施加  (Thing, modifier*, frames)  ret 8
+//   解除  AttributeModifier 解除  (Thing, modifier*)          ret 4
+//
+// 唯一没有照抄的是"查表"：日冕版把 modifier 库暴露成 (库哈希, 名称哈希, out)，
+// 原版则把库写死在全局 0xCD7ADC，参数里的哈希是"库内键"。而那个查表函数是
+// find-or-create —— 猜错键会往游戏的表里塞垃圾条目。所以这里改成只读内存扫描：
+//   在哈希树节点上 node+0x10 = 名称哈希、node+0x14 = modifier 对象。
+// 依据 0x4A6F50 的反汇编：`cmp dword ptr [ecx+0x10], ebp` 后 `mov eax, [edx+0x14]` / ret。
+// 校验三道：哈希相等 / 树链接像指针 / [modifier] 是游戏模块内的 vtable。
+// ===========================================================================
+
+constexpr uint32_t kHashIronCurtain = 0x6516AA2Du;  // AttributeModifier_IronCurtain（有外观）
+// 已用引擎自己的哈希函数验算：MAP_INVULNERABLE_Up 的真实 Key 是 0xF24F7254，
+// 之前那个 0x508D8641 是另一份构建/模组里的常量，在零售版查不到，别再用了。
+// 零售版映像里确实存在这个字符串：AttributeModifier_InvulnerabilityCrate
+constexpr uint32_t kHashInvulnCrate = 0x37C61161u;
+constexpr uint32_t kModStoreHash = 0xC5E07887u;      // 全局 modifier 库容器哈希
+
+// 施加（22 字节版，两个游戏版本里都只有 1 处）：56 57 8B 7C 24 0C 85 FF 8B F1 75 07
+// 5F 32 C0 5E C2 08 00 8B 8E
+static const uint8_t kSigModApply[] = {0x56, 0x57, 0x8B, 0x7C, 0x24, 0x0C, 0x85, 0xFF,
+                                       0x8B, 0xF1, 0x75, 0x07, 0x5F, 0x32, 0xC0, 0x5E,
+                                       0xC2, 0x08, 0x00, 0x8B, 0x8E};
+// 解除：56 57 8B 7C 24 0C 83 7F 04 00 8B F1 74 64（唯一）
+static const uint8_t kSigModRemove[] = {0x56, 0x57, 0x8B, 0x7C, 0x24, 0x0C, 0x83,
+                                        0x7F, 0x04, 0x00, 0x8B, 0xF1, 0x74, 0x64};
+// modifier 库查表 __cdecl(容器哈希, 名字哈希, out) -> AttributeModifier*：55 8B 6C 24 0C 85 ED 75
+static const uint8_t kSigModFind[] = {0x55, 0x8B, 0x6C, 0x24, 0x0C, 0x85, 0xED, 0x75};
+
+struct ModApi {
+  uint32_t apply = 0;
+  uint32_t remove = 0;
+  uint32_t find = 0;
+  bool ok = false;
+  char note[192] = {};
+};
+static ModApi g_mod_api;
+static uint32_t g_mod_api_base = 0;
+
+struct ModNode {
+  uint32_t hash = 0;
+  uint32_t mod = 0;
+};
+static ModNode g_mod_nodes[8];
+static int g_mod_node_n = 0;
+static uint32_t g_mod_node_base = 0;
+static uint32_t g_mod_miss_hash = 0;   // 上次没找到的哈希（避免每帧重扫堆）
+static DWORD g_mod_miss_tick = 0;
+
+static bool image_range(uint32_t* lo, uint32_t* hi) {
+  const uint32_t base = loaded_module();
+  if (!base) return false;
+  __try {
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    const auto* nt =
+        reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    *lo = base;
+    *hi = base + nt->OptionalHeader.SizeOfImage;
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
+// 在游戏模块映像里找特征码，最多收 max_hits 个。
+static int find_sig_all(const uint8_t* sig, int sig_len, uint32_t* hits, int max_hits) {
+  uint32_t lo = 0, hi = 0;
+  if (!image_range(&lo, &hi) || !sig || sig_len <= 0 || !hits || max_hits <= 0) return 0;
+  int n = 0;
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(lo);
+  const size_t span = hi - lo;
+  if (span <= static_cast<size_t>(sig_len)) return 0;
+  __try {
+    for (size_t i = 0; i + static_cast<size_t>(sig_len) <= span && n < max_hits; ++i) {
+      if (p[i] != sig[0]) continue;
+      if (std::memcmp(p + i, sig, static_cast<size_t>(sig_len)) == 0) {
+        hits[n++] = lo + static_cast<uint32_t>(i);
+      }
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  return n;
+}
+
+// 施加和解除在二进制里紧挨着（解除 = 施加 + 0x90，两个版本都成立）。
+// 不硬编码这个距离：先按特征码各找一遍，只接受满足 "apply + 0x90 == remove" 的那一对。
+static void resolve_modifier_api() {
+  const uint32_t base = loaded_module();
+  if (!base) return;
+  if (g_mod_api.ok && g_mod_api_base == base) return;
+  g_mod_api = ModApi{};
+  g_mod_api_base = base;
+
+  uint32_t rem[4] = {};
+  uint32_t app[8] = {};
+  uint32_t fnd[4] = {};
+  const int nrem = find_sig_all(kSigModRemove, sizeof(kSigModRemove), rem, 4);
+  const int napp = find_sig_all(kSigModApply, sizeof(kSigModApply), app, 8);
+  const int nfnd = find_sig_all(kSigModFind, sizeof(kSigModFind), fnd, 4);
+  if (nrem != 1) {
+    std::snprintf(g_mod_api.note, sizeof(g_mod_api.note),
+                  u8"modifier 解除函数特征码命中 %d 处（应为 1，版本不匹配）", nrem);
+    return;
+  }
+  uint32_t picked = 0;
+  for (int i = 0; i < napp; ++i) {
+    if (app[i] + 0x90u == rem[0]) {
+      picked = app[i];
+      break;
+    }
+  }
+  if (!picked) {
+    std::snprintf(g_mod_api.note, sizeof(g_mod_api.note),
+                  u8"modifier 施加函数没定位到（施加 %d 处，解除 @%08X）", napp,
+                  (unsigned)rem[0]);
+    return;
+  }
+  g_mod_api.apply = picked;
+  g_mod_api.remove = rem[0];
+  if (nfnd == 1) {
+    g_mod_api.find = fnd[0];
+  } else {
+    std::snprintf(g_mod_api.note, sizeof(g_mod_api.note),
+                  u8"modifier 查表函数特征码命中 %d 处（应为 1）", nfnd);
+  }
+  g_mod_api.ok = true;
+  log("modifier api: apply=%08X remove=%08X find=%08X", (unsigned)g_mod_api.apply,
+      (unsigned)g_mod_api.remove, (unsigned)g_mod_api.find);
+}
+
+// [modifier] 是否像一个真的 AttributeModifier。
+// 注意：零售版里 AttributeModifier 没有 vtable（SAGE 的 RefCountClass 不是多态类），
+// 之前拿「首字段是映像内 vtable」来判断，会把查到的合法对象全判成垃圾——
+// 这就是「未解析」的真正原因。现在改成只做可读性检查。
+static bool looks_like_attribute_modifier(uint32_t mod) {
+  if (!is_ptr(mod)) return false;
+  uint32_t f0 = 0, f4 = 0, f8 = 0, fc = 0;
+  if (!safe_read_u32(mod, &f0)) return false;
+  if (!safe_read_u32(mod + 4, &f4)) return false;
+  if (!safe_read_u32(mod + 8, &f8)) return false;
+  if (!safe_read_u32(mod + 0xC, &fc)) return false;
+  // 全 0 的块基本是「表头/占位」，不像 modifier。
+  if (!f0 && !f4 && !f8 && !fc) return false;
+  return true;
+}
+
+// 严格版：首字段必须指向映像内（只有做堆扫描兜底时才需要这么严）。
+static bool modifier_has_vtable(uint32_t mod) {
+  if (!is_ptr(mod)) return false;
+  uint32_t vt = 0;
+  if (!safe_read_u32(mod, &vt)) return false;
+  uint32_t lo = 0, hi = 0;
+  if (!image_range(&lo, &hi)) return false;
+  return vt >= lo && vt < hi;
+}
+
+static bool is_committed_readable(DWORD state, DWORD protect) {
+  if (state != MEM_COMMIT) return false;
+  if (protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+  const DWORD p = protect & 0xFFu;
+  return p == PAGE_READONLY || p == PAGE_READWRITE || p == PAGE_WRITECOPY ||
+         p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE ||
+         p == PAGE_EXECUTE_WRITECOPY;
+}
+
+// 走引擎自己的 modifier 库查表：__cdecl(容器哈希, 键, 0) -> AttributeModifier*
+// 键既可能是「名字哈希」，也可能是「驻留名字字符串的地址」，两种都试。
+static uint32_t modifier_lookup_key(uint32_t key) {
+  if (!g_mod_api.ok || !g_mod_api.find) return 0;
+  using Find_t = uint32_t(__cdecl*)(uint32_t, uint32_t, uint32_t);
+  uint32_t mod = 0;
+  __try {
+    mod = reinterpret_cast<Find_t>(g_mod_api.find)(kModStoreHash, key, 0);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return 0;
+  }
+  return looks_like_attribute_modifier(mod) ? mod : 0;
+}
+
+static uint32_t modifier_lookup_engine(uint32_t hash) { return modifier_lookup_key(hash); }
+
+// 在游戏模块映像里找一段 ASCII 字面量，命中返回它的 VA。
+static int image_find_literal(const char* s, uint32_t* out, int max_out) {
+  uint32_t lo = 0, hi = 0;
+  if (!s || !s[0] || !out || max_out <= 0) return 0;
+  if (!image_range(&lo, &hi)) return 0;
+  const size_t n = std::strlen(s);
+  int got = 0;
+  __try {
+    const auto* p = reinterpret_cast<const uint8_t*>(lo);
+    const size_t span = hi - lo;
+    for (size_t i = 0; i + n < span && got < max_out; ++i) {
+      const void* hit = std::memchr(p + i, s[0], span - i - n);
+      if (!hit) break;
+      const auto* c = static_cast<const uint8_t*>(hit);
+      i = static_cast<size_t>(c - p);
+      if (std::memcmp(c, s, n) == 0) out[got++] = lo + static_cast<uint32_t>(i);
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  return got;
+}
+
+// 取一个 modifier 对象：先问引擎，查不到再退回堆扫描（兼容改过容器哈希的版本）。
+static uint32_t find_modifier_by_hash(uint32_t hash, char* why, size_t why_n) {
+  const uint32_t base = loaded_module();
+  if (!base) {
+    if (why && why_n) std::snprintf(why, why_n, u8"游戏模块未加载");
+    return 0;
+  }
+  if (g_mod_node_base != base) {
+    g_mod_node_n = 0;
+    g_mod_node_base = base;
+  }
+  for (int i = 0; i < g_mod_node_n; ++i) {
+    if (g_mod_nodes[i].hash == hash) return g_mod_nodes[i].mod;
+  }
+  // 查表失败过就冷却一阵：UI 每帧都会来问，不能每帧扫一遍堆。
+  const DWORD now_tick = GetTickCount();
+  if (g_mod_miss_hash == hash && g_mod_miss_tick &&
+      static_cast<int32_t>(now_tick - g_mod_miss_tick) < 30000) {
+    if (why && why_n) std::snprintf(why, why_n, u8"30 秒内不再重扫");
+    return 0;
+  }
+
+  const uint32_t via_engine = modifier_lookup_engine(hash);
+  if (via_engine) {
+    if (g_mod_node_n < (int)(sizeof(g_mod_nodes) / sizeof(g_mod_nodes[0]))) {
+      g_mod_nodes[g_mod_node_n].hash = hash;
+      g_mod_nodes[g_mod_node_n].mod = via_engine;
+      ++g_mod_node_n;
+    }
+    if (why && why_n) std::snprintf(why, why_n, u8"engine@%08X", (unsigned)via_engine);
+    return via_engine;
+  }
+
+  const uint8_t low = static_cast<uint8_t>(hash & 0xFFu);
+  const uint8_t b1 = static_cast<uint8_t>((hash >> 8) & 0xFFu);
+  const uint8_t b2 = static_cast<uint8_t>((hash >> 16) & 0xFFu);
+  const uint8_t b3 = static_cast<uint8_t>((hash >> 24) & 0xFFu);
+  int key_hits = 0, node_hits = 0;
+
+  SYSTEM_INFO si{};
+  GetSystemInfo(&si);
+  auto* p = static_cast<uint8_t*>(si.lpMinimumApplicationAddress);
+  auto* end = static_cast<uint8_t*>(si.lpMaximumApplicationAddress);
+  while (p < end) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi)) break;
+    const size_t size = mbi.RegionSize;
+    auto* region = static_cast<uint8_t*>(mbi.BaseAddress);
+    auto* next = region + size;
+    if (is_committed_readable(mbi.State, mbi.Protect) && size >= 24) {
+      // memchr 先按最低字节筛，避免逐 dword 走 2GB。
+      const uint8_t* lim = region + size - 24;
+      for (const uint8_t* q = region; q <= lim;) {
+        const void* hit = std::memchr(q, low, static_cast<size_t>(lim - q) + 1);
+        if (!hit) break;
+        const auto* c = static_cast<const uint8_t*>(hit);
+        q = c + 1;
+        const uint32_t at = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(c));
+        if (at & 3u) continue;                        // 哈希是 4 字节对齐写的
+        if (c[1] != b1 || c[2] != b2 || c[3] != b3) continue;
+        ++key_hits;
+        if (at < 0x10000) continue;
+        // 树节点布局：node+0x00 left / +0x04 right / +0x10 key / +0x14 value
+        uint32_t left = 0, right = 0, mod = 0;
+        if (!safe_read_u32(at - 0x10, &left) || !safe_read_u32(at - 0x0C, &right)) continue;
+        if (!safe_read_u32(at + 4, &mod)) continue;
+        if (!looks_like_attribute_modifier(mod)) continue;
+        auto link_ok = [at](uint32_t v) {
+          if (v == 0) return true;
+          if (!is_ptr(v)) return false;
+          const uint32_t d = (v > at) ? (v - at) : (at - v);
+          return d < (64u << 20);                     // 树节点在同一个堆里
+        };
+        if (!link_ok(left) || !link_ok(right)) continue;
+        ++node_hits;
+        if (g_mod_node_n < (int)(sizeof(g_mod_nodes) / sizeof(g_mod_nodes[0]))) {
+          g_mod_nodes[g_mod_node_n].hash = hash;
+          g_mod_nodes[g_mod_node_n].mod = mod;
+          ++g_mod_node_n;
+        }
+        log("modifier %08X: key@%08X mod=%08X vt=%08X", (unsigned)hash, (unsigned)at,
+            (unsigned)mod, (unsigned)read_u32(mod));
+        if (why && why_n) {
+          std::snprintf(why, why_n, u8"node@%08X", (unsigned)at);
+        }
+        return mod;
+      }
+    }
+    if (next <= p) break;
+    p = next;
+  }
+  if (why && why_n) {
+    std::snprintf(why, why_n, u8"没找到（哈希命中 %d 次，像节点的 %d 个）", key_hits, node_hits);
+  }
+  g_mod_miss_hash = hash;
+  g_mod_miss_tick = GetTickCount();
+  return 0;
+}
+
+// 零售版 / 起义时刻的 modifier 名字和哈希常量不一定对得上（那套常量来自另一份
+// 构建）。这里按「候选哈希 → 候选名字的驻留字符串指针 → 堆扫描」逐级试，
+// 成功一次就缓存，失败也缓存 15 秒避免 UI 每帧重试。
+static uint32_t g_inv_mod[2] = {0, 0};
+static uint8_t g_inv_mod_tried[2] = {0, 0};
+static DWORD g_inv_mod_tick[2] = {0, 0};
+static char g_inv_mod_how[2][128] = {};
+
+// 引擎自己的「名字 → Key」哈希函数（实现见下）：hash(s, len, len, 1)。
+static uint32_t name_hash(const char* name);
+
+static uint32_t resolve_invuln_modifier(int flavor, char* why, size_t why_n) {
+  flavor = (flavor == 1) ? 1 : 0;
+  auto set_why = [why, why_n](const char* fmt, ...) {
+    if (!why || !why_n) return;
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(why, why_n, fmt, ap);
+    va_end(ap);
+  };
+  if (g_inv_mod[flavor]) {
+    if (why && why_n) std::snprintf(why, why_n, "%s", g_inv_mod_how[flavor]);
+    return g_inv_mod[flavor];
+  }
+  resolve_modifier_api();
+  if (!g_mod_api.ok) {
+    set_why("%s", g_mod_api.note);
+    return 0;
+  }
+  const DWORD now = GetTickCount();
+  if (g_inv_mod_tried[flavor] &&
+      static_cast<int32_t>(now - g_inv_mod_tick[flavor]) < 15000) {
+    set_why(u8"15 秒内不再重试");
+    return 0;
+  }
+  g_inv_mod_tried[flavor] = 1;
+  g_inv_mod_tick[flavor] = now;
+
+  // 0x6516AA2D / 0x37C61161 已经用引擎自己的哈希函数验算过：
+  //   AttributeModifier_IronCurtain            -> 6516AA2D
+  //   AttributeModifier_InvulnerabilityCrate   -> 37C61161
+  const uint32_t hashes[2] = {
+      flavor ? kHashInvulnCrate : kHashIronCurtain,
+      flavor ? kHashIronCurtain : kHashInvulnCrate,
+  };
+  for (uint32_t h : hashes) {
+    const uint32_t m = modifier_lookup_key(h);
+    log("invincible: find(hash=%08X) -> %08X", (unsigned)h, (unsigned)m);
+    if (m) {
+      g_inv_mod[flavor] = m;
+      std::snprintf(g_inv_mod_how[flavor], sizeof(g_inv_mod_how[flavor]), "hash@%08X",
+                    (unsigned)h);
+      if (why && why_n) std::snprintf(why, why_n, "%s", g_inv_mod_how[flavor]);
+      return m;
+    }
+  }
+
+  // 用引擎自己的哈希函数现算候选名字的 Key，再查库（哈希不写死，换版本也认）。
+  const char* const ordered[4] = {
+      flavor ? "AttributeModifier_InvulnerabilityCrate" : "AttributeModifier_IronCurtain",
+      flavor ? "AttributeModifier_IronCurtain" : "AttributeModifier_InvulnerabilityCrate",
+      "AttributeModifier_Invulnerability",
+      "AttributeModifier_Invulnerable",
+  };
+  for (const char* name : ordered) {
+    const uint32_t h = name_hash(name);
+    if (!h) continue;
+    const uint32_t m = modifier_lookup_key(h);
+    log("invincible: find(%s hash=%08X) -> %08X", name, (unsigned)h, (unsigned)m);
+    if (m) {
+      g_inv_mod[flavor] = m;
+      std::snprintf(g_inv_mod_how[flavor], sizeof(g_inv_mod_how[flavor]), "%s", name);
+      if (why && why_n) std::snprintf(why, why_n, "%s@%08X", name, (unsigned)h);
+      return m;
+    }
+  }
+
+  char scan_why[192] = {};
+  const uint32_t via_scan = find_modifier_by_hash(hashes[0], scan_why, sizeof(scan_why));
+  if (via_scan) {
+    g_inv_mod[flavor] = via_scan;
+    std::snprintf(g_inv_mod_how[flavor], sizeof(g_inv_mod_how[flavor]), "scan(%s)", scan_why);
+    if (why && why_n) std::snprintf(why, why_n, "%s", g_inv_mod_how[flavor]);
+    return via_scan;
+  }
+  set_why(u8"库里没有（%s）", scan_why);
+  return 0;
+}
+
+// 引擎自己的「名字 → Key」哈希函数。找法：映像里有字符串
+// "AttributeModifier_InvulnerabilityCrate"，箱子的模块初始化代码是
+//   push <字符串VA>; call nameHash  ->  再用结果去 modifier 库里查。
+// 所以顺着这条引用就能把哈希函数挖出来（零售版 RVA 0x18040，起义时刻 0x17F2C）。
+static uint32_t g_name_hash_fn = 0;
+static bool g_name_hash_tried = false;
+
+static uint32_t resolve_name_hash_fn() {
+  if (g_name_hash_tried) return g_name_hash_fn;
+  g_name_hash_tried = true;
+  uint32_t lo = 0, hi = 0;
+  if (!image_range(&lo, &hi)) return 0;
+  uint32_t addr[1] = {};
+  if (image_find_literal("AttributeModifier_InvulnerabilityCrate", addr, 1) <= 0) {
+    log("name hash: literal not found in image");
+    return 0;
+  }
+  const uint32_t sva = addr[0];
+  const auto* img = reinterpret_cast<const uint8_t*>(lo);
+  const size_t span = hi - lo;
+  __try {
+    for (size_t i = 0; i + 12 < span; ++i) {
+      if (img[i] != 0x68) continue;  // push imm32
+      uint32_t imm = 0;
+      std::memcpy(&imm, img + i + 1, 4);
+      if (imm != sva) continue;
+      for (size_t k = i + 5; k + 5 <= i + 14; ++k) {
+        if (img[k] != 0xE8) continue;  // call rel32
+        int32_t rel = 0;
+        std::memcpy(&rel, img + k + 1, 4);
+        const uint32_t tgt = static_cast<uint32_t>(lo + k + 5 + static_cast<uint32_t>(rel));
+        if (tgt < lo || tgt >= hi) continue;
+        g_name_hash_fn = tgt;
+        log("name hash: fn @%08X (from ref @%08X)", (unsigned)tgt, (unsigned)(lo + i));
+        return g_name_hash_fn;
+      }
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  log("name hash: no call reference found");
+  return 0;
+}
+
+// 和引擎完全一样的调用方式：hash(s, len, len, 1)。
+static uint32_t name_hash(const char* name) {
+  const uint32_t fn = resolve_name_hash_fn();
+  if (!is_ptr(fn) || !name || !name[0]) return 0;
+  const int n = static_cast<int>(std::strlen(name));
+  using Hash_t = uint32_t(__cdecl*)(const char*, int, int, int);
+  __try {
+    return reinterpret_cast<Hash_t>(fn)(name, n, n, 1);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return 0;
+  }
+}
+static bool modifier_invoke(uint32_t ent, uint32_t mod, int frames, bool remove,
+                            bool on_game_thread) {
+  if (!g_mod_api.ok || !is_ptr(ent) || !is_ptr(mod)) return false;
+  if (on_game_thread) {
+    using Apply_t = int(__thiscall*)(void*, uint32_t, int);
+    using Remove_t = int(__thiscall*)(void*, uintptr_t);
+    __try {
+      if (remove) {
+        reinterpret_cast<Remove_t>(g_mod_api.remove)(reinterpret_cast<void*>(ent), mod);
+      } else {
+        reinterpret_cast<Apply_t>(g_mod_api.apply)(reinterpret_cast<void*>(ent), mod, frames);
+      }
+      return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      return false;
+    }
+  }
+  CallJob job{};
+  job.kind = CallJob::kThiscallArgs;
+  job.thisptr = ent;
+  job.args[0] = mod;
+  job.args[1] = static_cast<uint32_t>(frames);
+  job.nargs = remove ? 1 : 2;
+  job.fn = remove ? g_mod_api.remove : g_mod_api.apply;
+  return run_job(job);
+}
+
+static std::vector<uint32_t> scope_entities(int cap = 1024) {
+  std::vector<uint32_t> out;
+  std::vector<uint32_t> buf(cap > 0 ? static_cast<size_t>(cap) : 0u);
+  if (buf.empty()) return out;
+  const int n = unit_collect_scope(buf.data(), cap);
+  out.reserve(static_cast<size_t>(n > 0 ? n : 0));
+  for (int i = 0; i < n; ++i) out.push_back(buf[static_cast<size_t>(i)]);
+  return out;
+}
+
+// 无敌 = 锁血。点一次「无敌」先把**当时选中**那批单位的血量拉满，
+// 再把这批单位记进名单；之后每 50ms 只给名单里的单位续满。
+// 换选、点别的单位都不会被加进来——旧实现每帧重读当前选择，才会「点谁谁无敌」。
+static bool g_inv_active = false;
+static std::vector<uint32_t> g_inv_targets;   // 点无敌那一刻锁定的单位
+static int g_inv_last_hit = 0;                // 上一轮实际补血到几个
+static DWORD g_inv_next_tick = 0;             // 50ms 节流
+static DWORD g_inv_log_tick = 0;
+static DWORD g_inv_off_battle_tick = 0;       // 离开战局的起始时刻（宽限用）
+
+// 定义在文件后面（战局时钟），这里只需要判断「现在是不是在打」。
+static bool read_battle_clock(uint32_t* logic_out, float* seconds_out);
+
+static void invincible_clear_targets() {
+  g_inv_targets.clear();
+  g_inv_active = false;
+  g_inv_next_tick = 0;
+  g_inv_last_hit = 0;
+  g_inv_off_battle_tick = 0;
+}
+
+// 把指定单位从锁血名单里摘掉：「残血(1点)」要能在无敌状态下直接生效。
+// 名单空了就把无敌整体关掉（状态文字也跟着变回「待命」）。
+static int invincible_release_entities(const std::vector<uint32_t>& ents) {
+  if (!g_inv_active || g_inv_targets.empty() || ents.empty()) return 0;
+  const size_t before = g_inv_targets.size();
+  for (uint32_t e : ents) {
+    g_inv_targets.erase(std::remove(g_inv_targets.begin(), g_inv_targets.end(), e),
+                        g_inv_targets.end());
+  }
+  const int released = (int)(before - g_inv_targets.size());
+  if (released <= 0) return 0;
+  log("invincible: released %d unit(s) for hp_min, %d left", released,
+      (int)g_inv_targets.size());
+  if (g_inv_targets.empty()) invincible_clear_targets();
+  return released;
+}
+
+// on = 先把当前选中单位血量拉满，再锁住；off = 恢复原血量并清空名单。
+bool invincible_apply_impl(bool on, float seconds, int flavor, std::string* out_msg) {
+  (void)seconds;
+  (void)flavor;
+
+  if (!on) {
+    // 解除：把名单里的单位恢复成正常血量，再清空（不碰其它单位）。
+    int restored = 0;
+    for (uint32_t ent : g_inv_targets) {
+      if (!looks_like_entity(ent) || !entity_alive(ent)) continue;
+      if (write_entity_hp(ent, "normal")) ++restored;
+    }
+    const int had = (int)g_inv_targets.size();
+    invincible_clear_targets();
+    log("invincible: released %d units (restored %d)", had, restored);
+    if (out_msg) {
+      char buf[160];
+      std::snprintf(buf, sizeof(buf), u8"已解除无敌（%d 个单位）", had);
+      *out_msg = buf;
+    }
+    return true;
+  }
+
+  // 只取「当前选中」；之前已经锁住的继续保留（多次点 = 累加）。
+  const std::vector<uint32_t> sel = selected_entities_stable(256);
+  std::vector<uint32_t> targets = g_inv_targets;
+  int added = 0;
+  int maxed = 0;
+  for (uint32_t ent : sel) {
+    if (!looks_like_entity(ent) || !entity_alive(ent)) continue;
+    // 第一步：血量直接拉到最大。
+    if (!write_entity_hp(ent, "max")) continue;
+    ++maxed;
+    if (std::find(targets.begin(), targets.end(), ent) == targets.end()) {
+      targets.push_back(ent);
+      ++added;
+    }
+  }
+  if (targets.empty()) {
+    if (out_msg) *out_msg = u8"无敌：请先在游戏里选中要保护的单位";
+    return false;
+  }
+  // 第二步：开始锁血（tick 每 50ms 把名单里的血续回最大值）。
+  g_inv_targets = targets;
+  g_inv_active = true;
+  g_inv_last_hit = (int)targets.size();
+  g_inv_next_tick = 0;
+  log("invincible: +%d new, total=%d, maxed=%d", added, (int)targets.size(), maxed);
+  if (out_msg) {
+    char buf[220];
+    if (added > 0) {
+      std::snprintf(buf, sizeof(buf), u8"选中的 %d 个单位已满血并锁血（累计 %d 个，换选不会跟着变）",
+                    added, (int)targets.size());
+    } else {
+      std::snprintf(buf, sizeof(buf), u8"选中的单位已在无敌名单里（累计 %d 个）",
+                    (int)targets.size());
+    }
+    *out_msg = buf;
+  }
+  return true;
+}
+
+bool invincible_lock_impl() { return g_inv_active; }
+
+// `[` 热键：只是「把当前选中加进无敌名单」，不再一刀切当成总开关。
+// 老实现是「已开启就全部解除」，于是选中第二个单位再按 `[` 会把第一个解掉、
+// 第二个又没加进去。现在：
+//   * 选中里只要还有没锁过的单位 → 累加（前面的单位继续锁）；
+//   * 选中的单位全都已经在名单里（对同一批再按一次）→ 只解掉这批。
+static bool invincible_toggle_impl(std::string* out_msg) {
+  const std::vector<uint32_t> sel = selected_entities_stable(256);
+  bool any_unlocked = false;
+  for (uint32_t ent : sel) {
+    if (!looks_like_entity(ent) || !entity_alive(ent)) continue;
+    if (std::find(g_inv_targets.begin(), g_inv_targets.end(), ent) == g_inv_targets.end()) {
+      any_unlocked = true;
+      break;
+    }
+  }
+  if (!g_inv_active || any_unlocked) return invincible_apply_impl(true, 600.f, 0, out_msg);
+
+  // 这批已经在名单里：只把它们解出来，别的单位继续无敌。
+  int restored = 0;
+  int released = 0;
+  for (uint32_t ent : sel) {
+    if (!looks_like_entity(ent) || !entity_alive(ent)) continue;
+    if (write_entity_hp(ent, "normal")) ++restored;
+    const size_t before = g_inv_targets.size();
+    g_inv_targets.erase(std::remove(g_inv_targets.begin(), g_inv_targets.end(), ent),
+                        g_inv_targets.end());
+    if (g_inv_targets.size() != before) ++released;
+  }
+  if (g_inv_targets.empty()) invincible_clear_targets();
+  log("invincible: toggle released %d selected (restored %d), %d left", released, restored,
+      (int)g_inv_targets.size());
+  if (out_msg) {
+    char buf[192];
+    std::snprintf(buf, sizeof(buf), u8"已把这 %d 个单位解除无敌（名单还剩 %d 个）", released,
+                  (int)g_inv_targets.size());
+    *out_msg = buf;
+  }
+  return released > 0;
+}
+
+// 每 50ms 给名单里的单位补满血；死掉的自动剔除，不会碰其它单位。
+void invincible_tick_impl() {
+  if (!g_inv_active) return;
+  // 不在战局里（结算 / 主菜单）就收摊，否则旧指针会被下一局复用。
+  // 5 秒宽限，避免进场瞬间时钟抖动一下就把名单丢了。
+  if (!read_battle_clock(nullptr, nullptr)) {
+    const DWORD now_off = GetTickCount();
+    if (!g_inv_off_battle_tick) {
+      g_inv_off_battle_tick = now_off ? now_off : 1;
+      return;
+    }
+    if (static_cast<int32_t>(now_off - g_inv_off_battle_tick) < 5000) return;
+    log("invincible: left battle, dropping targets");
+    invincible_clear_targets();
+    return;
+  }
+  g_inv_off_battle_tick = 0;
+
+  const DWORD now = GetTickCount();
+  if (g_inv_next_tick && static_cast<int32_t>(now - g_inv_next_tick) < 0) return;
+  g_inv_next_tick = now + 50;
+
+  int healed = 0;
+  std::vector<uint32_t> alive;
+  alive.reserve(g_inv_targets.size());
+  for (uint32_t ent : g_inv_targets) {
+    if (!looks_like_entity(ent) || !entity_alive(ent)) continue;   // 死了就剔除
+    alive.push_back(ent);
+    if (write_entity_hp(ent, "max")) ++healed;   // 续回最大值，锁住不掉血
+  }
+  if (alive.size() != g_inv_targets.size()) g_inv_targets.swap(alive);
+  g_inv_last_hit = healed;
+  if (g_inv_targets.empty()) {
+    log("invincible: all targets gone, stopping");
+    invincible_clear_targets();
+    return;
+  }
+  if (static_cast<int32_t>(now - g_inv_log_tick) > 10000) {
+    g_inv_log_tick = now;
+    log("invincible: holding %d units", healed);
+  }
+}
+
+const char* invincible_status_impl() {
+  static char buf[192];
+  std::snprintf(buf, sizeof(buf), u8"%s · 锁血 · 护住 %d 个单位",
+                g_inv_active ? u8"已开启" : u8"待命",
+                g_inv_active ? (int)g_inv_targets.size() : 0);
+  return buf;
+}
+
 
 // Cached player-relative entity vector offsets (units + buildings often separate).
 // High bit set => vector lives on [player+0x40] + (off&~hi).
@@ -1461,7 +2243,7 @@ static EntVecScore score_entity_vector(uint32_t begin, uint32_t end, uint32_t pl
     if (!looks_like_entity(ent)) continue;
     ++any;
     uint32_t ow = 0;
-    safe_read_u32(ent + 0x418, &ow);
+    safe_read_u32(ent + ent_off(kEntOwner, kEntOwnerEp1), &ow);
     if (is_ptr(ow) && nown < 12) {
       bool dup = false;
       for (int k = 0; k < nown; ++k) {
@@ -1669,7 +2451,10 @@ static void ensure_tpl_cs() {
 struct LiveEnt {
   uint32_t owner = 0;
   uint32_t pending_owner = 0;
+  uint32_t unit_data = 0;  // ThingTemplate*; detect unpack / morph
   int pending_hits = 0;
+  int seen_gen = 0;   // last object-list scan that still contained this ent
+  int dead_streak = 0;  // consecutive polls with HP≈0
   char key[96] = {};
   char name[64] = {};
   bool building = false;
@@ -1688,20 +2473,166 @@ static CRITICAL_SECTION g_live_cs;
 static bool g_live_cs_ready = false;
 static bool g_live_seeded = false;
 static int g_live_scan_tick = 0;
+
+// 真无敌兜底用：从 g_live 里挑出属于本地玩家的存活单位。
+int own_entities_snapshot(uint32_t* out, int max_out) {
+  if (!out || max_out <= 0) return 0;
+  const uint32_t me = local_owner_for_ops();
+  if (!is_ptr(me)) return 0;
+  int n = 0;
+  if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
+  for (const auto& kv : g_live) {
+    if (n >= max_out) break;
+    const uint32_t ent = kv.first;
+    if (!looks_like_entity(ent) || !entity_alive(ent)) continue;
+    if (!entity_belongs_to(ent, me, 0)) continue;
+    out[n++] = ent;
+  }
+  if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
+  return n;
+}
+
+// ---------------------------------------------------------------------------
+// 归属切换的底层：Team / 玩家归属
+//
+// GameObject 上有两个互相关联的字段：+0x414 是 Team*，+0x418 是 Player*
+// （Team::getPlayer() == [[team+4]+8]）。只写 +0x418 不动 +0x414 的话，
+// 引擎随后会按 Team 里的玩家把 +0x418 覆盖回去，表现就是「改了等于没改」。
+// 引擎自己的 GameObject::setTeam(Team*, int) 会同时刷新两个字段、挪动小队 /
+// AI 链表并广播归属变更，所以改归属一律走它。
+// ---------------------------------------------------------------------------
+constexpr uint32_t kEntTeam = 0x414;          // Team*（原版 1.12）
+constexpr uint32_t kFnSetTeam = 0x007CBF50;   // GameObject::setTeam(Team*, int)
+
+static bool is_module_ptr(uint32_t v) {
+  // 模块映像里的指针（虚表 / 代码 / 只读数据）。范围放宽到 32MB，避免因为
+  // 段布局不同把合法的虚表判掉。
+  const uint32_t base = loaded_module();
+  if (!base || (v & 3u) != 0) return false;
+  return v >= base + 0x1000 && v < base + 0x02000000u;
+}
+
+uint32_t ent_team_of(uint32_t ent) {
+  if (!is_ptr(ent)) return 0;
+  uint32_t t = 0;
+  if (!safe_read_u32(ent + kEntTeam, &t) || !is_ptr(t)) return 0;
+  return t;
+}
+
+// 一个 Team 是否属于该玩家：Team::getPlayer() = [[team+4]+8]。
+bool team_owned_by(uint32_t team, uint32_t player) {
+  if (!is_ptr(team) || !is_ptr(player)) return false;
+  uint32_t vtable = 0, sub = 0, owner = 0;
+  if (!safe_read_u32(team, &vtable) || !is_module_ptr(vtable)) return false;
+  if (!safe_read_u32(team + 4, &sub) || !is_ptr(sub)) return false;
+  if (!safe_read_u32(sub + 8, &owner)) return false;
+  return owner == player;
+}
+
+// 找出该玩家在引擎里的 Team：先看地图上属于他的单位挂的 Team，再从玩家对象
+// 里扫一遍指针。找不到返回 0（调用方退回「只写 +0x418」的旧行为）。
+uint32_t player_team_of(uint32_t player) {
+  if (!is_ptr(player) || uprising_active()) return 0;
+
+  std::vector<uint32_t> all;
+  if (g_live_cs_ready) {
+    EnterCriticalSection(&g_live_cs);
+    all.reserve(g_live.size());
+    for (const auto& kv : g_live) all.push_back(kv.first);
+    LeaveCriticalSection(&g_live_cs);
+  }
+  for (uint32_t ent : all) {
+    if (!looks_like_entity(ent) || !entity_alive(ent)) continue;
+    if (ent_owner_of(ent) != player) continue;
+    const uint32_t t = ent_team_of(ent);
+    if (team_owned_by(t, player)) return t;
+  }
+
+  for (uint32_t off = 0x40; off <= 0x800; off += 4) {
+    uint32_t p = 0;
+    if (!safe_read_u32(player + off, &p) || !is_ptr(p)) continue;
+    if (team_owned_by(p, player)) return p;
+  }
+  return 0;
+}
+
+// 调引擎的 setTeam：__thiscall(this=ent, team, 0)。放到子线程里跑，避免
+// 在渲染线程里直接改游戏逻辑链表；调用前后各读一次 +0x418 判断是否真的生效。
+bool engine_set_team(uint32_t ent, uint32_t team) {
+  const uint32_t fn = va_of(kFnSetTeam);
+  if (!fn || !is_ptr(ent) || !is_ptr(team) || uprising_active()) return false;
+  CallJob job{};
+  job.kind = CallJob::kThiscallArgs;
+  job.fn = fn;
+  job.thisptr = ent;
+  job.args[0] = team;
+  job.args[1] = 0;
+  job.nargs = 2;
+  return run_job(job);
+}
+
+// 把一个单位改到某个玩家名下，返回是否真的生效。
+static bool assign_entity_to_player(uint32_t ent, uint32_t player, uint32_t team) {
+  if (!is_ptr(ent) || !is_ptr(player)) return false;
+  const uint32_t off = ent_off(kEntOwner, kEntOwnerEp1);
+  if (team && engine_set_team(ent, team) && read_u32(ent + off) == player) return true;
+  // 兜底：引擎调用没成立时，把 Team 和 Player 一起写上（不要只写 +0x418）。
+  if (team && is_ptr(team)) {
+    write_u32(ent + kEntTeam, team);
+    write_u32(ent + off, player);
+    if (read_u32(ent + off) == player) return true;
+  }
+  return write_u32(ent + off, player);
+}
+
+static int g_live_scan_gen = 0;
+static bool g_roster_active = false;  // UI wants live roster (stats open)
+// Mid-match open seed (amortized — NOT a 200ms sync burst on Present):
+// 1) one cheap player-list walk that only enqueues unknown ents
+// 2) Present drains ~12 catalog resolves per frame
+// 3) board fills over ~1s without hitching. A sync 2048-resolve pass was
+// measured at ~170ms/poll with 6800 budget misses and never finished.
+static bool g_roster_seed_burst = false;
+static bool g_seed_walk_done = false;     // at least one enqueue walk finished
+static bool g_seed_queue_overflow = false;
+static std::unordered_set<uint32_t> g_live_drop;  // ents that are not roster units
+static std::unordered_map<uint32_t, uint8_t> g_live_retries;  // kRetry storms → drop
 // After a match change or save load, keep rescanning. A long battle's object
 // list is rebuilt in one burst and is easy to sample before it is complete.
 static DWORD g_rescan_began = 0;
 static DWORD g_roster_rescan_until = 0;
 static DWORD g_roster_next_scan = 0;
+static DWORD g_roster_next_light = 0;
+static DWORD g_roster_next_rediscover = 0;
 static int g_rescan_last_n = -1;
 static int g_rescan_stable = 0;
 static void queue_live_add(uint32_t ent, uint32_t hint) {
   if (!is_ptr(ent) || !g_live_cs_ready) return;
   EnterCriticalSection(&g_live_cs);
+  if (g_live_drop.find(ent) != g_live_drop.end()) {
+    LeaveCriticalSection(&g_live_cs);
+    return;
+  }
+  // Already tracked with a TypeId — nothing to classify.
+  auto known = g_live.find(ent);
+  if (known != g_live.end() && known->second.key[0]) {
+    LeaveCriticalSection(&g_live_cs);
+    return;
+  }
+  // Dedup against the pending queue (open-panel seed can rewalk).
+  for (int i = 0; i < g_add_n; ++i) {
+    if (g_add_q[i] == ent) {
+      if (is_ptr(hint) && !is_ptr(g_add_hint[i])) g_add_hint[i] = hint;
+      LeaveCriticalSection(&g_live_cs);
+      return;
+    }
+  }
   if (g_add_n < kLiveQueueCap) {
     g_add_q[g_add_n] = ent;
     g_add_hint[g_add_n] = hint;
     ++g_add_n;
+  } else {
+    g_seed_queue_overflow = true;
   }
   LeaveCriticalSection(&g_live_cs);
 }
@@ -1729,6 +2660,7 @@ struct FacCache {
   int pending = 0;
   int pending_hits = 0;
   uint32_t next_try = 0;  // throttle for the pointer walk when nothing matched
+  int fails = 0;          // consecutive failed probes — drives the backoff
 };
 static FacCache g_fac_cache[16] = {};
 static int g_fac_cache_n = 0;
@@ -1745,13 +2677,23 @@ static int g_seen_n = 0;
 static void clear_live_ents() {
   if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
   g_live.clear();
+  g_live_drop.clear();
+  g_live_retries.clear();
   g_add_n = 0;
   g_forget_n = 0;
   g_live_seeded = false;
   g_live_scan_tick = 0;
+  g_live_scan_gen = 0;
+  g_roster_seed_burst = false;
+  g_seed_walk_done = false;
+  g_seed_queue_overflow = false;
   g_rescan_began = GetTickCount();
+  // Soft rescan window: light scans after 4s, settle by ~6–8s. Avoid the old
+  // pattern of rediscovering every 600ms with full catalog walks.
   g_roster_rescan_until = g_rescan_began + 8000;
   g_roster_next_scan = 0;
+  g_roster_next_light = 0;
+  g_roster_next_rediscover = 0;
   g_rescan_last_n = -1;
   g_rescan_stable = 0;
   if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
@@ -1767,10 +2709,9 @@ static void clear_roster_caches() {
   g_logic_list_off = 0;
   g_logic_off_n = 0;
   g_logic_refresh = 0;
-  ensure_tpl_cs();
-  EnterCriticalSection(&g_tpl_cs);
-  g_tpl_type_cache.clear();
-  LeaveCriticalSection(&g_tpl_cs);
+  // Keep g_tpl_type_cache across battles — ThingTemplate TypeIds are stable for
+  // the process lifetime. Clearing it on every new match forces thousands of
+  // catalog walks during the spawn storm and hitch Present for seconds.
   g_ent_ident.clear();
   g_fac_cache_n = 0;
   g_seen_n = 0;
@@ -1781,6 +2722,16 @@ static void clear_roster_caches() {
   std::memset(g_roster_order, 0, sizeof(g_roster_order));
   clear_seat_diag();
   clear_live_ents();
+}
+
+// True for the first seconds after a match load / battle reset. Spawn hooks
+// and rediscover must stay cheap or the game freezes on Present.
+static bool roster_early_load() {
+  const DWORD now = GetTickCount();
+  if (g_rescan_began == 0) return false;
+  const int since = (int)(now - g_rescan_began);
+  if (since < 0 || since >= 5000) return false;
+  return !g_live_seeded || (int)(g_roster_rescan_until - now) > 0;
 }
 
 static RosterOrderCache* roster_order_for(uint32_t player, uint32_t player_id) {
@@ -2017,14 +2968,25 @@ static void build_roster_text_unused_sticky(PlayerEconomy* pe) {
 static bool should_hide_roster_type(const char* key) {
   if (!key || !key[0]) return false;
   // Carrier-launched fighters clutter the roster; skip.
-  if (std::strstr(key, "AttackDron")) return true;  // AttackDrone / AttackDron
-  if (std::strcmp(key, "AlliedAttackDrone") == 0) return true;
+  if (id_has_token(key, "AttackDron")) return true;  // AttackDrone / AttackDron
+  if (_stricmp(key, "AlliedAttackDrone") == 0) return true;
   // Top-secret chronosphere / satellite sweep helper objects.
-  if (std::strstr(key, "SatelliteSweep")) return true;
-  if (std::strcmp(key, "AlliedSatelliteSweepRevealObject") == 0) return true;
-  if (std::strcmp(key, "AlliedSatelliteSweepShroudRevealer") == 0) return true;
+  if (id_has_token(key, "SatelliteSweep")) return true;
   // Empire point-defense drones are spawned by the tower, not a fielded unit.
-  if (std::strstr(key, "PointDefense")) return true;
+  if (id_has_token(key, "PointDefense")) return true;
+  // BFI also drops helper / UI ghosts: return-to-base markers, repair pads,
+  // power-plant turbines, superweapon timer shells, upgrade stubs.
+  if (id_has_token(key, "ReturnToAirfield") || id_has_token(key, "ReturnToBase")) {
+    return true;
+  }
+  if (id_has_token(key, "RepairBay") || id_has_token(key, "Turbine")) return true;
+  if (id_has_token(key, "SuperWeaponTimer")) return true;
+  if (id_has_token(key, "BaseDefenseTransform")) return true;
+  if (_strnicmp(key, "Upgrade", 7) == 0) return true;
+  if (_strnicmp(key, "BuildAllied", 11) == 0 || _strnicmp(key, "BuildSoviet", 11) == 0 ||
+      _strnicmp(key, "BuildJapan", 10) == 0) {
+    return true;
+  }
   return false;
 }
 
@@ -2044,9 +3006,51 @@ static bool catalog_id_at(uint32_t addr, char* out, size_t out_len) {
   return true;
 }
 
+static int faction_of_key(const char* key);
+static int detect_faction_from_player(uint32_t player);
+static int cached_faction_of(uint32_t player);
+
+// Score a TypeId candidate. BFI-style STRUCTURE/unit filter is approximated
+// by name tokens; here we also prefer the owner's faction and finished
+// buildings over Japan *Egg pack-cores that sit in nested template data.
+static int score_catalog_candidate(const char* id, int owner_fac, uint32_t depth) {
+  if (!id || !id[0] || should_hide_roster_type(id)) return -100000;
+  int s = 2000 - (int)depth;
+  if (s < 0) s = 0;
+  const int fac = faction_of_key(id);
+  if (owner_fac > 0 && fac > 0) {
+    if (fac == owner_fac) {
+      s += 800;
+    } else if (type_id_is_building(id) || id_has_token(id, "Egg")) {
+      // Captured buildings / pack-cores may keep another side's TypeId.
+      s -= 600;
+    } else {
+      // Nested weapon/spawn strings (e.g. AlliedEngineer inside an MCV blob)
+      // must not label a living Soviet/Japan unit.
+      return -100000;
+    }
+  }
+  // Pack-cores are transitional; prefer the finished building id when both
+  // appear in the same template blob.
+  if (id_has_token(id, "Egg")) s -= 350;
+  if (id_has_token(id, "AntiStructure")) s -= 50;
+  // Prefer the unit's own TypeId over a nested helper that shares a catalog name.
+  if (id_has_token(id, "Engineer") && depth > 8) s -= 200;
+  return s;
+}
+
+static void consider_catalog_cand(const char* id, int owner_fac, uint32_t depth, char* best,
+                                  size_t best_len, int* best_score) {
+  if (!id || !id[0] || !best || !best_score) return;
+  const int sc = score_catalog_candidate(id, owner_fac, depth);
+  if (sc <= *best_score) return;
+  *best_score = sc;
+  std::snprintf(best, best_len, "%s", id);
+}
+
 // The template's own GameObject id is the nearest catalog string.
 // Nested weapon / spawn names sit further out and were being picked before,
-// which labeled a unit as another faction.
+// which labeled a unit as another faction (e.g. Allied seat showing 防卫者核心).
 static bool tpl_cached_reject(uint32_t unit_data) {
   if (!is_ptr(unit_data) || g_tpl_cs_state != 2) return false;
   EnterCriticalSection(&g_tpl_cs);
@@ -2056,8 +3060,10 @@ static bool tpl_cached_reject(uint32_t unit_data) {
   return reject;
 }
 
-static bool resolve_primary_catalog_id(uint32_t unit_data, char* out, size_t out_len) {
+static bool resolve_primary_catalog_id(uint32_t unit_data, char* out, size_t out_len,
+                                       int owner_fac = 0) {
   if (!is_ptr(unit_data) || !out || out_len < 2) return false;
+  // Cache key ignores owner_fac; cached ids are already faction-scored once.
   ensure_tpl_cs();
   EnterCriticalSection(&g_tpl_cs);
   auto it = g_tpl_type_cache.find(unit_data);
@@ -2068,21 +3074,44 @@ static bool resolve_primary_catalog_id(uint32_t unit_data, char* out, size_t out
     }
     std::snprintf(out, out_len, "%s", it->second.c_str());
     LeaveCriticalSection(&g_tpl_cs);
-    return lookup_zh_name(out) != nullptr;
+    // Cache ignores owner_fac. Re-resolve when a non-capturable unit was labeled
+    // with another faction (AlliedEngineer ghosts on every seat), or when a
+    // cross-faction Egg was cached before the owner was known.
+    const int cached_fac = faction_of_key(out);
+    const bool cross = owner_fac > 0 && cached_fac > 0 && cached_fac != owner_fac;
+    const bool re_resolve =
+        cross && (!type_id_is_building(out) || id_has_token(out, "Egg"));
+    if (re_resolve) {
+      EnterCriticalSection(&g_tpl_cs);
+      g_tpl_type_cache.erase(unit_data);
+      LeaveCriticalSection(&g_tpl_cs);
+    } else {
+      return lookup_zh_name(out) != nullptr;
+    }
+  } else {
+    LeaveCriticalSection(&g_tpl_cs);
   }
-  LeaveCriticalSection(&g_tpl_cs);
+
   char best[96] = {};
-  for (uint32_t off = 0; off <= 0x180 && !best[0]; off += 4) {
-    if (catalog_id_at(unit_data + off, best, sizeof(best))) break;
+  int best_score = -100000;
+  char cand[96] = {};
+  for (uint32_t off = 0; off <= 0x180; off += 4) {
+    if (catalog_id_at(unit_data + off, cand, sizeof(cand))) {
+      consider_catalog_cand(cand, owner_fac, off, best, sizeof(best), &best_score);
+    }
     uint32_t p = 0;
     if (!safe_read_u32(unit_data + off, &p) || !is_ptr(p)) continue;
-    if (catalog_id_at(p, best, sizeof(best))) break;
+    if (catalog_id_at(p, cand, sizeof(cand))) {
+      consider_catalog_cand(cand, owner_fac, off + 1, best, sizeof(best), &best_score);
+    }
     uint32_t p2 = 0;
-    if (safe_read_u32(p, &p2) && is_ptr(p2)) catalog_id_at(p2, best, sizeof(best));
+    if (safe_read_u32(p, &p2) && is_ptr(p2) && catalog_id_at(p2, cand, sizeof(cand))) {
+      consider_catalog_cand(cand, owner_fac, off + 2, best, sizeof(best), &best_score);
+    }
   }
   ensure_tpl_cs();
   EnterCriticalSection(&g_tpl_cs);
-  if (!best[0] || should_hide_roster_type(best)) {
+  if (!best[0] || best_score < 0) {
     if (best[0]) g_tpl_type_cache[unit_data] = "-";
     LeaveCriticalSection(&g_tpl_cs);
     return false;
@@ -2106,30 +3135,34 @@ static bool entity_catalog_for_roster(uint32_t ent, const MatchEconomy* out, int
   if (seat) *seat = -1;
   if (!looks_like_entity(ent)) return false;
   uint32_t ow = 0;
-  if (!safe_read_u32(ent + 0x418, &ow)) return false;
+  if (!safe_read_u32(ent + ent_off(kEntOwner, kEntOwnerEp1), &ow)) return false;
   const int s = seat_for_owner(out, ow);
   if (s < 0) return false;
   uint32_t unit_data = 0;
   if (!safe_read_u32(ent + 4, &unit_data) || !is_ptr(unit_data)) return false;
-  if (!resolve_primary_catalog_id(unit_data, type_id, type_len)) return false;
+  // Never trigger a faction walk here: this runs per entity while tallying.
+  const int owner_fac = cached_faction_of(ow);
+  if (!resolve_primary_catalog_id(unit_data, type_id, type_len, owner_fac)) return false;
   if (seat) *seat = s;
   return true;
 }
 
-static int score_catalog_vector(uint32_t begin, uint32_t end, const MatchEconomy* out) {
+// Cheap list scoring for rediscover — ownership only, no TypeId catalog walks.
+static int score_owned_vector(uint32_t begin, uint32_t end, const MatchEconomy* out) {
   uint32_t n = 0;
-  if (!valid_ent_vector_range(begin, end, &n)) return 0;
-  int catalog = 0;
-  const uint32_t sample = n < 48 ? n : 48;
+  if (!out || !valid_ent_vector_range(begin, end, &n)) return 0;
+  int owned = 0;
+  const uint32_t sample = n < 24 ? n : 24;
   for (uint32_t i = 0; i < sample; ++i) {
     const uint32_t idx = n <= sample ? i : (i * n / sample);
     uint32_t ent = 0;
-    if (!safe_read_u32(begin + idx * 4u, &ent)) continue;
-    char type_id[96] = {};
-    if (entity_catalog_for_roster(ent, out, nullptr, type_id, sizeof(type_id))) ++catalog;
+    if (!safe_read_u32(begin + idx * 4u, &ent) || !is_ptr(ent)) continue;
+    uint32_t ow = 0;
+    if (!safe_read_u32(ent + ent_off(kEntOwner, kEntOwnerEp1), &ow) || !is_ptr(ow)) continue;
+    if (seat_for_owner(out, ow) >= 0) ++owned;
   }
-  if (sample == 0 || catalog == 0) return 0;
-  return catalog * (int)((n + sample - 1) / sample);
+  if (sample == 0 || owned == 0) return 0;
+  return owned * (int)((n + sample - 1) / sample);
 }
 
 static int tally_catalog_vector(uint32_t begin, uint32_t end, MatchEconomy* out) {
@@ -2161,6 +3194,39 @@ static void tally_entity_into_player(PlayerEconomy* pe, uint32_t ent) {
   const char* zh = lookup_zh_name(type_id);
   if (!zh || !zh[0]) return;
   add_roster_count(pe, type_id, zh, type_id_is_building(type_id));
+}
+
+// In-place money/power only — used by the stats panel at ~10Hz.
+static bool refresh_match_resources_impl(MatchEconomy* inout) {
+  if (!inout || !inout->valid || inout->player_count <= 0) return false;
+  if (!loaded_module()) return false;
+  for (int i = 0; i < inout->player_count; ++i) {
+    PlayerEconomy& pe = inout->players[i];
+    if (!is_ptr(pe.player)) continue;
+
+    uint32_t money_table = 0, money_obj = 0, money = 0;
+    if (safe_read_u32(pe.player + kPlayerMoneyTableOff, &money_table) && is_ptr(money_table) &&
+        safe_read_u32(money_table, &money_obj) && is_ptr(money_obj) &&
+        safe_read_u32(money_obj + 0x04, &money) && money <= 200000000u) {
+      pe.has_money = true;
+      pe.money = money;
+    }
+
+    uint32_t power_obj = 0;
+    if (safe_read_u32(pe.player + kPlayerPowerObjOff, &power_obj) && is_ptr(power_obj)) {
+      uint32_t self_ref = 0;
+      const bool ok_self =
+          safe_read_u32(power_obj + 0x20, &self_ref) && self_ref == (power_obj + 0x20);
+      uint32_t total = 0, used = 0;
+      if (ok_self && safe_read_u32(power_obj + 0x04, &total) &&
+          safe_read_u32(power_obj + 0x08, &used) && total < 500000u && used < 500000u) {
+        pe.has_power = true;
+        pe.power_total = total;
+        pe.power_used = used;
+      }
+    }
+  }
+  return true;
 }
 
 static void fill_player_economy_basic(PlayerEconomy* pe, uint32_t player,
@@ -2252,35 +3318,134 @@ static void fill_player_economy_basic(PlayerEconomy* pe, uint32_t player,
 // kOk: recorded. kRetry: object exists but owner is not written yet. kDrop: not a roster unit.
 enum class LiveNote { kOk, kRetry, kDrop };
 
+// Cap expensive catalog resolves per Present / stats poll. Mass production
+// otherwise stalls the render thread classifying hundreds of new templates.
+static int g_catalog_budget = 0;
+
+static bool key_is_nano_egg(const char* key);
+static int detect_faction_from_player(uint32_t player);
+static int detect_faction(const PlayerEconomy& pe);
+
 static LiveNote note_live_ent(uint32_t ent, uint32_t owner_hint) {
   if (!is_ptr(ent)) return LiveNote::kDrop;
+  if (!entity_alive(ent)) return LiveNote::kDrop;
+
   uint32_t unit_data = 0;
   if (!safe_read_u32(ent + 4, &unit_data) || !is_ptr(unit_data)) return LiveNote::kRetry;
-  char type_id[96] = {};
-  if (!resolve_primary_catalog_id(unit_data, type_id, sizeof(type_id))) return LiveNote::kDrop;
-  const char* zh = lookup_zh_name(type_id);
-  if (!zh || !zh[0]) return LiveNote::kDrop;
   uint32_t ow = 0;
-  safe_read_u32(ent + 0x418, &ow);
+  safe_read_u32(ent + ent_off(kEntOwner, kEntOwnerEp1), &ow);
+  // Player object-list membership is authoritative when +0x418 is still 0
+  // (common right after Spawn). Prefer a live owner field when present.
   if (!is_ptr(ow)) ow = owner_hint;
+
+  // Fast path: already tracked with same template — skip catalog walks.
+  // Still refresh owner, and force re-resolve for pack-cores / template morphs.
+  // Cross-faction TypeId ghosts are dropped in publish_live_roster (seat vs key).
+  if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
+  auto known = g_live.find(ent);
+  if (known != g_live.end() && known->second.key[0] &&
+      known->second.unit_data == unit_data && !key_is_nano_egg(known->second.key)) {
+    if (is_ptr(ow)) known->second.owner = ow;
+    else if (is_ptr(owner_hint)) known->second.owner = owner_hint;
+    known->second.seen_gen = g_live_scan_gen;
+    known->second.dead_streak = 0;
+    if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
+    return LiveNote::kOk;
+  }
+  if (g_live_cs_ready) {
+    if (g_live_drop.find(ent) != g_live_drop.end()) {
+      LeaveCriticalSection(&g_live_cs);
+      return LiveNote::kDrop;
+    }
+    LeaveCriticalSection(&g_live_cs);
+  }
+
+  if (g_catalog_budget <= 0) return LiveNote::kRetry;
+  --g_catalog_budget;
+
+  const int owner_fac = is_ptr(ow) ? cached_faction_of(ow) : 0;
+  char type_id[96] = {};
+  if (!resolve_primary_catalog_id(unit_data, type_id, sizeof(type_id), owner_fac)) {
+    if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
+    g_live_drop.insert(ent);
+    if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
+    return LiveNote::kDrop;
+  }
+  const char* zh = lookup_zh_name(type_id);
+  if (!zh || !zh[0]) {
+    if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
+    g_live_drop.insert(ent);
+    if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
+    return LiveNote::kDrop;
+  }
   if (!is_ptr(ow)) return LiveNote::kRetry;
   if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
   auto it = g_live.find(ent);
   if (it == g_live.end()) {
     LiveEnt rec{};
     rec.owner = ow;
+    rec.unit_data = unit_data;
+    rec.seen_gen = g_live_scan_gen;
+    rec.dead_streak = 0;
     std::snprintf(rec.key, sizeof(rec.key), "%s", type_id);
     std::snprintf(rec.name, sizeof(rec.name), "%s", zh);
     rec.building = type_id_is_building(type_id);
     g_live.emplace(ent, rec);
   } else {
+    it->second.owner = ow;
+    it->second.unit_data = unit_data;
     std::snprintf(it->second.key, sizeof(it->second.key), "%s", type_id);
     std::snprintf(it->second.name, sizeof(it->second.name), "%s", zh);
     it->second.building = type_id_is_building(type_id);
-    if (!is_ptr(it->second.owner)) it->second.owner = ow;
+    it->second.seen_gen = g_live_scan_gen;
+    it->second.dead_streak = 0;
   }
   if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
   return LiveNote::kOk;
+}
+
+// Light object-list walk: bump known ents; enqueue unknowns for Present to
+// classify. Never call resolve_primary_catalog_id here — that is what made
+// open-panel seed hitch Present for ~170ms.
+// list_owner: Player* when walking that player's vectors (hint for new notes).
+static void touch_or_note_live(uint32_t ent, uint32_t list_owner = 0) {
+  if (!is_ptr(ent) || !entity_alive(ent)) return;
+  if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
+  if (g_live_drop.find(ent) != g_live_drop.end()) {
+    if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
+    return;
+  }
+  auto it = g_live.find(ent);
+  if (it != g_live.end() && it->second.key[0]) {
+    it->second.seen_gen = g_live_scan_gen;
+    it->second.dead_streak = 0;
+    // Only adopt list ownership when the entity owner field agrees (or is
+    // still unset). Shared/global lists must not reassign every seat's army.
+    if (is_ptr(list_owner)) {
+      uint32_t ow = 0;
+      const bool got =
+          safe_read_u32(ent + ent_off(kEntOwner, kEntOwnerEp1), &ow) && is_ptr(ow);
+      if (!got || ow == list_owner) it->second.owner = list_owner;
+      else it->second.owner = ow;
+    }
+    if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
+    return;
+  }
+  if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
+  queue_live_add(ent, list_owner);
+}
+
+// GameLogic global lists are noisy (projectiles, helpers). Only refresh
+// already-tracked ents; new classification comes from player lists / hooks.
+static void touch_live_only(uint32_t ent) {
+  if (!is_ptr(ent) || !entity_alive(ent)) return;
+  if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
+  auto it = g_live.find(ent);
+  if (it != g_live.end() && it->second.key[0]) {
+    it->second.seen_gen = g_live_scan_gen;
+    it->second.dead_streak = 0;
+  }
+  if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
 }
 
 static void forget_live_ent(uint32_t ent) {
@@ -2307,8 +3472,16 @@ static void refresh_core_identity(uint32_t ent, LiveEnt* rec) {
   if (!rec || !key_is_nano_egg(rec->key)) return;
   uint32_t unit_data = 0;
   if (!safe_read_u32(ent + 4, &unit_data) || !is_ptr(unit_data)) return;
+  // Template pointer changed → clear stale TypeId cache for the old blob.
+  if (rec->unit_data && rec->unit_data != unit_data && g_tpl_cs_state == 2) {
+    EnterCriticalSection(&g_tpl_cs);
+    g_tpl_type_cache.erase(rec->unit_data);
+    LeaveCriticalSection(&g_tpl_cs);
+  }
+  rec->unit_data = unit_data;
+  const int owner_fac = is_ptr(rec->owner) ? cached_faction_of(rec->owner) : 0;
   char type_id[96] = {};
-  if (!resolve_primary_catalog_id(unit_data, type_id, sizeof(type_id))) return;
+  if (!resolve_primary_catalog_id(unit_data, type_id, sizeof(type_id), owner_fac)) return;
   if (std::strcmp(rec->key, type_id) == 0) return;
   const char* zh = lookup_zh_name(type_id);
   if (!zh || !zh[0]) return;
@@ -2317,14 +3490,18 @@ static void refresh_core_identity(uint32_t ent, LiveEnt* rec) {
   rec->building = type_id_is_building(type_id);
 }
 
-static void publish_live_roster(MatchEconomy* out) {
-  if (!out) return;
-  uint32_t adds[256];
-  uint32_t hints[256];
-  uint32_t forgets[256];
+// Drain a slice of Create/Destroy queues. Returns true if work remains.
+static bool drain_live_queues(int max_add, int max_forget) {
+  if (max_add < 0) max_add = 0;
+  if (max_forget < 0) max_forget = 0;
+  uint32_t adds[64];
+  uint32_t hints[64];
+  uint32_t forgets[64];
   int nadd = 0, nforget = 0;
+  if (max_add > 64) max_add = 64;
+  if (max_forget > 64) max_forget = 64;
   if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
-  nadd = g_add_n < 256 ? g_add_n : 256;
+  nadd = g_add_n < max_add ? g_add_n : max_add;
   for (int i = 0; i < nadd; ++i) {
     adds[i] = g_add_q[i];
     hints[i] = g_add_hint[i];
@@ -2337,7 +3514,7 @@ static void publish_live_roster(MatchEconomy* out) {
   } else {
     g_add_n = 0;
   }
-  nforget = g_forget_n < 256 ? g_forget_n : 256;
+  nforget = g_forget_n < max_forget ? g_forget_n : max_forget;
   for (int i = 0; i < nforget; ++i) forgets[i] = g_forget_q[i];
   if (nforget < g_forget_n) {
     const int rest = g_forget_n - nforget;
@@ -2346,37 +3523,101 @@ static void publish_live_roster(MatchEconomy* out) {
   } else {
     g_forget_n = 0;
   }
+  const bool more = (g_add_n > 0 || g_forget_n > 0);
   if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
   for (int i = 0; i < nforget; ++i) forget_live_ent(forgets[i]);
   for (int i = 0; i < nadd; ++i) {
-    if (note_live_ent(adds[i], hints[i]) != LiveNote::kRetry) continue;
-    queue_live_add(adds[i], hints[i]);
+    const LiveNote note = note_live_ent(adds[i], hints[i]);
+    if (note == LiveNote::kOk) {
+      g_live_retries.erase(adds[i]);
+      continue;
+    }
+    if (note == LiveNote::kDrop) {
+      g_live_retries.erase(adds[i]);
+      continue;
+    }
+    // kRetry: a few chances (owner/template still writing), then drop so a
+    // 7000-entry junk vector cannot spin forever and keep the seed pending.
+    uint8_t& tries = g_live_retries[adds[i]];
+    if (tries < 4) {
+      ++tries;
+      queue_live_add(adds[i], hints[i]);
+    } else {
+      if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
+      g_live_drop.insert(adds[i]);
+      if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
+      g_live_retries.erase(adds[i]);
+    }
+  }
+  return more;
+}
+
+static void publish_live_roster(MatchEconomy* out) {
+  if (!out) return;
+  // Classification is amortized on Present (roster_tick). The economy poll
+  // only forgets / does a tiny drain so it never hitchs the render thread.
+  if (roster_early_load()) {
+    if (g_catalog_budget < 2) g_catalog_budget = 2;
+    drain_live_queues(1, 16);
+  } else {
+    if (g_catalog_budget < 4) g_catalog_budget = 4;
+    drain_live_queues(2, 24);
   }
 
-  std::vector<std::pair<uint32_t, LiveEnt>> copy;
+  // Resolve seat faction from the cache only — the graph walk itself is
+  // budgeted to a couple of seats per poll inside detect_faction_from_player(),
+  // and apply_seat_labels() already runs it.
+  int seat_fac[kMaxEconPlayers] = {};
+  for (int s = 0; s < out->player_count && s < kMaxEconPlayers; ++s) {
+    seat_fac[s] = cached_faction_of(out->players[s].player);
+  }
+
+  static std::vector<std::pair<uint32_t, LiveEnt>> copy;
   if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
+  copy.clear();
   copy.reserve(g_live.size());
   for (auto it = g_live.begin(); it != g_live.end();) {
     if (!looks_like_entity(it->first)) {
       it = g_live.erase(it);
       continue;
     }
-    refresh_core_identity(it->first, &it->second);
-    if (key_is_nano_egg(it->second.key) && !entity_alive(it->first)) {
+    // Eggs only (function no-ops for others); avoid catalog work under the lock.
+    if (key_is_nano_egg(it->second.key)) refresh_core_identity(it->first, &it->second);
+    // Pack-cores die / unpack quickly. Drop dead eggs immediately (don't wait
+    // for DestroyUnit), and drop eggs that vanished from every object list —
+    // otherwise Allied seats keep a stuck「防卫者核心」row forever.
+    if (key_is_nano_egg(it->second.key)) {
+      if (!entity_alive(it->first)) {
+        it = g_live.erase(it);
+        continue;
+      }
+      if (g_live_scan_gen > 0 && it->second.seen_gen > 0 &&
+          (g_live_scan_gen - it->second.seen_gen) >= 2) {
+        it = g_live.erase(it);
+        continue;
+      }
+    }
+    // Drop ghosts that left every scanned list (mis-noted helpers / stale
+    // CreateUnit leftovers). Need a few missed gens so a unit mid-transport
+    // isn't wiped on a single incomplete light scan.
+    if (!key_is_nano_egg(it->second.key) && g_live_scan_gen > 0 &&
+        it->second.seen_gen > 0 && (g_live_scan_gen - it->second.seen_gen) >= 3) {
       it = g_live.erase(it);
       continue;
     }
-    // A dying object often has +0x418 rewritten to the killer for a frame or
-    // two. Keep the last owner so that corpse does not flash onto another seat.
+    // Field roster = living objects only (BFI filters DESTROYED / dead).
     if (!entity_alive(it->first)) {
-      it->second.pending_owner = 0;
-      it->second.pending_hits = 0;
-      copy.emplace_back(it->first, it->second);
+      if (++it->second.dead_streak >= 2) {
+        it = g_live.erase(it);
+        continue;
+      }
       ++it;
       continue;
     }
+    it->second.dead_streak = 0;
     uint32_t ow = 0;
-    const bool got = safe_read_u32(it->first + 0x418, &ow) && is_ptr(ow);
+    const bool got =
+        safe_read_u32(it->first + ent_off(kEntOwner, kEntOwnerEp1), &ow) && is_ptr(ow);
     if (got && ow != it->second.owner && seat_for_owner(out, ow) >= 0) {
       if (seat_for_owner(out, it->second.owner) < 0) {
         it->second.owner = ow;
@@ -2395,6 +3636,26 @@ static void publish_live_roster(MatchEconomy* out) {
     } else {
       it->second.pending_owner = 0;
       it->second.pending_hits = 0;
+    }
+    // Drop cross-faction units / pack-cores that cannot belong to this seat.
+    // Captured buildings keep their original TypeId and are allowed through.
+    {
+      const int type_fac = faction_of_key(it->second.key);
+      const int seat = seat_for_owner(out, it->second.owner);
+      if (type_fac > 0 && seat >= 0 && seat < kMaxEconPlayers) {
+        const int sf = seat_fac[seat];
+        if (sf > 0 && sf != type_fac) {
+          if (key_is_nano_egg(it->second.key) || !it->second.building) {
+            if (it->second.unit_data && g_tpl_cs_state == 2) {
+              EnterCriticalSection(&g_tpl_cs);
+              g_tpl_type_cache.erase(it->second.unit_data);
+              LeaveCriticalSection(&g_tpl_cs);
+            }
+            it = g_live.erase(it);
+            continue;
+          }
+        }
+      }
     }
     copy.emplace_back(it->first, it->second);
     ++it;
@@ -2432,7 +3693,10 @@ static uint32_t __cdecl hk_create_unit(uint32_t a0, uint32_t tmpl, uint32_t pos,
 static uint32_t __cdecl hk_spawn_object(void* req) {
   uint32_t ent = g_orig_spawn ? g_orig_spawn(req) : 0;
   __try {
-    if (is_ptr(ent)) {
+    // Match load allocates map props / FX / helpers in a burst. Queuing them
+    // all for TypeId classification freezes Present — CreateUnit still tracks
+    // real units, and the light player-list scan catches the rest after settle.
+    if (is_ptr(ent) && !roster_early_load()) {
       uint32_t unit_data = 0;
       safe_read_u32(ent + 4, &unit_data);
       if (!tpl_cached_reject(unit_data)) queue_live_add(ent, 0);
@@ -2444,11 +3708,11 @@ static uint32_t __cdecl hk_spawn_object(void* req) {
 
 static void __cdecl forget_live_from_hook(uint32_t ent) {
   __try {
+    if (ent) air_hold_forget(ent);
     queue_live_forget(ent);
   } __except (EXCEPTION_EXECUTE_HANDLER) {
   }
 }
-
 static void __declspec(naked) hk_destroy_unit() {
   __asm {
     push ecx
@@ -2612,8 +3876,33 @@ static void install_sp_probe() {
 
 // Gather entities from every player's lists (and global multi-owner lists),
 // then bucket into each PlayerEconomy by owner / player_id.
+//
+// BFI-style approach: keep walking TheGameLogic / player object vectors on a
+// short interval instead of trusting Create/Destroy hooks alone. Hooks still
+// make adds/removes feel instant; the scan corrects misses and save loads.
+// Sub-phase timings of the last fill_all_rosters() call: rediscover branch,
+// object-list light scan, and the publish/tally pass. Logged by the economy
+// poll so a remaining stall can be attributed without guessing.
+static double g_roster_ph_rediscover = 0, g_roster_ph_light = 0, g_roster_ph_publish = 0;
+static bool g_roster_ph_logged = false;
+
 static void fill_all_rosters(MatchEconomy* out) {
   if (!out || out->player_count <= 0) return;
+  g_roster_ph_logged = false;
+
+  // Sub-phase timings for the perf log (read after the call).
+  LARGE_INTEGER rf{}, ft0{}, ftp{};
+  QueryPerformanceFrequency(&rf);
+  QueryPerformanceCounter(&ft0);
+  ftp = ft0;
+  auto mark = [&](double* slot) {
+    QueryPerformanceCounter(&ftp);
+    if (rf.QuadPart > 0) {
+      *slot = (double)(ftp.QuadPart - ft0.QuadPart) * 1000.0 / (double)rf.QuadPart;
+      ft0 = ftp;
+    }
+  };
+  double ph_rediscover = 0, ph_light = 0, ph_publish = 0;
 
   uint32_t local_id = 0;
   for (int i = 0; i < out->player_count; ++i) {
@@ -2627,23 +3916,23 @@ static void fill_all_rosters(MatchEconomy* out) {
   }
   if (local_id) g_roster_local_id = local_id;
 
-  // Scan once when the match starts, then again for a few seconds after a save
-  // load. Objects restored from a save often never pass CreateUnit, and the
-  // full object list can still be filling in on the first frame the clock runs.
   const DWORD now = GetTickCount();
   const bool rescan = (int)(g_roster_rescan_until - now) > 0;
-  // The first seconds of a save load are the game's own allocation burst.
-  // Walking every object list then allocates our roster map on that same thread.
-  const bool scan_wait = rescan && (int)(now - g_rescan_began) < 2500;
-  const bool scan_due =
-      !scan_wait && (!g_live_seeded || (rescan && (int)(now - g_roster_next_scan) >= 0));
-  if (scan_due) {
-  if (rescan) {
-    g_logic_off_n = 0;
-    g_logic_refresh = 0;
-    g_player_vec_cache_n = 0;
-  }
-  g_live_scan_tick = 0;
+  // Open → one seed walk. After that, while the panel stays open, reconcile
+  // with another cheap full player-list walk every ~2s (same path, no clear of
+  // g_live) so counts stay accurate without hide/show. Money/power stay on the
+  // separate 100ms refresh.
+  const bool need_seed_walk = g_roster_seed_burst && !g_seed_walk_done;
+  const bool scan_wait =
+      !need_seed_walk && rescan && (int)(now - g_rescan_began) < 4000;
+  const bool light_due =
+      need_seed_walk ||
+      (!g_roster_seed_burst && !scan_wait && (int)(now - g_roster_next_light) >= 0);
+  const bool rediscover_due =
+      (need_seed_walk && g_logic_off_n == 0) ||
+      (!g_roster_seed_burst && !scan_wait &&
+       ((rescan && g_logic_off_n == 0) || (int)(now - g_roster_next_rediscover) >= 0));
+  if (g_catalog_budget < 4) g_catalog_budget = 4;
 
   constexpr uint32_t kGameLogicRva = 0x8DDE84;  // VA 0xCDDE84
   uint32_t logic = 0;
@@ -2655,96 +3944,153 @@ static void fill_all_rosters(MatchEconomy* out) {
     return valid_ent_vector_range(*begin, *end, nullptr);
   };
 
-  // Units and buildings live in different lists. Keep several, and refresh
-  // the set periodically instead of locking onto whichever list was largest once.
-  if (is_ptr(logic) && (g_logic_off_n == 0 || ++g_logic_refresh >= 8)) {
-    g_logic_refresh = 0;
-    g_player_vec_cache_n = 0;
-    struct Cand {
-      uint32_t off = 0;
-      int n = 0;
+  if (rediscover_due) {
+    if (rescan || !g_live_seeded) {
+      g_logic_off_n = 0;
+      g_logic_refresh = 0;
+      g_player_vec_cache_n = 0;
+    }
+    // Units and buildings live in different lists. Refresh the set periodically
+    // instead of locking onto whichever list was largest once.
+    if (is_ptr(logic) && (g_logic_off_n == 0 || ++g_logic_refresh >= 2)) {
+      g_logic_refresh = 0;
+      g_player_vec_cache_n = 0;
+      struct Cand {
+        uint32_t off = 0;
+        int n = 0;
+      };
+      Cand cands[80] = {};
+      int nc = 0;
+      uint32_t seen_begin[400] = {};
+      int nseen = 0;
+      // Coarse step — enough to find the big object lists without melting Present.
+      for (uint32_t off = 0x20; off <= 0x600; off += 8) {
+        uint32_t begin = 0, end = 0;
+        if (!read_logic_vec(off, &begin, &end)) continue;
+        bool dup = false;
+        for (int k = 0; k < nseen; ++k) {
+          if (seen_begin[k] == begin) {
+            dup = true;
+            break;
+          }
+        }
+        if (dup || nseen >= 200) continue;
+        seen_begin[nseen++] = begin;
+        const int n = score_owned_vector(begin, end, out);
+        if (n < 1) continue;
+        if (nc >= 40) {
+          int worst = 0;
+          for (int i = 1; i < nc; ++i) {
+            if (cands[i].n < cands[worst].n) worst = i;
+          }
+          if (n <= cands[worst].n) continue;
+          cands[worst] = Cand{off, n};
+        } else {
+          cands[nc++] = Cand{off, n};
+        }
+      }
+      std::sort(cands, cands + nc, [](const Cand& a, const Cand& b) { return a.n > b.n; });
+      g_logic_off_n = 0;
+      for (int i = 0; i < nc && g_logic_off_n < kMaxLogicLists; ++i) {
+        if (cands[i].n < 1) break;
+        g_logic_offs[g_logic_off_n++] = cands[i].off;
+      }
+    }
+    g_roster_next_rediscover = now + (rescan ? 4000u : 20000u);
+  }
+  mark(&ph_rediscover);
+
+  if (light_due || rediscover_due) {
+    ++g_live_scan_gen;
+    if (g_live_scan_gen <= 0) g_live_scan_gen = 1;
+    g_live_scan_tick = 0;
+    // Reconcile walks must re-consider ents that were dropped during the noisy
+    // open-seed (junk vectors / owner not ready). Keeping g_live_drop forever
+    // made mid-match counts freeze until the user hid and reopened the panel.
+    if (!need_seed_walk && g_live_seeded) {
+      if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
+      g_live_drop.clear();
+      g_live_retries.clear();
+      if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
+    }
+
+    auto note_player_vec = [&](uint32_t begin, uint32_t end, uint32_t list_owner) {
+      uint32_t n = 0;
+      if (!valid_ent_vector_range(begin, end, &n)) return;
+      for (uint32_t i = 0; i < n; ++i) {
+        uint32_t ent = 0;
+        if (!safe_read_u32(begin + i * 4u, &ent) || !is_ptr(ent)) continue;
+        touch_or_note_live(ent, list_owner);
+      }
     };
-    Cand cands[80] = {};
-    int nc = 0;
-    uint32_t seen_begin[400] = {};
-    int nseen = 0;
-    for (uint32_t off = 0x20; off <= 0x600; off += 4) {
-      uint32_t begin = 0, end = 0;
-      if (!read_logic_vec(off, &begin, &end)) continue;
-      bool dup = false;
-      for (int k = 0; k < nseen; ++k) {
-        if (seen_begin[k] == begin) {
-          dup = true;
-          break;
-        }
+    auto touch_logic_vec = [&](uint32_t begin, uint32_t end) {
+      uint32_t n = 0;
+      if (!valid_ent_vector_range(begin, end, &n)) return;
+      for (uint32_t i = 0; i < n; ++i) {
+        uint32_t ent = 0;
+        if (!safe_read_u32(begin + i * 4u, &ent) || !is_ptr(ent)) continue;
+        touch_live_only(ent);
       }
-      if (dup || nseen >= 400) continue;
-      seen_begin[nseen++] = begin;
-      const int n = score_catalog_vector(begin, end, out);
-      if (n < 1) continue;
-      if (nc >= 80) {
-        int worst = 0;
-        for (int i = 1; i < nc; ++i) {
-          if (cands[i].n < cands[worst].n) worst = i;
-        }
-        if (n <= cands[worst].n) continue;
-        cands[worst] = Cand{off, n};
-      } else {
-        cands[nc++] = Cand{off, n};
+    };
+
+    for (int i = 0; i < out->player_count; ++i) {
+      uint32_t offs[kMaxEntVecOffs] = {};
+      const int no =
+          cached_offs_for_player(out->players[i].player, out->players[i].player_id, offs,
+                                 kMaxEntVecOffs);
+      for (int k = 0; k < no; ++k) {
+        uint32_t begin = 0, end = 0;
+        if (!resolve_vector_off(out->players[i].player, offs[k], &begin, &end)) continue;
+        note_player_vec(begin, end, out->players[i].player);
       }
     }
-    std::sort(cands, cands + nc, [](const Cand& a, const Cand& b) { return a.n > b.n; });
-    g_logic_off_n = 0;
-    for (int i = 0; i < nc && g_logic_off_n < kMaxLogicLists; ++i) {
-      if (cands[i].n < 1) break;
-      g_logic_offs[g_logic_off_n++] = cands[i].off;
-    }
-  }
-
-  auto note_vec = [&](uint32_t begin, uint32_t end) {
-    uint32_t n = 0;
-    if (!valid_ent_vector_range(begin, end, &n)) return;
-    for (uint32_t i = 0; i < n; ++i) {
-      uint32_t ent = 0;
-      if (!safe_read_u32(begin + i * 4u, &ent) || !is_ptr(ent)) continue;
-      note_live_ent(ent, 0);
-    }
-  };
-
-  for (int i = 0; i < out->player_count; ++i) {
-    uint32_t offs[kMaxEntVecOffs] = {};
-    const int no =
-        cached_offs_for_player(out->players[i].player, out->players[i].player_id, offs,
-                               kMaxEntVecOffs);
-    for (int k = 0; k < no; ++k) {
+    // Global lists only keep known ents alive in seen_gen — never seed ghosts.
+    for (int i = 0; i < g_logic_off_n; ++i) {
       uint32_t begin = 0, end = 0;
-      if (!resolve_vector_off(out->players[i].player, offs[k], &begin, &end)) continue;
-      note_vec(begin, end);
+      if (read_logic_vec(g_logic_offs[i], &begin, &end)) touch_logic_vec(begin, end);
+    }
+
+    int live_n = 0;
+    int pending = 0;
+    if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
+    live_n = (int)g_live.size();
+    pending = g_add_n;
+    if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
+    if (live_n == g_rescan_last_n) {
+      ++g_rescan_stable;
+    } else {
+      g_rescan_stable = 0;
+      g_rescan_last_n = live_n;
+    }
+
+    // Enqueue walk is cheap; Present drains the classify queue.
+    if (need_seed_walk) {
+      g_seed_walk_done = true;
+      log("roster: full scan enqueued pending=%d live=%d overflow=%d logicLists=%d", pending,
+          live_n, g_seed_queue_overflow ? 1 : 0, g_logic_off_n);
+    } else if (g_live_seeded && light_due) {
+      log("roster: reconcile walk pending=%d live=%d logicLists=%d", pending, live_n,
+          g_logic_off_n);
+    }
+    // Keep reconcile aligned with the 2s economy poll while the panel is open.
+    g_roster_next_light = now + 2000u;
+    g_roster_next_scan = g_roster_next_light;
+    log("roster: scan light=%d rediscover=%d live=%d pending=%d logicLists=%d seeded=%d burst=%d",
+        light_due ? 1 : 0, rediscover_due ? 1 : 0, live_n, pending, g_logic_off_n,
+        g_live_seeded ? 1 : 0, g_roster_seed_burst ? 1 : 0);
+    if (rescan && g_rescan_stable >= 2 && (int)(now - g_rescan_began) >= 5000) {
+      log("roster rescan settled live=%d", live_n);
+      g_roster_rescan_until = now;
     }
   }
-  for (int i = 0; i < g_logic_off_n; ++i) {
-    uint32_t begin = 0, end = 0;
-    if (read_logic_vec(g_logic_offs[i], &begin, &end)) note_vec(begin, end);
-  }
-  int live_n = 0;
-  if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
-  live_n = (int)g_live.size();
-  if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
-  if (live_n == g_rescan_last_n) {
-    ++g_rescan_stable;
-  } else {
-    g_rescan_stable = 0;
-    g_rescan_last_n = live_n;
-  }
-  g_roster_next_scan = GetTickCount() + 400;
-  g_live_seeded = true;
-  if (g_rescan_stable >= 3 && (int)(GetTickCount() - g_rescan_began) >= 4000) {
-    log("roster rescan settled live=%d", live_n);
-    g_roster_rescan_until = GetTickCount();
-  }
-  }
+  mark(&ph_light);
 
   publish_live_roster(out);
+  mark(&ph_publish);
+  g_roster_ph_rediscover = ph_rediscover;
+  g_roster_ph_light = ph_light;
+  g_roster_ph_publish = ph_publish;
+  g_roster_ph_logged = true;
 }
 
 static bool seat_has_record(const PlayerEconomy& pe) {
@@ -2858,11 +4204,35 @@ static int faction_from_side_string_va(uint32_t image_va) {
   }
 }
 
-// Uprising has no unit roster. Walk a bounded pointer graph from the player
-// and look for a side-name string. Depth 3 covers Player -> Template -> Side
-// -> name, and it is cached per player so the cost is paid once a match.
-static int detect_faction_from_player(uint32_t player) {
-  if (!is_ptr(player)) return 0;
+static int detect_faction_by_string(uint32_t player);
+static FacCache* fac_slot(uint32_t player, bool create);
+static int cached_faction_of(uint32_t player);
+
+// Rate limit for the expensive faction graph walk (~40ms per seat). Shared by
+// the stats board and the player pickers: one walk per second, two in a burst.
+// Without it, an unlabelled seat cost ~40ms on every poll/frame — that is what
+// made the match hitch every couple of seconds with 战况统计 open.
+static int g_fac_walk_budget = 0;
+static DWORD g_fac_walk_refill = 0;
+
+static void fac_walk_refill_budget() {
+  const DWORD now = GetTickCount();
+  if (g_fac_walk_refill == 0) {
+    g_fac_walk_refill = now;
+    g_fac_walk_budget = 2;
+    return;
+  }
+  if ((int32_t)(now - g_fac_walk_refill) < 1000) return;
+  g_fac_walk_refill = now;
+  if (g_fac_walk_budget < 2) ++g_fac_walk_budget;
+}
+
+// Expensive half of faction detection: bounded walk of the player object graph
+// looking for a pointer to one of the image's side-name strings. Depth 3 covers
+// Player -> Template -> Side -> name. Up to 128 nodes x 0x400 bytes (~33k
+// protected reads), so callers must go through detect_faction_from_player(),
+// which throttles and budgets it.
+static int faction_walk_from_player(uint32_t player) {
   const uint32_t base = loaded_module();
   if (!base) return 0;
   const uint32_t lo = base;
@@ -2885,7 +4255,8 @@ static int detect_faction_from_player(uint32_t player) {
   };
   enqueue(player);
   int depth_end = qn;
-  for (int depth = 0; depth < 3 && qi < qn; ++depth) {
+  int found = 0;
+  for (int depth = 0; depth < 3 && qi < qn && !found; ++depth) {
     const int stop = depth_end;
     for (; qi < stop; ++qi) {
       const uint32_t node = queue[qi];
@@ -2893,11 +4264,61 @@ static int detect_faction_from_player(uint32_t player) {
         uint32_t v = 0;
         if (!safe_read_u32(node + off, &v)) continue;
         const int f = match(v);
-        if (f) return f;
+        if (f) {
+          found = f;
+          break;
+        }
         enqueue(v);
       }
+      if (found) break;
     }
     depth_end = qn;
+  }
+  return found;
+}
+
+// Faction of one seat. Hits come straight from the cache.
+//
+// Misses run the residual probes (cheap one-hop string read first, then the
+// graph walk). Both the stats board and the player pickers call this, and
+// before it was throttled the walk ran for every seat on every poll — ~40ms
+// each, i.e. the "hitch every couple of seconds" hang while 战况统计 was open.
+// Now: one throttle slot per seat (always created, so no caller can bypass it),
+// a per-poll walk budget, and exponential backoff for seats that never resolve.
+static int detect_faction_from_player(uint32_t player) {
+  if (!is_ptr(player)) return 0;
+  for (int i = 0; i < g_fac_cache_n; ++i) {
+    if (g_fac_cache[i].player == player && g_fac_cache[i].faction > 0) {
+      return g_fac_cache[i].faction;
+    }
+  }
+  FacCache* slot = fac_slot(player, true);
+  const DWORD now_ms = GetTickCount();
+  if (slot && slot->next_try && (int32_t)(now_ms - slot->next_try) < 0) return 0;
+
+  int found = detect_faction_by_string(player);
+  fac_walk_refill_budget();
+  if (!found && g_fac_walk_budget > 0) {
+    --g_fac_walk_budget;
+    found = faction_walk_from_player(player);
+  }
+  if (found) {
+    if (slot) {
+      slot->faction = found;
+      slot->pending = 0;
+      slot->pending_hits = 0;
+      slot->fails = 0;
+    }
+    return found;
+  }
+  // Nothing matched. Back off so an unlabelled seat stops costing ~40ms a poll;
+  // 4s, 8s, 16s ... capped at a minute.
+  if (slot) {
+    if (slot->fails < 6) ++slot->fails;
+    uint32_t back = 4000u;
+    for (int i = 1; i < slot->fails && back < 60000u; ++i) back <<= 1;
+    if (back > 60000u) back = 60000u;
+    slot->next_try = now_ms + back;
   }
   return 0;
 }
@@ -2949,9 +4370,7 @@ static int detect_faction(const PlayerEconomy& pe) {
     }
   }
   if (best) return best;
-  int f = detect_faction_from_player(pe.player);
-  if (!f) f = detect_faction_by_string(pe.player);
-  return f;
+  return detect_faction_from_player(pe.player);
 }
 
 // The engine always creates one extra seat for the neutral / civilian side.
@@ -3090,6 +4509,15 @@ static FacCache* fac_slot(uint32_t player, bool create) {
   return nullptr;
 }
 
+// Per-seat gate for the expensive faction probes (player graph walk + side
+// string search). Shared by the economy board and the player pickers so a seat
+// that stays unknown is never re-probed more than once every couple of seconds.
+static bool fac_probe_due(uint32_t player) {
+  FacCache* slot = fac_slot(player, true);
+  if (!slot) return false;
+  return !slot->next_try || (int32_t)(GetTickCount() - slot->next_try) >= 0;
+}
+
 static void apply_seat_labels(MatchEconomy* out) {
   if (!out) return;
   const bool up = uprising_active();
@@ -3097,17 +4525,11 @@ static void apply_seat_labels(MatchEconomy* out) {
     PlayerEconomy& pe = out->players[i];
     FacCache* slot = fac_slot(pe.player, true);
     int faction = slot ? slot->faction : 0;
-    const uint32_t now_ms = GetTickCount();
-    // Uprising: the pointer walk is heavy, so only retry every couple of
-    // seconds once a seat has been measured and stayed unknown.
-    const bool due = !up || !slot || !slot->next_try ||
-                     (int32_t)(now_ms - slot->next_try) >= 0;
-    if (!faction && due) {
-      int detected = detect_faction(pe);
-      if (!detected) detected = detect_faction_from_player(pe.player);
-      if (!detected) detected = detect_faction_by_string(pe.player);
-      faction = remember_faction(pe.player, pe, detected);
-      if (up && slot) slot->next_try = now_ms + 2000;
+    // detect_faction() is a roster tally first and only falls back to the
+    // throttled, budgeted pointer walk inside detect_faction_from_player().
+    if (!faction) {
+      const int detected = detect_faction(pe);
+      if (detected) faction = remember_faction(pe.player, pe, detected);
     }
     if (up && seat_diag_once(pe.player)) {
       uint8_t observer = 0, replay = 0;
@@ -3429,6 +4851,7 @@ static ProtoKey g_proto_keys[640];
 static int g_proto_key_n = 0;
 static uint32_t g_proto_factory = 0;
 static DWORD g_proto_try_at = 0;
+static int g_proto_empty_tries = 0;
 
 static void remember_proto_key(uint32_t key, const ProtocolFace* face) {
   if (key == 0 || !face) return;
@@ -3542,12 +4965,22 @@ static void ensure_protocol_keys() {
   if (module_base()) safe_read_u32(module_base() + 0x008EBDE8, &factory);
   if (g_proto_key_n > 0 && factory == g_proto_factory && is_ptr(factory)) return;
   const DWORD now = GetTickCount();
-  if (g_proto_key_n == 0 && factory == g_proto_factory && is_ptr(factory) &&
-      now - g_proto_try_at < 2000) {
-    return;
+  // A rebuild walks the whole ThingFactory template list plus the GameLogic
+  // object hash (~45ms). It used to retry every 2s when it came back empty —
+  // i.e. on nearly every other stats poll, which is a 45ms hitch each time.
+  // Retry quickly a couple of times (factory may still be filling up), then
+  // back off hard.
+  if (g_proto_key_n == 0 && factory == g_proto_factory && is_ptr(factory)) {
+    const DWORD wait = g_proto_empty_tries < 3 ? 4000u : 30000u;
+    if (now - g_proto_try_at < wait) return;
   }
   g_proto_try_at = now;
   rebuild_protocol_keys();
+  if (g_proto_key_n == 0) {
+    if (g_proto_empty_tries < 1000) ++g_proto_empty_tries;
+  } else {
+    g_proto_empty_tries = 0;
+  }
 }
 
 static bool read_ptr_span(uint32_t begin_addr, uint32_t end_addr, uint32_t* begin, uint32_t* end,
@@ -4008,7 +5441,24 @@ static bool read_battle_clock(uint32_t* logic_out, float* seconds_out) {
 
 bool collect_match_economy_impl(MatchEconomy* out) {
   if (!out) return false;
+  // Phase timings. The whole poll is throttled to 2s by the stats board, but if
+  // it is still slow the log should say which half is responsible.
+  LARGE_INTEGER perf_freq{}, perf_t0{}, perf_prev{}, perf_now{};
+  QueryPerformanceFrequency(&perf_freq);
+  QueryPerformanceCounter(&perf_t0);
+  perf_prev = perf_t0;
+  double ph_walk = 0, ph_roster = 0, ph_label = 0, ph_proto = 0;
+  auto mark = [&](double* slot) {
+    QueryPerformanceCounter(&perf_now);
+    if (perf_freq.QuadPart > 0) {
+      *slot = (double)(perf_now.QuadPart - perf_prev.QuadPart) * 1000.0 /
+              (double)perf_freq.QuadPart;
+    }
+    perf_prev = perf_now;
+  };
   *out = MatchEconomy{};
+  // The faction graph walk is rate-limited globally (see fac_walk_refill_budget),
+  // so even the first poll of a match cannot stall Present for most of a second.
   if (!loaded_module()) {
     std::snprintf(out->note, sizeof(out->note), u8"未找到游戏模块");
     return false;
@@ -4084,8 +5534,13 @@ bool collect_match_economy_impl(MatchEconomy* out) {
     }
   }
 
+  mark(&ph_walk);
+
   // Unit tallies use retail entity offsets. Leave them off on Uprising.
-  if (!uprising_active()) fill_all_rosters(out);
+  if (!uprising_active()) {
+    fill_all_rosters(out);
+    mark(&ph_roster);
+  }
 
   // Drop spectators and seats that have not entered. Keep anyone already
   // shown this match, including after defeat.
@@ -4123,6 +5578,7 @@ bool collect_match_economy_impl(MatchEconomy* out) {
   }
 
   apply_seat_labels(out);
+  mark(&ph_label);
 
   // Scrub any dummy local seat recorded before this fix / earlier in the match.
   if (uprising_active()) drop_dummy_local_seats();
@@ -4172,9 +5628,13 @@ bool collect_match_economy_impl(MatchEconomy* out) {
     }
   }
 
-  if (!uprising_active()) {
+  // Protocol key rebuild alone is ~40ms. Skip it while a full-scan seed is
+  // still draining — the board only needs unit/building tallies then, and the
+  // 500ms seed poll was hitching Present on proto every time.
+  if (!uprising_active() && !g_roster_seed_burst) {
     for (int i = 0; i < out->player_count; ++i) fill_player_protocols(&out->players[i]);
   }
+  mark(&ph_proto);
 
   out->valid = out->player_count > 0;
   if (!out->valid) {
@@ -4185,6 +5645,24 @@ bool collect_match_economy_impl(MatchEconomy* out) {
   } else {
     std::snprintf(out->note, sizeof(out->note), u8"对局资源 · %d 方有统计",
                   out->player_count);
+  }
+  {
+    QueryPerformanceCounter(&perf_now);
+    const double total = (perf_freq.QuadPart > 0)
+                             ? (double)(perf_now.QuadPart - perf_t0.QuadPart) * 1000.0 /
+                                   (double)perf_freq.QuadPart
+                             : 0.0;
+    if (total >= 25.0) {
+      if (g_roster_ph_logged) {
+        log("perf: economy total=%.1fms walk=%.1f roster=%.1f labels=%.1f proto=%.1f players=%d "
+            "| roster rd=%.1f light=%.1f pub=%.1f",
+            total, ph_walk, ph_roster, ph_label, ph_proto, out->player_count,
+            g_roster_ph_rediscover, g_roster_ph_light, g_roster_ph_publish);
+      } else {
+        log("perf: economy total=%.1fms walk=%.1f roster=%.1f labels=%.1f proto=%.1f players=%d",
+            total, ph_walk, ph_roster, ph_label, ph_proto, out->player_count);
+      }
+    }
   }
   return out->valid;
 }
@@ -4599,10 +6077,8 @@ static void forget_lock_targets() {
     ban.applied_n = 0;
     ban.tmpl_n = 0;
   }
-  ensure_tpl_cs();
-  EnterCriticalSection(&g_tpl_cs);
-  g_tpl_type_cache.clear();
-  LeaveCriticalSection(&g_tpl_cs);
+  // Do NOT clear g_tpl_type_cache here — build_lock_tick used to wipe it every
+  // 400ms during match open, forcing mass TypeId re-walks and hitching Present.
 }
 
 static void build_lock_tick_impl() {
@@ -5053,15 +6529,39 @@ static uint32_t call_find_template(uint32_t factory, const char* interned) {
 
 // The finder hashes the exact string pointer it stored at load time.
 // Search process memory for that copy and look the pointer up.
+// ⚠️ 这是全进程内存扫描：一次可能几十毫秒到几百毫秒，跑在渲染线程上就是卡帧，
+//    连续几个不存在的 id 会让游戏看起来像死掉（进而被判定为崩溃）。
+//    所以加了 12ms 时间预算 + 每局最多 4 次，超了就直接放弃这次兜底。
 static uint32_t find_template_by_interned_name(uint32_t factory, const char* id) {
   const size_t n = std::strlen(id);
   if (n < 4 || n > 80) return 0;
+  static int s_scans = 0;
+  static DWORD s_last_scan = 0;
+  const DWORD now_tick = GetTickCount();
+  if (static_cast<int32_t>(now_tick - s_last_scan) > 30000) s_scans = 0;  // 30 秒后重新给额度
+  s_last_scan = now_tick;
+  if (s_scans >= 4) return 0;
+  ++s_scans;
+  LARGE_INTEGER freq{}, t0{};
+  QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&t0);
+  auto out_of_time = [&]() {
+    if (!freq.QuadPart) return false;
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    const double ms = (double)(now.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
+    return ms > 12.0;
+  };
   SYSTEM_INFO si{};
   GetSystemInfo(&si);
   auto* p = static_cast<uint8_t*>(si.lpMinimumApplicationAddress);
   auto* end = static_cast<uint8_t*>(si.lpMaximumApplicationAddress);
   int tried = 0;
   while (p < end && tried < 24) {
+    if (out_of_time()) {
+      log("summon name %s: interned-name scan hit its time budget", id);
+      break;
+    }
     MEMORY_BASIC_INFORMATION mbi{};
     if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi)) break;
     auto* base = static_cast<uint8_t*>(mbi.BaseAddress);
@@ -5125,12 +6625,397 @@ static uint32_t lookup_template_official(uint32_t factory, const char* id) {
   return 0;
 }
 
+// 类型名是否真的登记在模板库里（大小写敏感，和 FindTemplate 的键一致）。
+// 只在名单够大（>500）时才当"负结论"用：名单是扫 ThingFactory 哈希表得来的，
+// 比 find_template_by_id 的兜底路径（遍历 4096 个模板 × 每个 0x180 字节，
+// 再全进程内存找驻留字符串）便宜几个数量级。
+// 名单是不是从哈希表（权威）读出来的。兜底扫描出来的名字可能残缺，
+// 不能拿去当"这个类型不存在"的证据。
+static bool g_obj_names_from_hash = false;
+static bool type_list_from_hash() { return g_obj_names_from_hash; }
+
+static uint32_t find_template_by_id(const char* id);
+
+// ---------------------------------------------------------------------------
+// 模板查找：算出 SAGE 对象类型哈希，再调引擎自己的 FindTemplate。
+// 依据 Ra3-Copilot 的 pipeline（units.html#pipeline）：
+//   代码 = StringHasher.Hash(模板名.lower())，是 SuperFastHash 变体，不是 CRC32 / FNV。
+// 引擎的 FindTemplate(store, edx, hash) 只按哈希查表（那棵哈希树的键其实是名字
+// 的哈希，不是字符串指针），所以按字符串扫桶永远配不上——特殊单位（红鬼王、
+// 将军刽子手……）召唤不出来的根因就在这里：名字明明在内存里，表里却找不到。
+// ---------------------------------------------------------------------------
+constexpr uint32_t kFnTemplateFindRva = 0x003E4230;   // FindTemplate  (VA 0x7E4230)
+constexpr uint32_t kTemplateStoreRva = 0x008E6C58;    // ThingFactory 全局 (VA 0xCE6C58)
+
+static uint32_t sage_hash_lower(const char* s) {
+  if (!s || !s[0]) return 0;
+  // 支持直接写十六进制代码
+  if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X') && std::strlen(s) == 10) {
+    uint32_t v = 0;
+    for (int i = 2; i < 10; ++i) {
+      const char c = s[i];
+      uint32_t d;
+      if (c >= '0' && c <= '9') d = (uint32_t)(c - '0');
+      else if (c >= 'a' && c <= 'f') d = (uint32_t)(c - 'a' + 10);
+      else if (c >= 'A' && c <= 'F') d = (uint32_t)(c - 'A' + 10);
+      else return 0;
+      v = (v << 4) | d;
+    }
+    return v;
+  }
+  char low[128] = {};
+  size_t len = 0;
+  for (; s[len] && len < sizeof(low) - 1; ++len) {
+    char c = s[len];
+    if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    low[len] = c;
+  }
+  const unsigned char* b = reinterpret_cast<const unsigned char*>(low);
+  const uint32_t n = (uint32_t)len;
+  uint32_t h = n;
+  uint32_t i = 0;
+  for (uint32_t k = 0; k < n / 4; ++k, i += 4) {
+    h += (uint32_t)(b[i] | (b[i + 1] << 8));
+    const uint32_t tmp = ((uint32_t)(b[i + 2] | (b[i + 3] << 8))) ^ (h << 5);
+    h ^= tmp << 11;
+    h += h >> 11;
+  }
+  switch (n & 3) {
+    case 3:
+      h += (uint32_t)(b[i] | (b[i + 1] << 8));
+      h ^= (h ^ ((uint32_t)b[i + 2] << 2)) << 16;
+      h += h >> 11;
+      break;
+    case 2:
+      h += (uint32_t)(b[i] | (b[i + 1] << 8));
+      h ^= h << 11;
+      h += h >> 17;
+      break;
+    case 1:
+      h += b[i];
+      h ^= h << 10;
+      h += h >> 1;
+      break;
+    default:
+      break;
+  }
+  h ^= h << 3;
+  h += h >> 5;
+  h ^= h << 2;
+  h += h >> 15;
+  h ^= h << 10;
+  return h;
+}
+
+static bool template_plausible(uint32_t tmpl) {
+  if (!is_ptr(tmpl)) return false;
+  uint32_t vt = 0;
+  const uint32_t base = module_base();
+  if (!safe_read_u32(tmpl, &vt) || !is_ptr(vt)) return false;
+  return base && vt >= base && vt < base + 0x940000u;
+}
+
+static uint32_t module_image_size() {
+  const uint32_t base = module_base();
+  if (!base) return 0;
+  __try {
+    const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    const IMAGE_NT_HEADERS* nt =
+        reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    return nt->OptionalHeader.SizeOfImage;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return 0;
+  }
+}
+
+// ---- 自动定位 FindTemplate 与 ThingFactory 全局 ----
+// 照 Copilot（symres.cpp）的做法：认函数用字节签名，再由
+// `mov ecx,[imm32]; call FindTemplate` 这类代码里取出现次数最多的 imm32
+// 当 ThingFactory 全局。这样不依赖某个版本的具体 RVA（本机读 0xCE6C58 是 0，
+// 说明那个地址对这个构建不成立）。
+static constexpr uint8_t kSigFindTemplate[] = {0x83, 0xEC, 0x08, 0x56, 0x8D, 0x71, 0x28,
+                                               0x8D, 0x44, 0x24, 0x10, 0x50, 0x8D, 0x4C,
+                                               0x24, 0x08, 0x51, 0x8B, 0xCE, 0xE8};
+
+static uint32_t g_tmpl_find_fn = 0;      // FindTemplate 的绝对地址
+static uint32_t g_tmpl_factory_slot = 0; // ThingFactory 全局变量的地址
+static uint32_t g_tmpl_store = 0;        // 上面那个全局里存的对象
+static int g_tmpl_hits = 0;
+static bool g_tmpl_discovered = false;
+
+// 一个裸调用 + SEH 的小壳（__try 里不能有需要析构的局部对象，所以别把 lambda 塞进来）
+static uint32_t call_find_template(uint32_t fn, uint32_t store, uint32_t hash) {
+  using Fn = uint32_t(__fastcall*)(void*, void*, uint32_t);
+  uint32_t tmpl = 0;
+  __try {
+    tmpl = reinterpret_cast<Fn>(fn)(reinterpret_cast<void*>(store), nullptr, hash);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    tmpl = 0;
+  }
+  return tmpl;
+}
+
+// 在已提交可读的区域里扫一段字节，避免踩到未提交页（直接读会 AV）。
+static bool image_region_readable(const MEMORY_BASIC_INFORMATION& mbi) {
+  if (mbi.State != MEM_COMMIT) return false;
+  if (mbi.Protect & PAGE_NOACCESS) return false;
+  if (mbi.Protect & (PAGE_GUARD)) return false;
+  return true;
+}
+
+static int scan_image_signature(uint32_t base, uint32_t size, const uint8_t* sig, int siglen,
+                                uint32_t* out, int maxout) {
+  int n = 0;
+  uint32_t p = base;
+  const uint32_t end = base + size;
+  while (p < end && n < maxout) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(reinterpret_cast<LPCVOID>(p), &mbi, sizeof(mbi))) break;
+    uint32_t rs = reinterpret_cast<uint32_t>(mbi.BaseAddress);
+    uint32_t rsz = static_cast<uint32_t>(mbi.RegionSize);
+    if (!rsz) break;
+    uint32_t re = rs + rsz;
+    if (re > end) re = end;
+    if (image_region_readable(mbi) && re > rs + (uint32_t)siglen) {
+      const uint32_t limit = re - (uint32_t)siglen;
+      __try {
+        for (uint32_t i = rs; i < limit && n < maxout; ++i) {
+          if (*reinterpret_cast<const uint8_t*>(i) != sig[0]) continue;
+          if (std::memcmp(reinterpret_cast<const void*>(i), sig, siglen) == 0) out[n++] = i;
+        }
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+      }
+    }
+    p = re;
+  }
+  return n;
+}
+
+// 找 `8B 0D <imm32> E8 <rel32→fn>` 里出现最多的 imm32（Copilot 用的同一招）
+static int scan_factory_slots(uint32_t base, uint32_t size, uint32_t fn, uint32_t* slots,
+                              int* counts, int maxout) {
+  int nc = 0;
+  uint32_t p = base;
+  const uint32_t end = base + size;
+  while (p < end) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(reinterpret_cast<LPCVOID>(p), &mbi, sizeof(mbi))) break;
+    uint32_t rs = reinterpret_cast<uint32_t>(mbi.BaseAddress);
+    uint32_t rsz = static_cast<uint32_t>(mbi.RegionSize);
+    if (!rsz) break;
+    uint32_t re = rs + rsz;
+    if (re > end) re = end;
+    if (image_region_readable(mbi) && re > rs + 11) {
+      const uint32_t limit = re - 11;
+      __try {
+        for (uint32_t i = rs; i < limit; ++i) {
+          if (*reinterpret_cast<const uint8_t*>(i) != 0x8B) continue;
+          if (*reinterpret_cast<const uint8_t*>(i + 1) != 0x0D) continue;
+          if (*reinterpret_cast<const uint8_t*>(i + 6) != 0xE8) continue;
+          int32_t rel = 0;
+          std::memcpy(&rel, reinterpret_cast<const void*>(i + 7), 4);
+          if (i + 11 + static_cast<uint32_t>(rel) != fn) continue;
+          uint32_t imm = 0;
+          std::memcpy(&imm, reinterpret_cast<const void*>(i + 2), 4);
+          if (imm < base || imm >= end) continue;
+          int k = 0;
+          for (; k < nc; ++k) {
+            if (slots[k] == imm) {
+              ++counts[k];
+              break;
+            }
+          }
+          if (k == nc && nc < maxout) {
+            slots[nc] = imm;
+            counts[nc] = 1;
+            ++nc;
+          }
+        }
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+      }
+    }
+    p = re;
+  }
+  return nc;
+}
+
+static void discover_template_lookup() {
+  if (g_tmpl_discovered) return;
+  if (!module_base()) return;
+  g_tmpl_discovered = true;
+  const uint32_t base = module_base();
+  const uint32_t size = module_image_size();
+  if (!size) {
+    log("template: cannot read module headers, hash lookup disabled");
+    return;
+  }
+  // ① 认函数：先看 RVA，再看 Copilot 的字节签名
+  const uint32_t rva = base + kFnTemplateFindRva;
+  uint8_t probe[sizeof(kSigFindTemplate)] = {};
+  bool rva_ok = safe_read_bytes(rva, probe, sizeof(probe)) &&
+                std::memcmp(probe, kSigFindTemplate, sizeof(probe)) == 0;
+  uint32_t fn = 0;
+  if (rva_ok) {
+    fn = rva;
+    log("template: FindTemplate at RVA 0x%X (signature ok)", kFnTemplateFindRva);
+  } else {
+    uint32_t hits[8] = {};
+    const int nh = scan_image_signature(base, size, kSigFindTemplate,
+                                        (int)sizeof(kSigFindTemplate), hits, 8);
+    if (nh >= 1) {
+      fn = hits[0];
+      if (nh > 1) {
+        // 同形的有几个：挑被最多 `mov ecx,[imm]` 指向的那个
+        uint32_t slots[32] = {};
+        int counts[32] = {};
+        int best = -1;
+        for (int k = 0; k < nh; ++k) {
+          const int nc = scan_factory_slots(base, size, hits[k], slots, counts, 32);
+          int total = 0;
+          for (int i = 0; i < nc; ++i) total += counts[i];
+          if (best < 0 || total > best) {
+            best = total;
+            fn = hits[k];
+          }
+        }
+        log("template: %d signature hits, picked %08X", nh, fn);
+      }
+    } else {
+      log("template: FindTemplate signature not found, hash lookup disabled");
+      return;
+    }
+  }
+  if (!fn) return;
+  g_tmpl_find_fn = fn;
+
+  // ② 反推 ThingFactory 全局
+  uint32_t slots[32] = {};
+  int counts[32] = {};
+  const int nc = scan_factory_slots(base, size, fn, slots, counts, 32);
+  int best = -1;
+  for (int i = 0; i < nc; ++i) {
+    if (best < 0 || counts[i] > counts[best]) best = i;
+  }
+  if (best >= 0 && counts[best] >= 2) {
+    g_tmpl_factory_slot = slots[best];
+    g_tmpl_hits = counts[best];
+    uint32_t store = 0;
+    if (safe_read_u32(g_tmpl_factory_slot, &store) && is_ptr(store)) g_tmpl_store = store;
+  }
+
+  // ③ 验证：拿 JapanMCV（一定存在）的哈希去查；查不到就试另两个已知全局
+  const uint32_t probe_hash = sage_hash_lower("JapanMCV");
+  const uint32_t probe_hash2 = sage_hash_lower("AlliedBarracks");
+  uint32_t got = 0;
+  if (g_tmpl_store) {
+    const uint32_t t = call_find_template(fn, g_tmpl_store, probe_hash);
+    if (template_plausible(t)) got = t;
+  }
+  if (got) {
+    log("template: find=%08X factory slot=%08X store=%08X (hits=%d) probe tmpl=%08X", fn,
+        g_tmpl_factory_slot, g_tmpl_store, g_tmpl_hits, got);
+  } else {
+    const uint32_t cand_slots[2] = {base + kTemplateStoreRva, base + kThingFactoryRva};
+    uint32_t chosen = 0, chosen_store = 0;
+    for (int i = 0; i < 2 && !chosen; ++i) {
+      uint32_t s = 0;
+      if (!safe_read_u32(cand_slots[i], &s) || !is_ptr(s)) continue;
+      const uint32_t t = call_find_template(fn, s, probe_hash);
+      if (template_plausible(t)) {
+        chosen = cand_slots[i];
+        chosen_store = s;
+        got = t;
+      }
+    }
+    if (chosen) {
+      g_tmpl_factory_slot = chosen;
+      g_tmpl_store = chosen_store;
+      log("template: find=%08X fallback slot=%08X store=%08X probe tmpl=%08X", fn, chosen,
+          chosen_store, got);
+    } else {
+      log("template: find=%08X but no working store (derived slot=%08X store=%08X)", fn,
+          g_tmpl_factory_slot, g_tmpl_store);
+    }
+  }
+  if (g_tmpl_store) {
+    const uint32_t t2 = call_find_template(fn, g_tmpl_store, probe_hash2);
+    log("template: probe AlliedBarracks %08X -> %08X", probe_hash2, t2);
+  }
+}
+
+// 引擎模板库里的直接查表。hash 不用小写化——调用方先算好。
+static uint32_t template_find_by_hash(uint32_t hash) {
+  if (!hash || !module_base()) return 0;
+  static int s_fail_logged = 0;
+  discover_template_lookup();
+  if (!g_tmpl_find_fn) return 0;
+  uint32_t store = g_tmpl_store;
+  if (!is_ptr(store)) {
+    if (!safe_read_u32(g_tmpl_factory_slot, &store) || !is_ptr(store)) return 0;
+    g_tmpl_store = store;
+  }
+  const uint32_t tmpl = call_find_template(g_tmpl_find_fn, store, hash);
+  if (!template_plausible(tmpl)) {
+    if (s_fail_logged < 8) {
+      ++s_fail_logged;
+      log("template hash %08X -> %08X (not a template)", hash, tmpl);
+    }
+    return 0;
+  }
+  return tmpl;
+}
+
+static bool type_id_registered(const char* id) {
+  if (!id || !id[0]) return false;
+  if (!type_list_from_hash()) return true;  // 名单来自兜底扫描，不可信 → 不下结论
+  const std::vector<std::string>& all = object_type_names();
+  if (all.size() < 500) return true;
+  return std::binary_search(all.begin(), all.end(), std::string(id));
+}
+
 static uint32_t find_template_by_id(const char* id) {
   if (!module_base() || !id || !id[0]) return 0;
+  // ① 哈希直查（权威路径，Copilot 的 pipeline 同款）：不依赖名单、不扫内存，
+  //    名字在内存里但扫桶配不上的特殊单位也能查到。
+  {
+    const uint32_t hash = sage_hash_lower(id);
+    if (hash) {
+      const uint32_t by_hash = template_find_by_hash(hash);
+      if (by_hash) {
+        static int s_logged = 0;
+        if (s_logged < 12) {
+          ++s_logged;
+          log("summon %s: hash 0x%08X -> tmpl %08X", id, hash, by_hash);
+        }
+        return by_hash;
+      }
+      log("summon %s: hash 0x%08X not in template library", id, hash);
+    }
+  }
+
   uint32_t factory = 0;
   if (!safe_read_u32(module_base() + kThingFactoryRva, &factory) || !is_ptr(factory)) return 0;
+
+  if (!type_id_registered(id)) {
+    // 名单里没有 → 这个版本确实没有这个模板。**不要**再走兜底：
+    // find_template_by_interned_name 会遍历整个进程内存，一次几十毫秒到几秒，
+    // 在渲染线程上连续几个不存在的 id 就会把游戏卡死（看起来像崩溃）。
+    log("template %s not in factory list", id);
+    return 0;
+  }
   const uint32_t named = lookup_template_official(factory, id);
-  if (is_ptr(named)) return named;
+  if (is_ptr(named)) {
+    // 护栏：表里有些键指向的不是可 CreateUnit 的模板（技能 / OCL / 脚本对象）。
+    // 只看 vtable 是否落在游戏模块里；不在就当没找到，绝不能再拿去造对象（会崩）。
+    uint32_t vt = 0;
+    const uint32_t base = module_base();
+    if (safe_read_u32(named, &vt) && is_ptr(vt) && base && vt >= base && vt < base + 0x940000u) {
+      return named;
+    }
+    log("summon %s: table entry %08X does not look like a template (vt=%08X)", id, named, vt);
+  }
   uint32_t tmpl = 0;
   if (safe_read_u32(factory + 0x24, &tmpl) && is_ptr(tmpl)) {
     for (int n = 0; n < 4096 && is_ptr(tmpl); ++n) {
@@ -5181,7 +7066,7 @@ static bool summon_prepare_impl(uint32_t player, int count, const char* const* t
   if (count < 1) count = 1;
   if (count > 20) count = 20;
   if (!type_ids || type_count <= 0) {
-    if (out_msg) *out_msg = u8"请先选择要召唤的部队";
+    if (out_msg) *out_msg = u8"请先选择要召唤的单位 / 建筑";
     return false;
   }
   if (type_count > 64) type_count = 64;
@@ -5190,13 +7075,13 @@ static bool summon_prepare_impl(uint32_t player, int count, const char* const* t
   g_summon_snap.count = count;
   for (int i = 0; i < type_count; ++i) {
     if (!type_ids[i] || !type_ids[i][0]) continue;
-    if (type_id_is_building(type_ids[i])) continue;
+    // 建筑也允许召唤（引擎的 CreateUnit 对建筑模板同样有效）。
     std::snprintf(g_summon_snap.ids[g_summon_snap.n], sizeof(g_summon_snap.ids[0]), "%s",
                   type_ids[i]);
     if (++g_summon_snap.n >= 64) break;
   }
   if (g_summon_snap.n <= 0) {
-    if (out_msg) *out_msg = u8"请先选择要召唤的部队";
+    if (out_msg) *out_msg = u8"请先选择要召唤的单位 / 建筑";
     return false;
   }
   return true;
@@ -5209,12 +7094,15 @@ struct PendingSpawn {
   float x = 0.f;
   float y = 0.f;
   float z = 0.f;
+  float base_z = 0.f;  // 鼠标落点的地形高度（不含抬升），用来判断"这个对象被抬过"
+  int tag = 0;         // 属于第几个请求类型（用于回报"哪种没造出来"）
 };
 
 static PendingSpawn g_spawn_q[1280];
 static volatile LONG g_spawn_pub = 0;
 static volatile LONG g_spawn_made = 0;
 static volatile LONG g_spawn_busy = 0;
+static int g_spawn_type_made[64] = {};
 static HANDLE g_spawn_event = nullptr;
 
 static void ensure_spawn_event() {
@@ -5222,15 +7110,552 @@ static void ensure_spawn_event() {
 }
 
 static uint32_t create_unit_on_this_thread(uint32_t tmpl, uint32_t pos, uint32_t owner,
-                                           uint32_t info) {
+                                           uint32_t info, bool* threw) {
   using Fn = uint32_t(__cdecl*)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
   uint32_t ent = 0;
+  if (threw) *threw = false;
   __try {
     ent = reinterpret_cast<Fn>(va_of(kFnCreateUnit))(0, tmpl, pos, owner, info);
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     ent = 0;
+    if (threw) *threw = true;
   }
   return ent;
+}
+
+// 召唤出来的对象是"隐形 / 未入世"状态：小地图图标透明、引擎不把它当场上单位。
+// Copilot 同源经验（实测同 vtable 逐字节对拍）：
+//   实心 = {+0xC8:0, +0x28:0, +0x208:0}，刚召唤 = {+0xC8:0x800, +0x28:0x80000000, +0x208:0x80000000}
+// 所以创建后置 +0xBC 的 bit31、清掉这三位；不清就会出现"召唤了但场上什么都看不到"。
+static bool g_summon_visible_fix = true;
+
+// 找出对象里所有"位置副本"：本体的 Coord3D、以及一层子对象（Drawable / 物理体，
+// 变换矩阵的平移分量也是连续三个 float x,y,z）里的坐标。
+// 判据：三个连续 float 的 x/y 落在落点附近、z 接近地形高度。
+// 之前只取第一个命中（+0x38）→ 改的不是渲染用的那一份，所以"高度不生效"。
+struct PosField {
+  uint32_t obj = 0;
+  uint32_t off = 0;
+  float z = 0.f;
+};
+constexpr int kMaxPosFields = 8;
+
+static int collect_pos_fields(uint32_t obj, float x, float y, float zg, bool check_z,
+                              PosField* out, int max);
+
+// CreateUnit 对地面层对象会把 z 贴回地形高度（气球炸弹因此一出生就"落地"）。
+// 一个对象里通常有好几份位置副本（本体 Coord3D、子对象、Drawable 变换矩阵的平移），
+// 只改其中一份就"高度不生效"。这里把全部匹配到的坐标副本一起抬起来，
+// 返回找到的副本数（>0 才算抬过）。
+static int post_create_lift(uint32_t obj, float x, float y, float zg, float want_z) {
+  if (!is_ptr(obj) || want_z <= 0.f) return 0;
+  PosField f[kMaxPosFields];
+  const int n = collect_pos_fields(obj, x, y, zg, true, f, kMaxPosFields);
+  if (n <= 0) {
+    log("summon: no position copy found on %08X (x=%.1f y=%.1f)", obj, x, y);
+    return 0;
+  }
+  int raised = 0;
+  for (int i = 0; i < n; ++i) {
+    log("summon: %08X pos copy +0x%X z=%.1f want=%.1f", f[i].obj, f[i].off, f[i].z, want_z);
+    if (want_z > f[i].z + 5.f) {
+      write_f32(f[i].obj + f[i].off + 8, want_z);
+      ++raised;
+    }
+  }
+  log("summon: raised %d/%d position copies on %08X to z=%.1f", raised, n, obj, want_z);
+  return n;
+}
+
+// ---- 召唤出来的空中单位保持高度 ----
+// 气球炸弹的模板描述就是 Slow-Falling Ordnance：它落地/接触地形即引爆。
+// 光把创建时的 z 抬高只是把它变成"从高处掉下来炸"，所以这里再加一层：把它们的
+// 位置每帧按回召唤高度，让它们真的停在空中；要给它们"投放"，用面板上的「放手」清表。
+struct AirHold {
+  uint32_t obj = 0;
+  uint32_t off = 0;   // 该对象的位置字段偏移
+  float z = 0.f;
+  uint32_t vt = 0;    // 记下 vtable：内存被复用（换了对象）就不认
+  float sx = 0.f;     // 召唤点：对象跑远了就不再托（防写错对象）
+  float sy = 0.f;
+  DWORD born = 0;
+  DWORD probe_at = 0; // 下一次打诊断日志的时间
+};
+// 一个对象可能有好几份位置副本（本体 + 子对象 / Drawable 的变换矩阵平移分量）。
+// 全部都要托住，否则改的那一份不是渲染用的那一份，看起来就是"高度不生效"。
+static AirHold g_air_hold[96];
+static int g_air_hold_n = 0;
+static volatile LONG g_air_hold_on = 1;
+static volatile LONG g_air_hold_live = 0;   // 当前被托住的个数（给界面显示）
+// 托举表被两条线程碰：Present（每帧托住）和 Destroy 钩子（对象销毁时出表）。
+// 用自旋锁而不是 CRITICAL_SECTION：钩子跑在游戏线程上，绝不能在这里阻塞等待。
+static volatile LONG g_air_lock = 0;
+
+static bool air_lock_take() {
+  for (int i = 0; i < 2000; ++i) {
+    if (InterlockedCompareExchange(&g_air_lock, 1, 0) == 0) return true;
+    YieldProcessor();
+  }
+  return false;
+}
+
+static void air_lock_drop() { InterlockedExchange(&g_air_lock, 0); }
+
+bool air_hold_enabled_impl() { return g_air_hold_on != 0; }
+
+void set_air_hold_enabled_impl(bool on) {
+  InterlockedExchange(&g_air_hold_on, on ? 1 : 0);
+  if (!on) {
+    g_air_hold_n = 0;
+    InterlockedExchange(&g_air_hold_live, 0);
+  }
+}
+
+int air_hold_count_impl() { return (int)InterlockedCompareExchange(&g_air_hold_live, 0, 0); }
+
+// 「放手」：清掉托举表，它们就开始自然下落（该炸就炸）。
+void air_hold_release_all_impl() {
+  if (!air_lock_take()) return;
+  g_air_hold_n = 0;
+  InterlockedExchange(&g_air_hold_live, 0);
+  air_lock_drop();
+}
+
+void air_hold_forget_impl(uint32_t obj) {
+  if (!obj) return;
+  if (!air_lock_take()) return;   // 拿不到锁就等下一帧的存活校验把它清掉
+  if (g_air_hold_n > 0) {
+    int w = 0;
+    for (int i = 0; i < g_air_hold_n; ++i) {
+      if (g_air_hold[i].obj == obj) continue;
+      g_air_hold[w++] = g_air_hold[i];
+    }
+    g_air_hold_n = w;
+    InterlockedExchange(&g_air_hold_live, w);
+  }
+  air_lock_drop();
+}
+
+// need_vt = true：本体/子对象（第一字是 vtable，用来判"内存没被别的对象复用"）。
+// need_vt = false：堆里的纯数据块（例如单独分配的 Coord3D），第一字就是 float x，
+//                 没有 vtable 可对，只能靠坐标还贴着召唤点来判断。
+static void air_hold_add_ex(uint32_t obj, uint32_t off, float z, float sx, float sy,
+                            bool need_vt) {
+  if (!is_ptr(obj)) return;
+  if (!air_lock_take()) return;
+  bool found = false;
+  for (int i = 0; i < g_air_hold_n; ++i) {
+    if (g_air_hold[i].obj == obj && g_air_hold[i].off == off) {
+      g_air_hold[i].z = z;
+      g_air_hold[i].sx = sx;
+      g_air_hold[i].sy = sy;
+      found = true;
+      break;
+    }
+  }
+  if (!found && g_air_hold_n < (int)(sizeof(g_air_hold) / sizeof(g_air_hold[0]))) {
+    AirHold& h = g_air_hold[g_air_hold_n++];
+    h.obj = obj;
+    h.off = off;
+    h.z = z;
+    h.vt = 0;
+    if (need_vt) safe_read_u32(obj, &h.vt);
+    h.sx = sx;
+    h.sy = sy;
+    h.born = GetTickCount();
+    h.probe_at = h.born + 1000;
+    InterlockedExchange(&g_air_hold_live, g_air_hold_n);
+  }
+  air_lock_drop();
+}
+
+static void air_hold_add(uint32_t obj, uint32_t off, float z, float sx, float sy) {
+  air_hold_add_ex(obj, off, z, sx, sy, true);
+}
+
+static void air_hold_add_raw(uint32_t obj, uint32_t off, float z, float sx, float sy) {
+  air_hold_add_ex(obj, off, z, sx, sy, false);
+}
+
+// ---- 追踪扫描 ----
+// 创建当帧只有本体几份坐标；真正驱动"下落 + 落地即爆"的那一份往往在**另一个堆块**里，
+// 由 Thing 里的指针指向（Coord3D 是纯 12 字节数据、没有 vtable，之前按"子对象必须有
+// vtable"筛，正好把它漏掉了）。这里改成沿指针下钻（最多 3 层、只跟堆指针），
+// 每隔一段时间再扫一次，把新冒出来的坐标副本也收进托举表。
+struct PosHunt {
+  uint32_t obj = 0;
+  float sx = 0.f;
+  float sy = 0.f;
+  float sz = 0.f;
+  int stage = 0;
+  DWORD next_at = 0;
+  // 上一次采样看到的坐标副本：用来判"哪一份在往下掉"（真正驱动下落的那个）。
+  int prev_n = 0;
+  uint32_t prev_obj[8] = {};
+  uint32_t prev_off[8] = {};
+  float prev_z[8] = {};
+};
+static PosHunt g_hunt[16];
+static int g_hunt_n = 0;
+static volatile LONG g_hunt_lock = 0;
+
+// 采样时刻（毫秒，相对召唤）。前密后疏：前 2 秒是对象建子结构的时候。
+static const DWORD kHuntDelays[] = {0, 120, 320, 700, 1400, 2400, 3800, 5600};
+
+static void schedule_hunt(uint32_t obj, float x, float y, float z) {
+  if (!is_ptr(obj)) return;
+  if (InterlockedCompareExchange(&g_hunt_lock, 1, 0) != 0) return;
+  for (int i = 0; i < g_hunt_n; ++i) {
+    if (g_hunt[i].obj == obj) {
+      g_hunt[i].sx = x;
+      g_hunt[i].sy = y;
+      g_hunt[i].sz = z;
+      g_hunt[i].stage = 0;
+      g_hunt[i].next_at = GetTickCount();
+      InterlockedExchange(&g_hunt_lock, 0);
+      return;
+    }
+  }
+  if (g_hunt_n < (int)(sizeof(g_hunt) / sizeof(g_hunt[0]))) {
+    PosHunt& h = g_hunt[g_hunt_n++];
+    h.obj = obj;
+    h.sx = x;
+    h.sy = y;
+    h.sz = z;
+    h.stage = 0;
+    h.next_at = GetTickCount();
+  }
+  InterlockedExchange(&g_hunt_lock, 0);
+}
+
+static void run_due_hunts();
+
+// ---- 高频夹持线程 ----
+// 只在 Present 里写是不够的：Present 在「物理更新 → 渲染」之后，下一次物理更新
+// 会把 z 改回去，渲染用的又是物理那份，看起来就是"高度不生效"。所以再开一根
+// 8ms 的线程反复按高度，赶在物理更新和绘制之间把值压回去。
+static volatile LONG g_air_thread_started = 0;
+static volatile LONG g_air_thread_stop = 0;
+static volatile LONG g_air_thread_live = 0;
+static HANDLE g_air_thread = nullptr;
+
+static DWORD WINAPI air_hold_thread_proc(LPVOID);
+
+static void ensure_air_hold_thread() {
+  if (InterlockedCompareExchange(&g_air_thread_started, 1, 0) != 0) return;
+  InterlockedExchange(&g_air_thread_stop, 0);
+  g_air_thread = CreateThread(nullptr, 0, air_hold_thread_proc, nullptr, 0, nullptr);
+  if (!g_air_thread) {
+    InterlockedExchange(&g_air_thread_started, 0);
+    log("air hold: pin thread failed to start");
+  } else {
+    log("air hold: pin thread started (8ms)");
+  }
+}
+
+// 卸载前必须先把它停掉：DLL 被 FreeLibrary 之后，这根线程还在往游戏内存里写，
+// 就是"退出时崩在 dll_unloaded"那一类。
+void air_hold_stop_thread() {
+  if (InterlockedCompareExchange(&g_air_thread_started, 0, 0) == 0) return;
+  InterlockedExchange(&g_air_thread_stop, 1);
+  for (int i = 0; i < 100; ++i) {
+    if (InterlockedCompareExchange(&g_air_thread_live, 0, 0) == 0) break;
+    Sleep(5);
+  }
+  if (g_air_thread) {
+    if (InterlockedCompareExchange(&g_air_thread_live, 0, 0) != 0) {
+      TerminateThread(g_air_thread, 0);
+    }
+    WaitForSingleObject(g_air_thread, 200);
+    CloseHandle(g_air_thread);
+    g_air_thread = nullptr;
+  }
+  InterlockedExchange(&g_air_thread_started, 0);
+  InterlockedExchange(&g_air_thread_stop, 0);
+}
+
+
+// 找出对象里所有"位置副本"（实现）：本体 + 一层子对象。
+static int collect_pos_fields(uint32_t obj, float x, float y, float zg, bool check_z,
+                              PosField* out, int max) {
+  int n = 0;
+  auto scan = [&](uint32_t o, uint32_t limit) {
+    for (uint32_t off = 0; off + 12 <= limit && n < max; off += 4) {
+      float a = 0.f, b = 0.f, c = 0.f;
+      if (!safe_read_bytes(o + off, &a, sizeof(a))) continue;
+      if (!(a > -60000.f && a < 60000.f)) continue;
+      if (std::fabs(a - x) > 24.f) continue;
+      if (!safe_read_bytes(o + off + 4, &b, sizeof(b))) continue;
+      if (!(b > -60000.f && b < 60000.f)) continue;
+      if (std::fabs(b - y) > 24.f) continue;
+      if (!safe_read_bytes(o + off + 8, &c, sizeof(c))) continue;
+      if (!(c > -20000.f && c < 20000.f)) continue;
+      // 位置副本的 z 就是刚生成时的地形高度。放 3.0 是为了排掉"旁边别的单位"：
+      // 上一版放到 400，连 200 米外高度 247 的另一支部队都被当成副本写过。
+      // 延迟复查时本体已经被抬到高空了，所以那时不再看 z。
+      if (check_z && std::fabs(c - zg) > 3.f) continue;
+      // 去重（同一对象同偏移）
+      bool dup = false;
+      for (int i = 0; i < n; ++i) {
+        if (out[i].obj == o && out[i].off == off) {
+          dup = true;
+          break;
+        }
+      }
+      if (dup) continue;
+      out[n].obj = o;
+      out[n].off = off;
+      out[n].z = c;
+      ++n;
+    }
+  };
+  scan(obj, 0x600);
+  const uint32_t base = module_base();
+  // 一层子对象：vtable 落在游戏模块内的才算（排除容器/字符串指针）。
+  for (uint32_t p = 0; p + 4 <= 0x600 && n < max; p += 4) {
+    uint32_t q = 0;
+    if (!safe_read_u32(obj + p, &q) || !is_ptr(q)) continue;
+    uint32_t vt = 0;
+    if (!safe_read_u32(q, &vt) || !is_ptr(vt)) continue;
+    if (!base || vt < base || vt >= base + 0x940000u) continue;
+    scan(q, 0x400);
+  }
+  return n;
+}
+
+// 沿指针下钻找坐标副本。堆里那些"纯数据块"（例如单独分配的 Coord3D）没有 vtable，
+// 只能靠"块里有没有一组 x/y 对得上召唤点"来认。上限 256 个块、每块看前 0x800 字节，
+// 只在采样时刻跑（8ms 线程里不是每帧都跑）。
+constexpr int kDeepMaxBlocks = 256;
+constexpr int kDeepScanBytes = 0x800;
+constexpr int kDeepPtrWords = 0x300;
+
+static bool deep_mark(uint32_t* seen, int* nseen, uint32_t v) {
+  for (int i = 0; i < *nseen; ++i) {
+    if (seen[i] == v) return false;
+  }
+  if (*nseen < kDeepMaxBlocks) seen[(*nseen)++] = v;
+  return true;
+}
+
+// 只看坐标，不看 z 上界：对象可能已经掉下去一截了。
+static int collect_pos_fields_deep(uint32_t root, float x, float y, float zlo, float zhi,
+                                   PosField* out, int max, int* out_blocks) {
+  if (out_blocks) *out_blocks = 0;
+  if (!is_ptr(root) || !out || max <= 0) return 0;
+  const uint32_t base = module_base();
+  const uint32_t size = module_image_size();
+  static uint32_t seen[kDeepMaxBlocks];
+  int nseen = 0;
+  uint32_t queue[kDeepMaxBlocks] = {};
+  int qn = 0;
+  queue[qn++] = root;
+  deep_mark(seen, &nseen, root);
+  int n = 0;
+  for (int qi = 0; qi < qn; ++qi) {
+    const uint32_t o = queue[qi];
+    // ① 找三元组
+    for (uint32_t off = 0; off + 12 <= kDeepScanBytes && n < max; off += 4) {
+      float a = 0.f, b = 0.f, c = 0.f;
+      if (!safe_read_bytes(o + off, &a, sizeof(a))) break;
+      if (!(a > -60000.f && a < 60000.f) || std::fabs(a - x) > 24.f) continue;
+      if (!safe_read_bytes(o + off + 4, &b, sizeof(b))) break;
+      if (!(b > -60000.f && b < 60000.f) || std::fabs(b - y) > 24.f) continue;
+      if (!safe_read_bytes(o + off + 8, &c, sizeof(c))) break;
+      if (!(c > zlo && c < zhi)) continue;
+      bool dup = false;
+      for (int i = 0; i < n; ++i) {
+        if (out[i].obj == o && out[i].off == off) {
+          dup = true;
+          break;
+        }
+      }
+      if (dup) continue;
+      out[n].obj = o;
+      out[n].off = off;
+      out[n].z = c;
+      ++n;
+    }
+    // ② 跟指针（只跟堆里的，跳过模块自身的数据段/代码段）
+    for (uint32_t p = 0; p + 4 <= kDeepPtrWords && qn < kDeepMaxBlocks; p += 4) {
+      uint32_t v = 0;
+      if (!safe_read_u32(o + p, &v)) break;
+      if (v < 0x01000000u || v >= 0x7FF00000u || (v & 3u) != 0) continue;
+      if (base && size && v >= base && v < base + size) continue;
+      if (!deep_mark(seen, &nseen, v)) continue;
+      queue[qn++] = v;
+    }
+  }
+  if (out_blocks) *out_blocks = qn;
+  return n;
+}
+
+// 到点的采样：把这一次看到的坐标副本补进托举表（并立刻按到目标高度）。
+static void run_due_hunts() {
+  if (g_hunt_n <= 0) return;
+  const DWORD now = GetTickCount();
+  if (InterlockedCompareExchange(&g_hunt_lock, 1, 0) != 0) return;
+  int w = 0;
+  constexpr int kStages = (int)(sizeof(kHuntDelays) / sizeof(kHuntDelays[0]));
+  for (int i = 0; i < g_hunt_n; ++i) {
+    PosHunt h = g_hunt[i];
+    if ((int32_t)(now - h.next_at) < 0) {
+      g_hunt[w++] = h;
+      continue;
+    }
+    PosField f[kMaxPosFields];
+    int blocks = 0;
+    const int n = collect_pos_fields_deep(h.obj, h.sx, h.sy, h.sz - 8000.f, h.sz + 400.f, f,
+                                          kMaxPosFields, &blocks);
+    // 第一遍只观察、不写：和上一遍比 z，往下掉的那几份就是引擎真正在用的位置。
+    if (h.stage > 0) {
+      for (int k = 0; k < n; ++k) {
+        for (int p = 0; p < h.prev_n; ++p) {
+          if (h.prev_obj[p] != f[k].obj || h.prev_off[p] != f[k].off) continue;
+          const float dz = f[k].z - h.prev_z[p];
+          if (dz < -2.f) {
+            log("air hold: FALLING %08X+0x%X z %.1f -> %.1f (dz=%.1f)",
+                f[k].obj, f[k].off, h.prev_z[p], f[k].z, dz);
+          }
+          break;
+        }
+      }
+    }
+    int added = 0;
+    for (int k = 0; k < n; ++k) {
+      if (h.stage > 0) {
+        if (f[k].z < h.sz - 0.5f) write_f32(f[k].obj + f[k].off + 8, h.sz);
+        air_hold_add_raw(f[k].obj, f[k].off, h.sz, h.sx, h.sy);
+        ++added;
+      }
+    }
+    h.prev_n = 0;
+    for (int k = 0; k < n && h.prev_n < 8; ++k) {
+      h.prev_obj[h.prev_n] = f[k].obj;
+      h.prev_off[h.prev_n] = f[k].off;
+      h.prev_z[h.prev_n] = f[k].z;
+      ++h.prev_n;
+    }
+    if (h.stage == 0 || added) {
+      log("air hold: hunt stage %d on %08X -> %d copies seen, %d held (%d blocks walked)",
+          h.stage, h.obj, n, added, blocks);
+    }
+    ++h.stage;
+    if (h.stage >= kStages) continue;   // 这个对象的采样做完了
+    h.next_at = now + kHuntDelays[h.stage] - (h.stage ? kHuntDelays[h.stage - 1] : 0);
+    g_hunt[w++] = h;
+  }
+  g_hunt_n = w;
+  InterlockedExchange(&g_hunt_lock, 0);
+}
+
+// 每帧把被托住的对象按回目标高度。
+// 存活判据不能再用「+0x33C 是血量结构」：气球炸弹这类是弹药（Ordnance），
+// 那儿根本不是血量指针，于是每一条都在下一帧被判死、整张托举表被清空——
+// 这才是"高度怎么调都贴地"的真正原因。现在只要求：
+//   ① vtable 还是当初那个、且落在游戏模块内（内存没被复用成别的对象）；
+//   ② 坐标还在召唤点附近（跑远了就不是它了，宁可放手也不乱写）。
+void air_hold_tick_impl() {
+  if (g_air_hold_on) run_due_hunts();
+  if (g_air_hold_n <= 0) return;
+  const uint32_t base = module_base();
+  if (!g_air_hold_on) {
+    air_hold_release_all();
+    return;
+  }
+  int w = 0;
+  int dropped = 0;
+  int pulled = 0;
+  DWORD stuck = 0;
+  if (!air_lock_take()) return;
+  const int held = g_air_hold_n;
+  const DWORD now = GetTickCount();
+  for (int i = 0; i < held; ++i) {
+    AirHold h = g_air_hold[i];
+    bool keep = false;
+    __try {
+      uint32_t vt = 0;
+      float px = 0.f, py = 0.f, z = 0.f;
+      bool alive = true;
+      if (h.vt != 0) {
+        // 有 vtable 的：内存没被别的东西复用
+        alive = safe_read_u32(h.obj, &vt) && is_ptr(vt) && base && vt >= base &&
+                vt < base + 0x940000u && vt == h.vt;
+      }
+      if (alive && safe_read_bytes(h.obj + h.off, &px, sizeof(px)) &&
+          safe_read_bytes(h.obj + h.off + 4, &py, sizeof(py)) &&
+          safe_read_bytes(h.obj + h.off + 8, &z, sizeof(z)) && z > -20000.f &&
+          z < 20000.f && std::fabs(px - h.sx) < 800.f && std::fabs(py - h.sy) < 800.f) {
+        // 只往上托，不压：引擎自己送得更高就别管。
+        if (z < h.z - 0.5f) {
+          write_f32(h.obj + h.off + 8, h.z);
+          ++pulled;
+        } else if (z > h.z + 1.f) {
+          ++stuck;   // 已经比目标高（被别的逻辑抬走了）
+        }
+        keep = true;
+        // 诊断：出生后 8 秒内每秒报一次"引擎现在把它放多高"
+        if ((int32_t)(now - h.probe_at) >= 0 && (DWORD)(now - h.born) < 8000) {
+          h.probe_at = now + 1000;
+          log("air hold probe: %08X+0x%X z=%.1f want=%.1f", h.obj, h.off, z, h.z);
+        }
+      }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      keep = false;
+    }
+    if (keep) {
+      g_air_hold[w++] = h;
+    } else {
+      ++dropped;
+    }
+  }
+  static int s_tick = 0;
+  if ((++s_tick % 120) == 0 && pulled) {
+    log("air hold: %d held, %d pulled back this frame, %d already higher, %d dropped",
+        g_air_hold_n, pulled, (int)stuck, dropped);
+  }
+  if (w != g_air_hold_n) {
+    if (dropped) log("air hold: %d object(s) gone, %d still held", dropped, w);
+    g_air_hold_n = w;
+    InterlockedExchange(&g_air_hold_live, w);
+  }
+  air_lock_drop();
+}
+
+static DWORD WINAPI air_hold_thread_proc(LPVOID) {
+  InterlockedExchange(&g_air_thread_live, 1);
+  while (InterlockedCompareExchange(&g_air_thread_stop, 0, 0) == 0) {
+    Sleep(8);
+    if (InterlockedCompareExchange(&g_air_thread_stop, 0, 0) != 0) break;
+    __try {
+      air_hold_tick_impl();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+  }
+  InterlockedExchange(&g_air_thread_live, 0);
+  return 0;
+}
+
+static void post_create_show(uint32_t obj) {
+  if (!is_ptr(obj)) return;
+  // 护栏：Thing 的 +0x33C 是 HP 结构指针；不是就别往这块内存写（写错地方会直接崩）。
+  uint32_t hp = 0;
+  uint32_t hpv = 0;
+  if (!safe_read_u32(obj + 0x33C, &hp) || !is_ptr(hp)) return;
+  if (!safe_read_u32(hp, &hpv) || hpv == 0) return;
+  uint32_t v = 0;
+  // Copilot 的 kPostCreateStateWords：把"静息态 / 回盾 / 技能启用"这几个状态字改成
+  // 一个正常在场单位该有的值（+0x80/+0x84/+0x88/+0x90/+0x94/+0xD0）。
+  write_u32(obj + 0x80, 0x00000000u);
+  write_u32(obj + 0x84, 0x00000800u);
+  write_u32(obj + 0x88, 0x00000000u);
+  write_u32(obj + 0x90, 0x00000002u);
+  write_u32(obj + 0x94, 0x00000020u);
+  write_u32(obj + 0xD0, 0x00000000u);
+  if (safe_read_u32(obj + 0xBC, &v)) write_u32(obj + 0xBC, v | 0x80000000u);
+  if (safe_read_u32(obj + 0xC8, &v)) write_u32(obj + 0xC8, v & ~0x00000800u);
+  if (safe_read_u32(obj + 0x28, &v)) write_u32(obj + 0x28, v & ~0x80000000u);
+  if (safe_read_u32(obj + 0x208, &v)) write_u32(obj + 0x208, v & ~0x80000000u);
 }
 
 static void drain_unit_spawns_impl() {
@@ -5249,7 +7674,52 @@ static void drain_unit_spawns_impl() {
       write_f32(pos_buf, s.x);
       write_f32(pos_buf + 4, s.y);
       write_f32(pos_buf + 8, s.z);
-      if (is_ptr(create_unit_on_this_thread(s.tmpl, pos_buf, s.owner, s.info))) ++made;
+      // 第 4 个 float 填 1.0（和 Copilot / 引擎自己的落点向量一致），
+      // 别把这个槽里的旧垃圾交给游戏。
+      write_f32(pos_buf + 12, 1.0f);
+      bool threw = false;
+      const uint32_t ent = create_unit_on_this_thread(s.tmpl, pos_buf, s.owner, s.info, &threw);
+      if (is_ptr(ent)) {
+        ++made;
+        if (s.tag >= 0 && s.tag < 64) ++g_spawn_type_made[s.tag];
+        if (s.z > 0.f) {
+          int found = 0;
+          PosField fields[kMaxPosFields];
+          __try {
+            found = post_create_lift(ent, s.x, s.y, s.base_z, s.z);
+            if (found > 0) {
+              collect_pos_fields(ent, s.x, s.y, s.base_z, true, fields, kMaxPosFields);
+            }
+          } __except (EXCEPTION_EXECUTE_HANDLER) {
+            log("post-create lift faulted on %08X", ent);
+            found = 0;
+          }
+          // 会自己往下掉/落地即爆的对象（z 被抬过）每帧都要按回去，
+          // 否则抬多高都只是"从高处掉下来炸"。
+          if (found > 0 && s.z > s.base_z + 5.f) {
+            for (int k = 0; k < found && k < kMaxPosFields; ++k) {
+              air_hold_add(fields[k].obj, fields[k].off, s.z, s.x, s.y);
+            }
+            ensure_air_hold_thread();
+            // 真正驱动"下落"的那一份坐标常常在另一个堆块里、晚几百毫秒才建好，
+            // 所以按时刻表反复下钻扫描，把新出现的副本也收进托举表。
+            schedule_hunt(ent, s.x, s.y, s.z);
+            log("summon: holding %08X at z=%.1f (%d position copies)", ent, s.z, found);
+          }
+        }
+        if (g_summon_visible_fix) {
+          __try {
+            post_create_show(ent);
+          } __except (EXCEPTION_EXECUTE_HANDLER) {
+            log("post-create state fix faulted on %08X", ent);
+          }
+        }
+      } else if (threw) {
+        // CreateUnit 里炸了：引擎的分配器/对象表多半已经半坏，这一批剩下的别再往里塞。
+        log("create unit tmpl=%08X threw; aborting the rest of this batch (%d left)", s.tmpl,
+            count - i - 1);
+        break;
+      }
     }
   }
   InterlockedExchange(&g_spawn_made, made);
@@ -5260,6 +7730,7 @@ static int submit_spawns(int n) {
   if (n <= 0) return 0;
   ensure_spawn_event();
   if (!g_spawn_event) return -1;
+  std::memset(g_spawn_type_made, 0, sizeof(g_spawn_type_made));
   InterlockedExchange(&g_spawn_made, 0);
   ResetEvent(g_spawn_event);
   InterlockedExchange(&g_spawn_pub, n);
@@ -5290,10 +7761,23 @@ static void summon_ring_xy(float ox, float oy, int slot, int total, float* x, fl
   *y = oy + radius * std::sin(angle);
 }
 
+// 有些对象贴地生成会立刻"落地即爆"（气球炸弹），要给它们一个起始高度。
+// 单位是游戏世界坐标（和 /summon?z= 同一个量纲，飞机巡航大约 300~600）。
+// 气球炸弹比飞机高得多：它本身就是"缓慢下落的弹药"（模板描述 Slow-Falling Ordnance），
+// 一落地就炸，所以直接放到高空，配合 air_hold_tick() 停在那儿。
+static float summon_spawn_lift(const char* type_id) {
+  if (!type_id || !type_id[0]) return 0.f;
+  if (contains_ic(type_id, "Balloon")) return 3000.f;
+  return 0.f;
+}
+
+// 用户手动加的抬升（面板上的「召唤高度」），默认 0。
+static float g_summon_lift_extra = 0.f;
+
 static bool summon_troops_impl(std::string* out_msg) {
   const SummonSnap snap = g_summon_snap;
   if (snap.n <= 0 || snap.count <= 0) {
-    if (out_msg) *out_msg = u8"请先选择要召唤的部队";
+    if (out_msg) *out_msg = u8"请先选择要召唤的单位 / 建筑";
     return false;
   }
   if (!mc_base()) {
@@ -5335,18 +7819,25 @@ static bool summon_troops_impl(std::string* out_msg) {
     return false;
   }
   uint32_t tmpls[64] = {};
+  float lifts[64] = {};
   int planned = 0;
   int missing = 0;
+  const char* first_missing = nullptr;
   for (int i = 0; i < snap.n; ++i) {
+    lifts[i] = summon_spawn_lift(snap.ids[i]);
     tmpls[i] = find_template_by_id(snap.ids[i]);
     if (!is_ptr(tmpls[i])) {
       ++missing;
+      if (!first_missing) first_missing = snap.ids[i];
       log("summon no template: %s", snap.ids[i]);
+    } else {
+      planned += snap.count;
+      log("summon type %s -> tmpl %08X lift=%.0f x%d", snap.ids[i], tmpls[i], lifts[i],
+          snap.count);
     }
-    else planned += snap.count;
   }
-  log("summon player=%08X info=%08X types=%d each=%d planned=%d", owner, owner_info, snap.n,
-      snap.count, planned);
+  log("summon player=%08X info=%08X types=%d each=%d planned=%d at=%.1f,%.1f,%.1f", owner,
+      owner_info, snap.n, snap.count, planned, spawn[0], spawn[1], spawn[2]);
   if (InterlockedCompareExchange(&g_spawn_busy, 1, 0) != 0) {
     if (out_msg) *out_msg = u8"上一次召唤还在进行";
     return false;
@@ -5358,7 +7849,9 @@ static bool summon_troops_impl(std::string* out_msg) {
          ++c) {
       PendingSpawn& s = g_spawn_q[queued];
       summon_ring_xy(spawn[0], spawn[1], queued, planned, &s.x, &s.y);
-      s.z = spawn[2];
+      s.z = spawn[2] + lifts[i] + g_summon_lift_extra;
+      s.base_z = spawn[2];
+      s.tag = i;
       s.tmpl = tmpls[i];
       s.owner = owner;
       s.info = owner_info;
@@ -5371,21 +7864,44 @@ static bool summon_troops_impl(std::string* out_msg) {
     if (out_msg) *out_msg = u8"召唤没有赶上游戏这一帧";
     return false;
   }
+  // 哪种在模板库里、也提交了，但引擎没造出来 → 单独点名，方便判断是"版本没有"
+  // 还是"对象本身不让 CreateUnit 造"。
+  std::vector<std::string> failed;
+  for (int i = 0; i < snap.n; ++i) {
+    if (!is_ptr(tmpls[i])) continue;
+    if (g_spawn_type_made[i] > 0) continue;
+    failed.emplace_back(snap.ids[i]);
+    log("summon type %s exists but CreateUnit refused it", snap.ids[i]);
+  }
   if (made <= 0) {
     if (out_msg) {
-      *out_msg = missing ? u8"找不到这些部队（请先进入战局）"
-                         : u8"召唤失败（请把鼠标放在可通行的地形上）";
+      if (missing) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      u8"本版本没有 %s（%d 种缺失），已跳过", first_missing, missing);
+        *out_msg = buf;
+      } else if (failed.size()) {
+        char buf[220];
+        std::snprintf(buf, sizeof(buf), u8"游戏拒绝创建 %s（模板在，但造不出来）",
+                      failed[0].c_str());
+        *out_msg = buf;
+      } else {
+        *out_msg = u8"召唤失败（请把鼠标放在可通行的地形上）";
+      }
     }
     return false;
   }
   if (out_msg) {
-    char buf[180];
-    if (missing) {
-      std::snprintf(buf, sizeof(buf), u8"已召唤 %d 个单位（归属%s），%d 种找不到", made,
-                    owner_name[0] ? owner_name : u8"所选玩家", missing);
-    } else {
-      std::snprintf(buf, sizeof(buf), u8"已召唤 %d 个单位（归属%s）", made,
-                    owner_name[0] ? owner_name : u8"所选玩家");
+    char buf[260];
+    size_t used = 0;
+    used += std::snprintf(buf, sizeof(buf), u8"已召唤 %d 个单位（归属%s）", made,
+                          owner_name[0] ? owner_name : u8"所选玩家");
+    if (missing && used < sizeof(buf)) {
+      used += std::snprintf(buf + used, sizeof(buf) - used, u8"，%d 种本版本没有", missing);
+    }
+    if (!failed.empty() && used < sizeof(buf)) {
+      std::snprintf(buf + used, sizeof(buf) - used, u8"，%s 等 %d 种造不出来",
+                    failed[0].c_str(), (int)failed.size());
     }
     *out_msg = buf;
   }
@@ -5449,6 +7965,372 @@ static bool spawn_one_mcv(std::string* out_msg) {
   }
   return true;
 }
+
+// ---------------------------------------------------------------------------
+// 空投（箱子）
+// ---------------------------------------------------------------------------
+// 箱子模板名从引擎的模板哈希表里现扫，避免把名字写死（零售版/起义时刻/各语言版
+// 的箱子集合略有差异）。扫不到才退回内置表。
+
+struct CrateKindEntry {
+  char id[96];
+  const char* zh;
+  uint32_t tmpl = 0;  // 解析成功后缓存，避免每次空投都重新扫内存
+};
+
+static CrateKindEntry g_crates[48];
+static int g_crate_n = -1;  // -1 = 还没扫过
+static bool g_crate_real = false;   // 当前列表是不是真从模板表扫出来的
+static DWORD g_crate_scan_tick = 0;
+
+static const char* crate_zh_for(const char* id) {
+  auto has = [id](const char* s) { return std::strstr(id, s) != nullptr; };
+  if (has("Attribute")) return u8"属性箱";
+  if (has("IronCurtain")) return u8"属性箱·铁幕";
+  if (has("Bomb") || has("Forzen") || has("Frozen")) return u8"炸弹箱";
+  if (has("Veterancy")) return u8"经验箱";
+  if (has("Heal")) return u8"治疗箱";
+  if (has("Money")) return u8"奖励箱·资金";
+  if (has("Salvage")) return u8"回收箱";
+  if (has("Random")) return u8"神秘箱";
+  if (has("Shroud")) return u8"黑幕箱";
+  if (has("Unit")) return u8"部队箱";
+  return nullptr;
+}
+
+// 只认真正的箱子模板：CrateMoney / CrateHeal / CrateShroud ...
+// 排除碎片、投放器、拾取触发器等同样带 Crate 字样的对象。
+static bool crate_template_id_ok(const char* s) {
+  if (!s || std::strncmp(s, "Crate", 5) != 0) return false;
+  static const char* kBanned[] = {"Debris", "Pickup",  "Spawner", "Revealer", "Module",
+                                  "Collide", "Nugget", "Command", "Type",     "Data",
+                                  "State",   "Update", "Dummy",   "Seed",     "Class"};
+  for (const char* b : kBanned) {
+    if (std::strstr(s, b)) return false;
+  }
+  return true;
+}
+
+// 兜底内存扫描用的宽松判断：代号必须以 Crate 开头。
+// （引擎里还有 VeterancyCrate / CratePickup 这类"名字里带 Crate、但不是箱子模板"
+// 的字符串，之前把这类东西扫进列表，空投时自然一个模板都解析不到。）
+static bool crate_id_ok(const char* s) {
+  const size_t n = std::strlen(s);
+  if (n < 5 || n > 80) return false;
+  return crate_template_id_ok(s);
+}
+
+// 从模板对象上把它的代号扫出来。引擎把 id 存成 C 字符串，可能挂在对象本身，
+// 也可能挂在对象里第一层 / 第二层的子对象上（和 template_has_exact_id 同一套偏移）。
+static bool template_id_of(uint32_t tmpl, char* out, size_t out_n) {
+  if (!is_ptr(tmpl) || !out || out_n < 16) return false;
+  auto take = [&](uint32_t addr) -> bool {
+    char buf[96] = {};
+    if (!safe_read_bytes(addr, buf, sizeof(buf) - 1)) return false;
+    buf[sizeof(buf) - 1] = 0;
+    const size_t len = std::strlen(buf);
+    if (len < 5 || len > 80) return false;
+    for (size_t i = 0; i < len; ++i) {
+      const char c = buf[i];
+      const bool ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                      (c >= 'a' && c <= 'z') || c == '_';
+      if (!ok) return false;
+    }
+    std::snprintf(out, out_n, "%s", buf);
+    return true;
+  };
+  for (uint32_t off = 0; off <= 0x180; off += 4) {
+    if (take(tmpl + off)) return true;
+    uint32_t p = 0;
+    if (!safe_read_u32(tmpl + off, &p) || !is_ptr(p)) continue;
+    if (take(p)) return true;
+    uint32_t p2 = 0;
+    if (safe_read_u32(p, &p2) && is_ptr(p2) && take(p2)) return true;
+  }
+  return false;
+}
+
+// 列表排序权重：把常用的箱子放前面（默认选中项就是第一个）。
+static int crate_sort_rank(const char* id) {
+  if (std::strstr(id, "Money")) return 0;
+  if (std::strstr(id, "Heal")) return 1;
+  if (std::strstr(id, "Veterancy")) return 2;
+  if (std::strstr(id, "Random")) return 3;
+  if (std::strstr(id, "Bomb")) return 4;
+  if (std::strstr(id, "Unit")) return 5;
+  if (std::strstr(id, "Salvage")) return 6;
+  if (std::strstr(id, "Shroud")) return 7;
+  if (std::strstr(id, "Attribute")) return 8;
+  return 9;
+}
+
+// 返回新加入的条目下标，-1 = 重复/已满。
+static int crate_catalog_add(const char* id) {
+  if (g_crate_n >= (int)(sizeof(g_crates) / sizeof(g_crates[0]))) return -1;
+  for (int i = 0; i < g_crate_n; ++i) {
+    if (std::strcmp(g_crates[i].id, id) == 0) return -1;
+  }
+  const int idx = g_crate_n++;
+  CrateKindEntry& e = g_crates[idx];
+  std::snprintf(e.id, sizeof(e.id), "%s", id);
+  e.zh = crate_zh_for(e.id);
+  return idx;
+}
+
+static bool is_id_char(uint8_t c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+// 引擎把模板代号当 C 字符串驻留在内存里，直接扫一遍最可靠：
+// 零售版叫 CrateMoneyMP、日中版 / 起义时刻可能叫别的，写死名字必然踩空。
+static int crate_scan_memory() {
+  SYSTEM_INFO si{};
+  GetSystemInfo(&si);
+  auto* p = static_cast<uint8_t*>(si.lpMinimumApplicationAddress);
+  auto* end = static_cast<uint8_t*>(si.lpMaximumApplicationAddress);
+  int found = 0;
+  while (p < end) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi)) break;
+    auto* region = static_cast<uint8_t*>(mbi.BaseAddress);
+    const size_t size = mbi.RegionSize;
+    auto* next = region + size;
+    if (is_committed_readable(mbi.State, mbi.Protect) && size > 16) {
+      const uint8_t* lim = region + size;
+      const uint8_t* q = region;
+      while (q < lim) {
+        const void* hit = std::memchr(q, 'C', static_cast<size_t>(lim - q));
+        if (!hit) break;
+        const auto* c = static_cast<const uint8_t*>(hit);
+        const uint8_t* start = c;
+        while (start > region && is_id_char(start[-1])) --start;
+        const uint8_t* e = c;
+        while (e < lim && is_id_char(*e)) ++e;
+        const size_t n = static_cast<size_t>(e - start);
+        if (n >= 5 && n <= 80) {
+          char buf[96];
+          const size_t take = n < sizeof(buf) - 1 ? n : sizeof(buf) - 1;
+          std::memcpy(buf, start, take);
+          buf[take] = 0;
+          const bool left_ok = (start == region) || (start[-1] == 0);
+          const bool right_ok = (e >= lim) || (*e == 0);
+          if (left_ok && right_ok && crate_id_ok(buf)) {
+            const int before = g_crate_n;
+            crate_catalog_add(buf);
+            if (g_crate_n > before) ++found;
+          }
+        }
+        q = (e > c) ? e : c + 1;
+      }
+    }
+    if (next <= p) break;
+    p = next;
+  }
+  return found;
+}
+
+static void crate_catalog_build() {
+  g_crate_n = 0;
+  // 首选：直接走引擎模板表（ThingFactory+0x24 的单向链表，+0xC 是 next）。
+  // 这条链就是引擎自己按名字查模板时用的那张表，所以扫出来的名字一定能解析。
+  int from_factory = 0;
+  uint32_t factory = 0;
+  if (module_base() &&
+      safe_read_u32(module_base() + kThingFactoryRva, &factory) && is_ptr(factory)) {
+    uint32_t tmpl = 0;
+    if (safe_read_u32(factory + 0x24, &tmpl) && is_ptr(tmpl)) {
+      for (int n = 0; n < 8192 && is_ptr(tmpl); ++n) {
+        char id[96] = {};
+        if (template_id_of(tmpl, id, sizeof(id)) && crate_template_id_ok(id)) {
+          const int idx = crate_catalog_add(id);
+          if (idx >= 0) {
+            g_crates[idx].tmpl = tmpl;   // 顺手缓存模板，省掉每次空投的查找
+            ++from_factory;
+          }
+        }
+        uint32_t next = 0;
+        if (!safe_read_u32(tmpl + 0xC, &next) || next == tmpl || !is_ptr(next)) break;
+        tmpl = next;
+      }
+    }
+  }
+  if (from_factory > 0) {
+    log("crate catalog: %d crate templates from factory", from_factory);
+  } else if (is_ptr(local_owner_for_ops())) {
+    // 兜底：模板表没读到，扫一遍内存里的字符串。这一步要几百毫秒，
+    // 只在战局里做（主菜单不需要箱子表，进来了会重新扫）。
+    const DWORD t0 = GetTickCount();
+    const int n = crate_scan_memory();
+    log("crate catalog: memory scan found %d ids in %lu ms", n, GetTickCount() - t0);
+  }
+  g_crate_real = (g_crate_n > 0);
+  if (g_crate_n == 0) {
+    // 最后兜底：零售版内置箱子名（模板还解析不到，进战局后会重新扫）。
+    static const char* kFallback[] = {"CrateMoney",    "CrateMoneyMP",   "CrateHeal",
+                                      "CrateHealMP",   "CrateVeterancy", "CrateVeterancyMP",
+                                      "CrateRandom",   "CrateSalvage",   "CrateShroud",
+                                      "CrateBomb",     "CrateUnit",      "CrateAttribute"};
+    for (const char* id : kFallback) crate_catalog_add(id);
+    g_crate_real = false;
+    log("crate catalog: still empty, using built-in list");
+  }
+  {
+    // 按常用度排序，默认选中项就是第一个（资金箱）。
+    std::stable_sort(g_crates, g_crates + g_crate_n,
+                     [](const CrateKindEntry& a, const CrateKindEntry& b) {
+                       const int ra = crate_sort_rank(a.id), rb = crate_sort_rank(b.id);
+                       if (ra != rb) return ra < rb;
+                       return std::strcmp(a.id, b.id) < 0;
+                     });
+    // 去重：引擎对同一种箱子会给出单机版 / 联机版两个代号
+    // （CrateHeal / CrateHealMP 都叫"治疗箱"），UI 里没必要列两遍。
+    // 排序后先出现的是非 MP 代号，所以保留它，丢掉落后的同名牌。
+    int kept = 0;
+    int dropped = 0;
+    int out = 0;
+    for (int i = 0; i < g_crate_n; ++i) {
+      const char* label = g_crates[i].zh ? g_crates[i].zh : g_crates[i].id;
+      bool dup = false;
+      for (int j = 0; j < out; ++j) {
+        const char* prev = g_crates[j].zh ? g_crates[j].zh : g_crates[j].id;
+        if (std::strcmp(prev, label) == 0) {
+          dup = true;
+          break;
+        }
+      }
+      if (dup) {
+        ++dropped;
+        continue;
+      }
+      if (out != i) g_crates[out] = g_crates[i];
+      ++out;
+      ++kept;
+    }
+    g_crate_n = out;
+    log("crate catalog: %d entries (real=%d, deduped %d)", kept, g_crate_real ? 1 : 0, dropped);
+    for (int i = 0; i < g_crate_n && i < 24; ++i) {
+      log("  crate[%d] = %s (%s)", i, g_crates[i].id,
+          g_crates[i].zh ? g_crates[i].zh : "-");
+    }
+  }
+  g_crate_scan_tick = GetTickCount();
+}
+
+static void crate_catalog_ensure() {
+  if (g_crate_n >= 0 && g_crate_real) return;
+  // 兜底表不算数，但要节流：内存扫描要几百毫秒，不能每 3 秒来一次。
+  const DWORD now = GetTickCount();
+  if (g_crate_n >= 0 && g_crate_scan_tick &&
+      static_cast<int32_t>(now - g_crate_scan_tick) < 30000) {
+    return;
+  }
+  // 不在战局里（读不到玩家归属）就不扫，模板表是读地图时才填的。
+  if (g_crate_n >= 0 && !is_ptr(local_owner_for_ops())) return;
+  crate_catalog_build();
+}
+
+static bool spawn_crate_impl(int crate_idx, int count, float height, std::string* out_msg) {
+  if (!mc_base()) {
+    if (out_msg) *out_msg = u8"请先点「注入」";
+    return false;
+  }
+  crate_catalog_ensure();
+  if (g_crate_n <= 0) {
+    if (out_msg) *out_msg = u8"箱子表是空的（请先进入战局再点一次）";
+    return false;
+  }
+  if (crate_idx < 0 || crate_idx >= g_crate_n) crate_idx = 0;
+  const char* id = g_crates[crate_idx].id;
+  if (count < 1) count = 1;
+  if (count > 20) count = 20;
+
+  uint32_t tmpl = g_crates[crate_idx].tmpl;
+  if (is_ptr(tmpl)) {
+    // 跨局缓存要校验：模板对象可能被下一局重建，指针会失效。
+    uint32_t vt = 0;
+    uint32_t lo = 0, hi = 0;
+    const bool vtable_ok = safe_read_u32(tmpl, &vt) && image_range(&lo, &hi) && vt >= lo &&
+                           vt < hi;
+    if (!vtable_ok || !template_has_exact_id(tmpl, id)) tmpl = 0;
+  }
+  if (!is_ptr(tmpl)) tmpl = find_template_by_id(id);
+  if (!is_ptr(tmpl)) {
+    // 表里的名字不一定都能解析（不同版本命名不同），换一个能用的。
+    const int try_n = g_crate_n < 4 ? g_crate_n : 4;
+    for (int i = 0; i < try_n && !is_ptr(tmpl); ++i) {
+      if (i == crate_idx) continue;
+      const uint32_t t = find_template_by_id(g_crates[i].id);
+      if (is_ptr(t)) {
+        log("crate: '%s' not found in this build, using '%s'", id, g_crates[i].id);
+        tmpl = t;
+        crate_idx = i;
+        id = g_crates[i].id;
+      }
+    }
+  }
+  if (!is_ptr(tmpl)) {
+    log("crate: no template for '%s' (catalog=%d)", id, g_crate_n);
+    if (out_msg) {
+      char buf[200];
+      std::snprintf(buf, sizeof(buf), u8"箱子模板一个都没解析到（表里有 %d 项，请把日志发我）",
+                    g_crate_n);
+      *out_msg = buf;
+    }
+    return false;
+  }
+  float spawn[3];
+  if (!mouse_world_pos(spawn)) {
+    if (out_msg) *out_msg = u8"读不到鼠标地图坐标（请把鼠标移到战场地形上）";
+    return false;
+  }
+  uint32_t owner = local_owner_for_ops();
+  if (!is_ptr(owner)) {
+    if (out_msg) *out_msg = u8"请先选择玩家";
+    return false;
+  }
+  uint32_t owner_info = 0;
+  safe_read_u32(owner + 0x10, &owner_info);
+
+  uint32_t pos_buf = reinterpret_cast<uint32_t>(mc_base() + 0x10A0);
+  int ok_n = 0;
+  for (int i = 0; i < count; ++i) {
+    const float radius = (count > 1) ? 45.f : 0.f;
+    const float angle = (float)i * 2.399963f;
+    write_f32(pos_buf, spawn[0] + radius * std::cos(angle));
+    write_f32(pos_buf + 4, spawn[1] + radius * std::sin(angle));
+    write_f32(pos_buf + 8, spawn[2] + height);
+    CallJob job{};
+    job.kind = CallJob::kCdecl;
+    job.fn = va_of(kFnCreateUnit);
+    job.nargs = 5;
+    job.args[0] = 0;
+    job.args[1] = tmpl;
+    job.args[2] = pos_buf;
+    job.args[3] = owner;
+    job.args[4] = owner_info;
+    if (run_job(job) && is_ptr(job.eax_out)) ++ok_n;
+    Sleep(40);
+  }
+  if (ok_n == 0) {
+    if (out_msg) *out_msg = u8"空投失败（请把鼠标放在可通行的地形上）";
+    log("crate: spawn failed id=%s tmpl=%08X at=%.1f,%.1f", id, (unsigned)tmpl, spawn[0], spawn[1]);
+    return false;
+  }
+  log("crate: dropped %d x %s tmpl=%08X at=%.1f,%.1f,%.1f", ok_n, id, (unsigned)tmpl, spawn[0],
+      spawn[1], spawn[2]);
+  if (crate_idx >= 0 && crate_idx < g_crate_n) g_crates[crate_idx].tmpl = tmpl;
+  if (out_msg) {
+    char buf[192];
+    const char* zh = g_crates[crate_idx].zh ? g_crates[crate_idx].zh : id;
+    std::snprintf(buf, sizeof(buf), u8"已空投 %d 个「%s」", ok_n, zh);
+    *out_msg = buf;
+  }
+  return true;
+}
+
+// ---- 当前选中的箱子（UI 记着，真正空投时用） ----
+static int g_crate_sel_idx = 0;
+static int g_crate_sel_count = 1;
 
 constexpr uint32_t kUpgradeStoreRva = 0x008E0D90;
 constexpr uint32_t kFnPlayerSetUpgrade = 0x0088B800;
@@ -5573,10 +8455,102 @@ static void label_battle_player(uint32_t player, uint32_t player_id, bool /*is_l
   std::snprintf(out, out_len, u8"玩家%u", player_id);
 }
 
+// Seat list for the player pickers (money / spawn rank / summon / unit scope /
+// team / colour). Deliberately avoids the full economy poll: no object-list
+// walks, no protocol scans and no unthrottled faction graph search. Those cost
+// hundreds of milliseconds each and used to run once per menu frame, so simply
+// showing the overlay froze the match.
+static bool refresh_battle_seats_light(MatchEconomy* out) {
+  if (!out) return false;
+  *out = MatchEconomy{};
+  out->spectator = is_spectator();
+  const uint32_t base = loaded_module();
+  if (!base) return false;
+
+  float seconds = 0.f;
+  if (!read_battle_clock(nullptr, &seconds)) return false;
+  // Read-only on purpose: the match bookkeeping (roster caches, seen seats,
+  // battle clock) stays owned by the economy board so opening the pickers can
+  // never disturb it.
+  out->match_seconds = seconds;
+
+  uint32_t list = 0;
+  if (!safe_read_u32(base + player_list_rva(), &list) || !is_ptr(list)) return false;
+
+  uint32_t local = 0;
+  safe_read_u32(list + kPlayerListLocalOff, &local);
+  if (!is_ptr(local)) local = local_owner_for_ops();
+
+  for (int i = 0; i < (int)kPlayerListSlots && out->player_count < kMaxEconPlayers; ++i) {
+    uint32_t player = 0;
+    if (!safe_read_u32(list + kPlayerListArrayOff + (uint32_t)i * 4u, &player)) continue;
+    if (!is_ptr(player)) continue;
+    bool dup = false;
+    for (int j = 0; j < out->player_count; ++j) {
+      if (out->players[j].player == player) {
+        dup = true;
+        break;
+      }
+    }
+    if (dup) continue;
+
+    PlayerEconomy pe{};
+    fill_player_economy_basic(&pe, player, local);
+    // Player index 0 is the neutral / civilian seat (oil derricks, map props).
+    if (!pe.is_local && pe.player_id == 0) continue;
+    const bool seen = find_seen_seat(player) >= 0;
+    if (!pe.has_money && !pe.has_power && !pe.has_score && !pe.is_local && !seen) continue;
+    // Same gate the board applies, so the pickers list the same seats the board
+    // does: a seat counts once it entered the match, or was shown earlier.
+    if (!pe.is_local && !seat_entered_battle(pe) && !seen) continue;
+    mark_defeated_flag(&pe);
+
+    // Faction label from the cache; a miss goes through the shared throttled
+    // probes (cheap string hop first, then the rate-limited graph walk).
+    int fac = cached_faction_of(player);
+    if (!fac && fac_probe_due(player)) {
+      fac = detect_faction_from_player(player);
+      if (fac) remember_faction(player, pe, fac);
+    }
+    label_battle_player(player, pe.player_id, pe.is_local, pe.name, sizeof(pe.name));
+    out->players[out->player_count++] = pe;
+  }
+
+  // Board parity: at match start no seat has a record yet, so keep the local
+  // seat as the fallback the board also uses.
+  if (out->player_count == 0 && is_ptr(local)) {
+    PlayerEconomy pe{};
+    fill_player_economy_basic(&pe, local, local);
+    if (!seat_is_dummy_local(pe)) {
+      label_battle_player(local, pe.player_id, pe.is_local, pe.name, sizeof(pe.name));
+      out->players[out->player_count++] = pe;
+    }
+  }
+
+  // Stable order: local first, then player_id, then pointer. Never sort by money.
+  auto seat_less = [](const PlayerEconomy& a, const PlayerEconomy& b) {
+    if (a.is_local != b.is_local) return a.is_local;
+    if (a.player_id != b.player_id) return a.player_id < b.player_id;
+    return a.player < b.player;
+  };
+  for (int i = 0; i < out->player_count; ++i) {
+    for (int j = i + 1; j < out->player_count; ++j) {
+      if (seat_less(out->players[j], out->players[i])) {
+        PlayerEconomy tmp = out->players[i];
+        out->players[i] = out->players[j];
+        out->players[j] = tmp;
+      }
+    }
+  }
+
+  out->valid = out->player_count > 0;
+  return out->valid;
+}
+
 static int list_battle_players_impl(BattlePlayer* out, int max_out) {
   if (!out || max_out <= 0) return 0;
   static MatchEconomy econ;
-  if (!collect_match_economy_impl(&econ) || econ.player_count <= 0) return 0;
+  if (!refresh_battle_seats_light(&econ) || econ.player_count <= 0) return 0;
   int n = 0;
   for (int i = 0; i < econ.player_count && n < max_out; ++i) {
     const PlayerEconomy& pe = econ.players[i];
@@ -5655,9 +8629,72 @@ static bool set_spawn_rank_impl(int level, std::string* out_msg) {
 
 }  // namespace
 
+// ---- 空中托举的公开入口 ----------------------------------------------------
+void air_hold_tick() { air_hold_tick_impl(); }
+
+bool air_hold_enabled() { return air_hold_enabled_impl(); }
+
+void set_air_hold_enabled(bool on) { set_air_hold_enabled_impl(on); }
+
+int air_hold_count() { return air_hold_count_impl(); }
+
+void air_hold_release_all() { air_hold_release_all_impl(); }
+
+void air_hold_forget(uint32_t obj) { air_hold_forget_impl(obj); }
+
+void air_hold_shutdown() { air_hold_stop_thread(); }
+
+// ---- 真无敌 / 空投 的公开入口 ----------------------------------------------
+bool invincible_apply(bool on, float seconds, int flavor, std::string* out_msg) {
+  return invincible_apply_impl(on, seconds, flavor, out_msg);
+}
+
+// 当前是否「已开启无敌」（点过无敌、还没解除）。
+bool invincible_lock() { return invincible_lock_impl(); }
+
+const char* invincible_status() { return invincible_status_impl(); }
+
+void invincible_tick() { invincible_tick_impl(); }
+
+int crate_kind_count() {
+  crate_catalog_ensure();
+  return g_crate_n;
+}
+
+const char* crate_kind_name(int idx) {
+  crate_catalog_ensure();
+  if (idx < 0 || idx >= g_crate_n) return "";
+  return g_crates[idx].id;
+}
+
+const char* crate_kind_label(int idx) {
+  crate_catalog_ensure();
+  if (idx < 0 || idx >= g_crate_n) return "";
+  return g_crates[idx].zh ? g_crates[idx].zh : g_crates[idx].id;
+}
+
+bool spawn_crate(int crate_idx, int count, float height, std::string* out_msg) {
+  return spawn_crate_impl(crate_idx, count, height, out_msg);
+}
+
+bool crate_auto_active() { return false; }  // 自动空投已移除
+
+void crate_select(int idx, int count) {
+  // 箱子表可能还没扫出来（启动时就会调用），所以索引不按表长裁剪，
+  // 真正空投时再夹到合法范围，保证恢复回来的选择不丢。
+  if (idx >= 0) g_crate_sel_idx = idx;
+  if (count > 0) g_crate_sel_count = count > 20 ? 20 : count;
+}
+
+int crate_kind_sel() { return g_crate_sel_idx; }
+
+int crate_sel_count() { return g_crate_sel_count; }
+
 void install_roster_hooks() { install_roster_hooks_impl(); }
 
 bool collect_match_economy(MatchEconomy* out) { return collect_match_economy_impl(out); }
+
+bool refresh_match_resources(MatchEconomy* inout) { return refresh_match_resources_impl(inout); }
 
 const BuildLockEntry* build_lock_catalog(int* count) { return build_lock_catalog_impl(count); }
 
@@ -5670,6 +8707,107 @@ bool build_lock_selected(bool locked, std::string* out_msg) {
 }
 
 void build_lock_tick() { build_lock_tick_impl(); }
+
+void roster_set_active(bool on) {
+  const bool rising = on && !g_roster_active;
+  g_roster_active = on;
+  if (!rising || uprising_active()) return;
+  // Each time 战况统计 opens: full-table snapshot of player object lists
+  // (BFI-style), then Present amortizes TypeId classify. Clear the old live
+  // table so mid-match open cannot show a stale / partial army.
+  if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
+  g_live.clear();
+  g_live_drop.clear();
+  g_live_retries.clear();
+  g_add_n = 0;
+  g_forget_n = 0;
+  if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
+  g_roster_seed_burst = true;
+  g_seed_walk_done = false;
+  g_seed_queue_overflow = false;
+  g_live_seeded = false;
+  g_roster_next_light = 0;
+  g_roster_next_rediscover = 0;
+  log("roster: stats opened — full scan armed");
+}
+
+bool roster_active() { return g_roster_active; }
+
+bool roster_seed_pending() { return g_roster_active && (g_roster_seed_burst || !g_live_seeded); }
+
+void roster_tick() {
+  if (!g_live_cs_ready || uprising_active()) return;
+  // Stats closed: only forget dead objects. Never classify / scan.
+  if (!g_roster_active) {
+    g_catalog_budget = 0;
+    drain_live_queues(0, 24);
+    return;
+  }
+  auto drain_timeboxed = [&](double budget_ms) {
+    LARGE_INTEGER freq{}, t0{}, t1{};
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+    g_catalog_budget = 8;
+    for (int slice = 0; slice < 4; ++slice) {
+      drain_live_queues(4, 8);
+      QueryPerformanceCounter(&t1);
+      const double ms = (freq.QuadPart > 0)
+                            ? (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart
+                            : 0.0;
+      if (ms >= budget_ms) break;
+      int pending_now = 0;
+      if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
+      pending_now = g_add_n;
+      if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
+      if (pending_now == 0) break;
+      g_catalog_budget = 4;
+    }
+  };
+
+  if (g_roster_seed_burst || !g_live_seeded) {
+    // Time-box classify so a hard template cannot hitch Present. ~2ms/frame.
+    drain_timeboxed(2.0);
+    int pending = 0;
+    int live_n = 0;
+    if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
+    pending = g_add_n;
+    live_n = (int)g_live.size();
+    if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
+    if (g_seed_walk_done && pending == 0) {
+      if (g_seed_queue_overflow) {
+        g_seed_queue_overflow = false;
+        g_seed_walk_done = false;
+        g_roster_next_light = 0;
+        log("roster: seed queue overflow — another walk armed live=%d", live_n);
+      } else {
+        g_live_seeded = true;
+        g_roster_seed_burst = false;
+        // First reconcile soon after the open seed settles.
+        g_roster_next_light = GetTickCount() + 2000u;
+        log("roster: full scan done live=%d", live_n);
+      }
+    }
+    return;
+  }
+  // After seed: if a reconcile walk enqueued unknowns, keep draining them with
+  // the same time box — otherwise counts lag until the next hide/show.
+  int pending = 0;
+  if (g_live_cs_ready) EnterCriticalSection(&g_live_cs);
+  pending = g_add_n;
+  if (g_live_cs_ready) LeaveCriticalSection(&g_live_cs);
+  if (pending > 0) {
+    drain_timeboxed(2.0);
+    return;
+  }
+  if (roster_early_load()) {
+    g_catalog_budget = 1;
+    drain_live_queues(1, 12);
+    return;
+  }
+  // Keep Present light — list walks live in collect_match_economy (2s wall clock).
+  g_catalog_budget = 3;
+  drain_live_queues(2, 16);
+}
 
 void refresh_power_cooldowns() { clear_local_superweapon_cooldowns(); }
 
@@ -5703,13 +8841,226 @@ bool summon_prepare(uint32_t player, int count, const char* const* type_ids, int
   return summon_prepare_impl(player, count, type_ids, type_count, out_msg);
 }
 
+float summon_extra_lift() { return g_summon_lift_extra; }
+
+void set_summon_extra_lift(float meters) {
+  if (!(meters >= 0.f)) meters = 0.f;
+  if (meters > 4000.f) meters = 4000.f;
+  g_summon_lift_extra = meters;
+}
+
+bool summon_visible_fix() { return g_summon_visible_fix; }
+
+void set_summon_visible_fix(bool on) { g_summon_visible_fix = on; }
+
 void drain_unit_spawns() { drain_unit_spawns_impl(); }
+
+const char* type_display_name(const char* type_id) { return lookup_zh_name(type_id); }
+
+// 对象模板库（ThingFactory）的哈希表：factory+0x2C 是桶数组，factory+0x30 是桶数，
+// 每个节点是 {名称指针, 模板指针, 下一个}。这就是引擎 FindTemplate 用的那张表，
+// 里面登记了全部对象类型（含战役 / 特殊 / Mod 单位），不只是建造面板那批。
+static std::vector<std::string> g_obj_names;
+static uint32_t g_obj_names_factory = 0;
+static uint32_t g_obj_names_buckets = 0;
+static DWORD g_obj_names_last = 0;
+static bool g_obj_names_force = false;
+
+// 类型名形状：可见 ASCII、4~80 字符、带常见对象名前缀。
+// 用来从模板内存里挖 id 时过滤掉描述文本 / 资源键。
+static bool plausible_type_id(const char* s) {
+  if (!s || !s[0]) return false;
+  size_t len = 0;
+  for (; s[len]; ++len) {
+    const unsigned char c = (unsigned char)s[len];
+    if (c <= 0x20 || c >= 0x7F) return false;
+    if (len >= 80) return false;
+  }
+  if (len < 4) return false;
+  static const char* kPrefix[] = {
+      "Allied", "Soviet", "Japan", "Celestial", "Neutral", "Civilian",
+      "OreNode", "OilDerrick", "Hospital", "Garage", "Observation",
+      "ShipYard", "Airport", "Veterancy", "Crate", "Bonus", "Tech",
+      "PlayerPower", "SpecialPower", "Generic", "Wall", "Garrison"};
+  for (const char* p : kPrefix) {
+    if (_strnicmp(s, p, std::strlen(p)) == 0) return true;
+  }
+  return false;
+}
+
+// 兜底：不同版本的 ThingFactory 哈希表布局可能不一样。布局对不上时改为遍历
+// 模板链表（factory+0x24），从每个模板的前 0x180 字节里挖「像类型名」的串。
+static std::vector<std::string> collect_type_ids_from_templates(uint32_t factory) {
+  std::vector<std::string> out;
+  uint32_t tmpl = 0;
+  if (!safe_read_u32(factory + 0x24, &tmpl) || !is_ptr(tmpl)) return out;
+  for (int n = 0; n < 4096 && is_ptr(tmpl); ++n) {
+    for (uint32_t off = 0; off <= 0x180; off += 4) {
+      uint32_t p = 0;
+      if (!safe_read_u32(tmpl + off, &p) || !is_ptr(p)) continue;
+      char buf[96] = {};
+      if (!safe_read_bytes(p, buf, sizeof(buf) - 1)) continue;
+      if (!plausible_type_id(buf)) continue;
+      out.emplace_back(buf);
+    }
+    uint32_t next = 0;
+    if (!safe_read_u32(tmpl + 0xC, &next) || next == tmpl) break;
+    tmpl = next;
+  }
+  return out;
+}
+
+// 扫一个 store 的哈希桶，收集类型名。布局：+0x2C 桶数组 / +0x30 桶数，
+// 节点 {key(名字指针), value(模板), next}。
+static void walk_store_names(uint32_t store, std::vector<std::string>* out, uint32_t* out_count) {
+  if (out_count) *out_count = 0;
+  if (!out || !is_ptr(store)) return;
+  uint32_t buckets = 0, count = 0;
+  if (!safe_read_u32(store + 0x2C, &buckets) || !is_ptr(buckets) ||
+      !safe_read_u32(store + 0x30, &count) || count == 0 || count > 100000) {
+    return;
+  }
+  if (out_count) *out_count = count;
+  int budget = 60000;   // 读预算：布局对不上时不至于在渲染线程上扫太久
+  for (uint32_t i = 0; i < count && out->size() < 8192; ++i) {
+    uint32_t node = 0;
+    if (!safe_read_u32(buckets + i * 4u, &node)) continue;
+    for (int guard = 0; is_ptr(node) && guard < 64; ++guard) {
+      if (--budget <= 0) return;
+      uint32_t key = 0, next = 0;
+      if (safe_read_u32(node, &key) && is_ptr(key)) {
+        char buf[96] = {};
+        if (safe_read_bytes(key, buf, sizeof(buf) - 1)) {
+          bool ok = true;
+          size_t len = 0;
+          for (; buf[len] && len < sizeof(buf) - 1; ++len) {
+            const unsigned char c = (unsigned char)buf[len];
+            if (c <= 0x20 || c >= 0x7F) {
+              ok = false;
+              break;
+            }
+          }
+          if (ok && len >= 3) out->push_back(std::string(buf, len));
+        }
+      }
+      if (!safe_read_u32(node + 8, &next) || next == node) break;
+      node = next;
+    }
+  }
+}
+
+const std::vector<std::string>& object_type_names() {
+  if (!module_base()) return g_obj_names;
+  const DWORD now = GetTickCount();
+  if (g_obj_names_force) g_obj_names_force = false;
+  // 成功扫过：60 秒内复用。扫失败（列表还是空）：5 秒内不再重试，
+  // 否则每次 UI 引用都会重扫一遍工厂表，进对局前会把帧时间拖垮。
+  const bool ok_fresh =
+      !g_obj_names.empty() && static_cast<int32_t>(now - g_obj_names_last) < 60000;
+  const bool fail_fresh = g_obj_names.empty() &&
+                          static_cast<int32_t>(now - g_obj_names_last) < 5000;
+  if (ok_fresh || fail_fresh) return g_obj_names;
+  g_obj_names_last = now;
+
+  // 两个 store 都试：真 ThingFactory（引擎 FindTemplate 用的那个）里才有全部模板，
+  // 另一个只有可建造的几百条——拿它当"名单"会把现成的特殊单位误判成不存在。
+  discover_template_lookup();
+  uint32_t stores[3] = {};
+  stores[0] = g_tmpl_store;
+  if (!safe_read_u32(module_base() + kTemplateStoreRva, &stores[1])) stores[1] = 0;
+  if (!safe_read_u32(module_base() + kThingFactoryRva, &stores[2])) stores[2] = 0;
+
+  std::vector<std::string> out;
+  uint32_t used = 0;
+  uint32_t used_count = 0;
+  bool from_hash = false;
+  for (int i = 0; i < 3; ++i) {
+    if (!is_ptr(stores[i]) || stores[i] == used) continue;
+    std::vector<std::string> tmp;
+    uint32_t cnt = 0;
+    walk_store_names(stores[i], &tmp, &cnt);
+    std::sort(tmp.begin(), tmp.end());
+    tmp.erase(std::unique(tmp.begin(), tmp.end()), tmp.end());
+    if (tmp.size() > out.size()) {
+      out.swap(tmp);
+      used = stores[i];
+      used_count = cnt;
+      from_hash = out.size() >= 16;
+    }
+  }
+  if (!from_hash && is_ptr(used)) {
+    // 哈希表没读到东西（这个版本的布局不是 +0x2C/+0x30）：退回扫模板链表。
+    std::vector<std::string> alt = collect_type_ids_from_templates(used);
+    std::sort(alt.begin(), alt.end());
+    alt.erase(std::unique(alt.begin(), alt.end()), alt.end());
+    if (alt.size() > out.size()) out.swap(alt);
+  }
+  const bool changed_layout = used_count != g_obj_names_buckets || g_obj_names.empty();
+  g_obj_names.swap(out);
+  g_obj_names_from_hash = from_hash;
+  g_obj_names_factory = used;
+  g_obj_names_buckets = used_count;
+  if (changed_layout) {
+    log("thing factory: %d object type names (buckets=%u, store=%08X)", (int)g_obj_names.size(),
+        used_count, used);
+  }
+  return g_obj_names;
+}
+
+void refresh_object_type_names() {
+  g_obj_names_force = true;
+  g_obj_names.clear();
+  object_type_names();
+}
+
+bool object_type_exists(const char* type_id) {
+  if (!type_id || !type_id[0]) return false;
+  // 首选哈希直查模板库：这才是引擎的判据，名单扫描（尤其退化的兜底扫描）
+  // 会把现成可召唤的特殊单位误判成"没有"。
+  if (template_find_by_hash(sage_hash_lower(type_id))) return true;
+  const std::vector<std::string>& all = object_type_names();
+  if (all.empty()) return false;
+  // 名单是模板库哈希表里登记的全部类型名；这里只做精确匹配，不碰模板内存。
+  return std::binary_search(all.begin(), all.end(), std::string(type_id));
+}
+
+bool object_type_list_ready() {
+  return g_obj_names_from_hash && object_type_names().size() >= 500;
+}
 
 // 对局时钟（秒），供摄像机定时事件等使用。
 bool battle_clock(float* seconds_out) {
   if (seconds_out) *seconds_out = 0.f;
   if (!loaded_module()) return false;
   return read_battle_clock(nullptr, seconds_out);
+}
+
+// 对局结束代次：离开对局后必须连续 500ms 都不在对局里，才自增一次。
+// 结算/退出对局的头几帧 TheGameLogic、ThePlayerList、音频事件都还在拆，
+// 这几帧里做任何"恢复"动作（改倍率、写 Lua 全局、遍历玩家列表）都可能踩到已经释放的对象。
+uint32_t battle_left_generation() {
+  static uint32_t s_epoch = 0;
+  static bool s_was_in_battle = false;
+  static bool s_fired = false;
+  static DWORD s_left_at = 0;
+  const bool in_battle = battle_clock(nullptr);
+  const DWORD now = GetTickCount();
+  if (in_battle) {
+    s_was_in_battle = true;
+    s_left_at = 0;
+    s_fired = false;
+    return s_epoch;
+  }
+  if (!s_was_in_battle || s_fired) return s_epoch;
+  if (s_left_at == 0) {
+    s_left_at = now ? now : 1;
+    return s_epoch;
+  }
+  if (now - s_left_at < 500u) return s_epoch;
+  s_fired = true;
+  s_was_in_battle = false;
+  s_left_at = 0;
+  return ++s_epoch;
 }
 
 void set_money_player(uint32_t player) { g_money_player = player; }
@@ -5881,6 +9232,14 @@ bool engine_run(const char* key, std::string* out_msg) {
   if (std::strcmp(key, "hp_max") == 0) return apply_hp("max", nullptr, out_msg);
   if (std::strcmp(key, "hp_min") == 0) return apply_hp("min", nullptr, out_msg);
   if (std::strcmp(key, "hp_normal") == 0) return apply_hp("normal", nullptr, out_msg);
+  if (std::strcmp(key, "invincible") == 0) {
+    // 按 `[` 只给当前选中加无敌（累加，不会把之前保护的单位解掉）；
+    // 对同一批已锁的单位再按一次才解除这一批。
+    return invincible_toggle_impl(out_msg);
+  }
+  if (std::strcmp(key, "airdrop") == 0) {
+    return spawn_crate_impl(g_crate_sel_idx, g_crate_sel_count, 0.f, out_msg);
+  }
   if (std::strcmp(key, "unit_kill") == 0) return kill_selected(out_msg);
   if (std::strcmp(key, "unit_rank") == 0) return rank_up(out_msg);
   if (std::strcmp(key, "convert_unit") == 0) return convert_selected(out_msg);
@@ -5905,7 +9264,13 @@ bool engine_run(const char* key, std::string* out_msg) {
     return ok1 || ok2;
   }
   if (std::strcmp(key, "spawn_mcv") == 0) return spawn_one_mcv(out_msg);
-  if (std::strcmp(key, "summon_troops") == 0) return summon_troops_impl(out_msg);
+  if (std::strcmp(key, "summon_troops") == 0) {
+    std::string msg;
+    const bool ok = summon_troops_impl(&msg);
+    log("summon_troops %s: %s", ok ? "ok" : "failed", msg.c_str());
+    if (out_msg) *out_msg = msg;
+    return ok;
+  }
   if (out_msg) *out_msg = u8"未知 engine 功能";
   return false;
 }
@@ -5976,6 +9341,20 @@ namespace {
 
 int g_unit_scope = kUnitScopeSelected;
 uint32_t g_unit_scope_player = 0;  // 0 表示用本地玩家
+
+// 「切换队伍 + 不启用 AI 操控」时被压成 0 速度的单位。旧实现只压不还原，
+// 于是后来勾上「启用 AI 操控」再切换，单位还是不动。
+std::unordered_set<uint32_t> g_team_frozen;
+
+// 还原被上面压成 0 的速度。备份值不可信（<=0，例如第一次压之前字段就是 0）时
+// 按原版正常速度 1.0 写回，否则单位会永远站在原地。返回是否真的写了。
+bool thaw_speed_node(uint32_t node) {
+  const float cur = read_f32(node + 8);
+  if (std::fabs(cur) > 1e-4f) return false;  // 已经在动，别碰
+  float backup = read_f32(node + 0x40);
+  if (!(backup > 0.f && backup <= 5000.f)) backup = 1.f;
+  return write_f32(node + 8, backup);
+}
 
 uint32_t ent_owner_of(uint32_t ent) {
   uint32_t ow = 0;
@@ -6076,34 +9455,84 @@ bool unit_change_team_ex(uint32_t target_player, bool enable_ai, std::string* ou
     if (out_msg) *out_msg = u8"切换队伍：当前范围内没有单位（先选中单位，或换个范围）";
     return false;
   }
-  const uint32_t off = ent_off(kEntOwner, kEntOwnerEp1);
-  int changed = 0;
+  // 走引擎的 setTeam：它会同时改 +0x414(Team) / +0x418(Player)。只写 +0x418
+  // 时引擎会按团队里的玩家把它覆盖回去，所以旧实现看起来「没生效」。
+  const uint32_t team = player_team_of(target_player);
+  if (!team) {
+    log("unit team change: no Team found for player %08X, falling back to raw owner write",
+        target_player);
+  }
+  int changed = 0, failed = 0;
   for (int i = 0; i < n; ++i) {
     const uint32_t ent = ents[i];
     if (ent_owner_of(ent) == target_player) continue;
-    if (write_u32(ent + off, target_player)) ++changed;
+    if (assign_entity_to_player(ent, target_player, team)) {
+      ++changed;
+    } else {
+      ++failed;
+    }
+  }
+  log("unit team change: team=%08X changed=%d failed=%d", team, changed, failed);
+  // 勾了「启用 AI 操控」：把之前被压成 0 的速度还原，否则这些单位永远动不了。
+  int thawed = 0, frozen = 0;
+  if (enable_ai) {
+    for (uint32_t ent : g_team_frozen) {
+      if (!looks_like_entity(ent) || !entity_alive(ent)) continue;
+      for (uint32_t node : speed_nodes(ent)) {
+        if (thaw_speed_node(node)) ++thawed;
+      }
+    }
+    // 本次范围里也一起还原：可能上次压过但没记进名单（老版本留下的冻结）。
+    for (int i = 0; i < n; ++i) {
+      for (uint32_t node : speed_nodes(ents[i])) {
+        if (thaw_speed_node(node)) ++thawed;
+      }
+    }
+    g_team_frozen.clear();
   }
   // 不启用 AI 操控：改完归属顺手把速度压成 0，免得 AI 立刻把单位调走。
-  // （这不是引擎级的「禁止 AI」，只是原地冻结，取消时用「单位速度」还原。）
-  int frozen = 0;
+  // （这不是引擎级的「禁止 AI」，只是原地冻结，勾上「启用 AI 操控」即可还原。）
   if (!enable_ai && changed > 0) {
     for (int i = 0; i < n; ++i) {
       for (uint32_t node : speed_nodes(ents[i])) {
-        if (set_speed_node(node, 0.f)) ++frozen;
+        if (set_speed_node(node, 0.f)) {
+          ++frozen;
+          g_team_frozen.insert(ents[i]);
+        }
       }
     }
   }
-  if (changed == 0 && frozen == 0) {
-    if (out_msg) *out_msg = u8"切换队伍：范围内单位已经属于该队伍";
+  if (changed == 0 && frozen == 0 && thawed == 0) {
+    if (out_msg) {
+      if (!team) {
+        *out_msg = u8"切换队伍：找不到该玩家的队伍（Team），已放弃以免把单位写坏";
+      } else {
+        *out_msg = u8"切换队伍：范围内单位已经属于该队伍";
+      }
+    }
     return false;
   }
   if (out_msg) {
-    char buf[160];
+    char buf[224];
     if (frozen > 0) {
       std::snprintf(buf, sizeof(buf), u8"已把 %d 个单位切换到目标队伍，并把 %d 处速度冻结为 0",
                     changed, frozen);
+    } else if (thawed > 0 && changed > 0) {
+      std::snprintf(buf, sizeof(buf), u8"已把 %d 个单位切换到目标队伍，并还原 %d 处速度（AI 可以调动了）",
+                    changed, thawed);
+    } else if (thawed > 0) {
+      std::snprintf(buf, sizeof(buf), u8"已还原 %d 处被冻结的速度（AI 可以调动了）", thawed);
     } else {
       std::snprintf(buf, sizeof(buf), u8"已把 %d 个单位切换到目标队伍", changed);
+    }
+    if (failed > 0) {
+      const size_t used = std::strlen(buf);
+      std::snprintf(buf + used, sizeof(buf) - used, u8"（%d 个没改成功）", failed);
+    }
+    if (!team) {
+      const size_t used = std::strlen(buf);
+      std::snprintf(buf + used, sizeof(buf) - used,
+                    u8"（没找到该玩家的 Team，只改了归属字段，可能被引擎覆盖）");
     }
     *out_msg = buf;
   }
@@ -6113,105 +9542,40 @@ bool unit_change_team_ex(uint32_t target_player, bool enable_ai, std::string* ou
 }
 
 // ---------------------------------------------------------------------------
-// 「切换单位的颜色」：读写玩家对象的颜色字段（+0x80 / +0x84）。
+// 「启用 AI 操控」勾回来时：把被冻结的速度还原。
 // ---------------------------------------------------------------------------
-namespace {
-
-struct ColorBackup {
-  uint32_t addr;
-  uint32_t argb;
-};
-
-std::map<uint32_t, ColorBackup> g_color_backup;  // key = 玩家对象指针
-
-bool color_ok(uint32_t argb) {
-  // 只认「0x00RRGGBB」这种形状：高位字节必须是 0，避免把指针（高位字节非 0）
-  // 误判成颜色后写坏玩家对象。
-  return (argb & 0xFF000000u) == 0 && (argb & 0x00FFFFFFu) != 0;
-}
-
-// 找到该玩家颜色所在的地址；读不到返回 0。
-uint32_t color_slot_of(uint32_t player) {
-  if (!is_ptr(player)) return 0;
-  uint32_t offs[3] = { 0x80u, 0x84u, 0x88u };
-  const int count = uprising_active() ? 3 : 2;
-  for (int i = 0; i < count; ++i) {
-    uint32_t v = 0;
-    if (!safe_read_u32(player + offs[i], &v)) continue;
-    if (color_ok(v)) return player + offs[i];
-  }
-  return 0;
-}
-
-}  // namespace
-
-bool unit_color_read(uint32_t player, uint8_t* r, uint8_t* g, uint8_t* b) {
-  const uint32_t slot = color_slot_of(player);
-  if (!slot) return false;
-  const uint32_t v = read_u32(slot);
-  if (r) *r = (uint8_t)((v >> 16) & 0xFFu);
-  if (g) *g = (uint8_t)((v >> 8) & 0xFFu);
-  if (b) *b = (uint8_t)(v & 0xFFu);
-  return true;
-}
-
-bool unit_color_has_backup(uint32_t player) {
-  return g_color_backup.find(player) != g_color_backup.end();
-}
-
-bool unit_color_write(uint32_t player, uint8_t r, uint8_t g, uint8_t b,
-                      std::string* out_msg) {
+bool unit_thaw_team_freeze(uint32_t target_player, std::string* out_msg) {
+  (void)target_player;
   if (uprising_active()) {
-    if (out_msg) *out_msg = u8"切换颜色：起义时刻暂未适配";
+    if (out_msg) *out_msg = u8"切换队伍：起义时刻暂未适配";
     return false;
   }
-  const uint32_t slot = color_slot_of(player);
-  if (!slot) {
-    if (out_msg) *out_msg = u8"切换颜色：读不到该玩家的颜色字段（先进入对局）";
-    return false;
+  int thawed = 0;
+  for (uint32_t ent : g_team_frozen) {
+    if (!looks_like_entity(ent) || !entity_alive(ent)) continue;
+    for (uint32_t node : speed_nodes(ent)) {
+      if (thaw_speed_node(node)) ++thawed;
+    }
   }
-  const uint32_t cur = read_u32(slot);
-  if (g_color_backup.find(player) == g_color_backup.end()) {
-    ColorBackup b0{};
-    b0.addr = slot;
-    b0.argb = cur;
-    g_color_backup[player] = b0;
+  g_team_frozen.clear();
+  // 名单里没记到的也顺手解开（老版本只压不还原，留下的冻结没人记得）。
+  uint32_t ents[512];
+  const int n = unit_collect_scope(ents, 512);
+  for (int i = 0; i < n; ++i) {
+    for (uint32_t node : speed_nodes(ents[i])) {
+      if (thaw_speed_node(node)) ++thawed;
+    }
   }
-  // 保留原 alpha（RA3 用 alpha 表示是否灰显，别动它）。
-  const uint32_t keep_a = cur & 0xFF000000u;
-  const uint32_t argb = keep_a | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
-  if (!write_u32(slot, argb)) {
-    if (out_msg) *out_msg = u8"切换颜色：写入失败";
+  if (thawed == 0) {
+    if (out_msg) *out_msg = u8"没有需要还原的速度（范围内单位本来就能动）";
     return false;
   }
   if (out_msg) {
-    char buf[128];
-    std::snprintf(buf, sizeof(buf), u8"已把该队伍颜色改为 (%u, %u, %u)", (unsigned)r,
-                  (unsigned)g, (unsigned)b);
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), u8"已还原 %d 处被冻结的速度（AI 可以调动了）", thawed);
     *out_msg = buf;
   }
-  log("unit color write %08X -> (%u,%u,%u)", player, (unsigned)r, (unsigned)g, (unsigned)b);
-  return true;
-}
-
-bool unit_color_restore(uint32_t player, std::string* out_msg) {
-  auto it = g_color_backup.find(player);
-  if (it == g_color_backup.end()) {
-    if (out_msg) *out_msg = u8"恢复颜色：没有记录过这个队伍的原始颜色";
-    return false;
-  }
-  if (!write_u32(it->second.addr, it->second.argb)) {
-    if (out_msg) *out_msg = u8"恢复颜色：写入失败";
-    return false;
-  }
-  const uint32_t v = it->second.argb;
-  g_color_backup.erase(it);
-  if (out_msg) {
-    char buf[128];
-    std::snprintf(buf, sizeof(buf), u8"已恢复原色 (%u, %u, %u)", (unsigned)((v >> 16) & 255u),
-                  (unsigned)((v >> 8) & 255u), (unsigned)(v & 255u));
-    *out_msg = buf;
-  }
+  log("unit team thaw -> %d nodes", thawed);
   return true;
 }
 

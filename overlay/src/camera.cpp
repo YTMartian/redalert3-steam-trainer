@@ -111,6 +111,10 @@ uint32_t g_view = 0;  // 最近一次确认可用的 View
 bool g_takeover = false;
 bool g_live_valid = false;
 CameraState g_live;  // 接管目标
+// 由 camera_tick 根据 battle_clock 更新；hook 里只读这个标志，避免在
+// setTransform 热路径里再走一遍对局检测，也避免退局拆 View 时还在改矩阵。
+volatile LONG g_in_battle = 0;
+bool g_was_in_battle = false;
 
 SetCameraFn_t g_orig_set_camera = nullptr;
 int g_hook_state = 0;  // 0 未装 / 1 成功 / -1 失败
@@ -408,16 +412,19 @@ void note_call(uint32_t view, uint32_t m_ptr, int which) {
 }
 
 // 校验通过则记下 View，并按需把接管目标写回矩阵/距离。
+// 不在对局里绝不改矩阵：退局时 View/D3D 正在拆除，改写会卡死 Present，
+// 表现就是「退出战局音效一直在后台循环」。
 bool capture_and_maybe_takeover(uint32_t view, float* m) {
   if (!m || !is_ptr(view) || !view_is_obj(view)) {
     InterlockedIncrement(&g_hook_rejects);
     return false;
   }
+  const bool in_battle = InterlockedCompareExchange(&g_in_battle, 0, 0) != 0;
   bool takeover = false;
   CameraState target;
   if (g_cs_ready) EnterCriticalSection(&g_cs);
   g_view = view;
-  takeover = g_takeover && g_live_valid;
+  takeover = in_battle && g_takeover && g_live_valid;
   target = g_live;
   if (g_cs_ready) LeaveCriticalSection(&g_cs);
   if (takeover) {
@@ -449,6 +456,13 @@ int __fastcall hk_set_camera(void* self, void* /*edx*/, float* m) {
 }
 
 int __fastcall hk_set_camera2(void* self, void* /*edx*/, float* m) {
+  // Probe B is almost never a View (vtable 0xBF4EA8). After a short sample
+  // window, forward-only — the detour cost was paying for nothing every frame.
+  static volatile long s_b_samples = 0;
+  const long sample = InterlockedIncrement(&s_b_samples);
+  if (sample > 128) {
+    return g_orig_set_camera2 ? g_orig_set_camera2(self, nullptr, m) : 0;
+  }
   __try {
     if (m) {
       const uint32_t view = reinterpret_cast<uint32_t>(self);
@@ -1072,6 +1086,8 @@ bool camera_read(CameraState* out) {
 
 bool camera_apply(const CameraState* st) {
   if (!st) return false;
+  // 不在对局里禁止写 View，避免退局拆对象时卡死。
+  if (!battle_clock(nullptr)) return false;
   Lock lock;
   const uint32_t view = current_view();
   if (!view) return false;
@@ -1089,6 +1105,10 @@ void camera_set_takeover(bool on) {
   Lock lock;
   if (on == g_takeover) return;
   if (on) {
+    if (!battle_clock(nullptr)) {
+      log("camera: takeover refused (not in battle)");
+      return;
+    }
     CameraState st;
     const uint32_t view = current_view();
     if (view && read_view_state(view, &st)) {
@@ -1590,6 +1610,11 @@ void camera_tick() {
     InitializeCriticalSection(&g_cs);
     g_cs_ready = true;
   }
+
+  float clock = 0.f;
+  const bool in_battle = battle_clock(&clock);
+  InterlockedExchange(&g_in_battle, in_battle ? 1 : 0);
+
   Lock lock;
   if (g_hook_state != 1) install_hook_locked();
   if (!g_loaded) {
@@ -1597,28 +1622,42 @@ void camera_tick() {
     g_loaded = true;
   }
 
+  // 退出遭遇战：立刻停接管 / 停动画，避免拆 View 时还在改矩阵卡死整局。
+  if (g_was_in_battle && !in_battle) {
+    if (g_takeover || g_play_state != kCamStopped) {
+      log("camera: battle left — takeover OFF, play stopped (was view=0x%X)", g_view);
+    }
+    g_takeover = false;
+    g_play_state = kCamStopped;
+    g_view = 0;
+  }
+  g_was_in_battle = in_battle;
+
   const DWORD now = GetTickCount();
   float dt = g_last_tick ? (float)(now - g_last_tick) / 1000.f : 0.f;
   g_last_tick = now;
   if (dt < 0.f) dt = 0.f;
   if (dt > 0.25f) dt = 0.25f;
 
-  handle_events(dt);
+  // 不在对局里不做事件/轨迹推进（定时事件里的「切换功能」也可能在退局时捣乱）。
+  if (in_battle) {
+    handle_events(dt);
 
-  if (g_play_state == kCamPlaying) {
-    g_play_t += dt * g_rate;
-    const float total = total_time();
-    if (total <= 1e-4f) {
-      g_play_state = kCamStopped;
-    } else if (g_play_t >= total) {
-      if (g_loop) {
-        g_play_t = std::fmod(g_play_t, total);
-      } else {
-        g_play_t = total;
+    if (g_play_state == kCamPlaying) {
+      g_play_t += dt * g_rate;
+      const float total = total_time();
+      if (total <= 1e-4f) {
         g_play_state = kCamStopped;
+      } else if (g_play_t >= total) {
+        if (g_loop) {
+          g_play_t = std::fmod(g_play_t, total);
+        } else {
+          g_play_t = total;
+          g_play_state = kCamStopped;
+        }
       }
+      apply_track_to_live(g_play_t);
     }
-    apply_track_to_live(g_play_t);
   }
 
   if (g_dirty) {
@@ -1630,7 +1669,10 @@ void camera_tick() {
     }
   }
 
-  camera_log_diag(now);
+  // Periodic diag used to fopen/append ~20 lines every 2s on the Present
+  // thread and hitch the game while the menu was open. Keep the helper for
+  // manual debugging; do not call it from the hot path.
+  (void)now;
 }
 
 // ---------------------------------------------------------------------------

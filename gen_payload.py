@@ -22,6 +22,27 @@ import core_hooks
 # 开发期占位基址：只用于算标签偏移与跳转长度，与运行时实际分配地址无关
 BASES = (0x10000000, 0x10003100, 0x10005000, 0x10005040, 0x400000)
 
+# 起义时刻那一段（EP1_CORE_HOOKS + ep1_asm_and_symbols）是手写补进 payload.py 的，
+# 本生成器不产生它。生成时把旧文件里这一段原样接回去：否则一跑本脚本，起义时刻
+# 支持就静默消失，arm_mustcode.py 顶部的 import 直接 ImportError，两个版本都装不上。
+EP1_MARKER = '\n\n# ra3ep1_1.0.game.'
+
+
+def preserved_ep1_block():
+    try:
+        old = io.open('payload.py', encoding='utf-8').read()
+    except IOError:
+        return ''
+    i = old.find(EP1_MARKER)
+    if i < 0:
+        if 'EP1_CORE_HOOKS' in old or 'ep1_asm_and_symbols' in old:
+            raise RuntimeError(
+                'payload.py 里有起义时刻代码，但找不到 EP1_MARKER；'
+                '先在 gen_payload.py 里更新标记，再重新生成')
+        print('[提示] 旧 payload.py 没有起义时刻段，本次不会写入')
+        return ''
+    return old[i + 1:]
+
 
 def main():
     sym = json.load(open('symbols.json'))
@@ -61,6 +82,7 @@ def main():
 
     hooks = core_hooks.CORE_HOOKS
     globals_ = core_hooks.DATA_GLOBALS
+    ep1 = preserved_ep1_block()  # 必须在打开 payload.py 写之前读旧文件
 
     with io.open('payload.py', 'w', encoding='utf-8') as w:
         w.write('# -*- coding: utf-8 -*-\n')
@@ -71,6 +93,7 @@ def main():
         w.write('LABELS = %r\n\n' % lab)
         w.write('CORE_HOOKS = %r\n\n' % hooks)
         w.write('DATA_GLOBALS = %r\n' % globals_)
+        w.write(ep1)
 
     print('payload.py 已生成')
     print('  ASM_TEXT      %d 字节' % len(aligned))
@@ -78,6 +101,7 @@ def main():
     print('  LABELS        MC:%d / MC2:%d 个标签' % (len(mc_labels), len(mc2_labels)))
     print('  CORE_HOOKS    %d 个 hook' % len(hooks))
     print('  DATA_GLOBALS  %d 个' % len(globals_))
+    print('  起义时刻段    %s' % ('已保留 %d 字节' % len(ep1) if ep1 else '无'))
     print('  MC 段 %d 字节 / MC2 段 %d 字节' % (len(mc), len(mc2)))
 
 

@@ -61,6 +61,7 @@ struct ImGui_ImplDX9_Data
     LPDIRECT3DDEVICE9           pd3dDevice;
     LPDIRECT3DVERTEXBUFFER9     pVB;
     LPDIRECT3DINDEXBUFFER9      pIB;
+    LPDIRECT3DSTATEBLOCK9       pStateBlock; // reused — CreateStateBlock every frame is extremely slow
     int                         VertexBufferSize;
     int                         IndexBufferSize;
     bool                        HasRgbaSupport;
@@ -201,13 +202,17 @@ void ImGui_ImplDX9_RenderDrawData(ImDrawData* draw_data)
             return;
     }
 
-    // Backup the DX9 state
-    IDirect3DStateBlock9* state_block = nullptr;
-    if (device->CreateStateBlock(D3DSBT_ALL, &state_block) < 0)
-        return;
-    if (state_block->Capture() < 0)
+    // Backup the DX9 state. Creating a state block every Present freezes RA3
+    // while the menu is open — cache one and only Capture/Apply each frame.
+    if (!bd->pStateBlock)
     {
-        state_block->Release();
+        if (device->CreateStateBlock(D3DSBT_ALL, &bd->pStateBlock) < 0)
+            return;
+    }
+    if (bd->pStateBlock->Capture() < 0)
+    {
+        bd->pStateBlock->Release();
+        bd->pStateBlock = nullptr;
         return;
     }
 
@@ -221,14 +226,10 @@ void ImGui_ImplDX9_RenderDrawData(ImDrawData* draw_data)
     CUSTOMVERTEX* vtx_dst;
     ImDrawIdx* idx_dst;
     if (bd->pVB->Lock(0, (UINT)(draw_data->TotalVtxCount * sizeof(CUSTOMVERTEX)), (void**)&vtx_dst, D3DLOCK_DISCARD) < 0)
-    {
-        state_block->Release();
         return;
-    }
     if (bd->pIB->Lock(0, (UINT)(draw_data->TotalIdxCount * sizeof(ImDrawIdx)), (void**)&idx_dst, D3DLOCK_DISCARD) < 0)
     {
         bd->pVB->Unlock();
-        state_block->Release();
         return;
     }
 
@@ -308,8 +309,8 @@ void ImGui_ImplDX9_RenderDrawData(ImDrawData* draw_data)
     device->SetTransform(D3DTS_PROJECTION, &last_projection);
 
     // Restore the DX9 state
-    state_block->Apply();
-    state_block->Release();
+    if (bd->pStateBlock)
+        bd->pStateBlock->Apply();
 }
 
 static bool ImGui_ImplDX9_CheckFormatSupport(LPDIRECT3DDEVICE9 pDevice, D3DFORMAT format)
@@ -433,6 +434,7 @@ void ImGui_ImplDX9_InvalidateDeviceObjects()
         }
     if (bd->pVB) { bd->pVB->Release(); bd->pVB = nullptr; }
     if (bd->pIB) { bd->pIB->Release(); bd->pIB = nullptr; }
+    if (bd->pStateBlock) { bd->pStateBlock->Release(); bd->pStateBlock = nullptr; }
 }
 
 void ImGui_ImplDX9_NewFrame()

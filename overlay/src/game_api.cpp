@@ -566,7 +566,14 @@ void init() {
     g_cs_ready = true;
   }
   ensure_log_path();
-  DeleteFileA(g_log_path);
+  // 保留上一次会话的日志：崩溃现场往往就在上一份里，直接删掉等于把证据扔了。
+  // 只留一份轮转文件，避免无限增长。
+  {
+    char prev[MAX_PATH + 16] = {};
+    std::snprintf(prev, sizeof(prev), "%s.prev", g_log_path);
+    DeleteFileA(prev);
+    MoveFileA(g_log_path, prev);
+  }
   log("DLL attached, log=%s", g_log_path);
   install_crash_filter();
   const GameModule game = detect_game_module();
@@ -625,7 +632,8 @@ void log(const char* fmt, ...) {
   va_start(ap, fmt);
   std::vsnprintf(line, sizeof(line), fmt, ap);
   va_end(ap);
-  set_status(line);
+  // 不再把每条诊断日志同步到界面状态栏：camera/time/misc 的 diag 很长，
+  // 用 TextWrapped 显示时会把主窗口撑高、造成整页跳动。需要给人看的短提示走 set_status。
   if (g_cs_ready) EnterCriticalSection(&g_log_cs);
   FILE* f = std::fopen(g_log_path, "a");
   if (f) {
@@ -697,7 +705,11 @@ const char* exception_name(DWORD code) {
 void crash_file_write(const char* text) {
   if (!text || !text[0]) return;
   ensure_log_path();
-  HANDLE h = CreateFileA(g_log_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+  // 崩溃记录单独一个文件，且**从不删除**：主日志每次注入都会轮转，
+  // 崩在现场的那份记录必须留下来。
+  char crash_path[MAX_PATH + 16] = {};
+  std::snprintf(crash_path, sizeof(crash_path), "%s.crash", g_log_path);
+  HANDLE h = CreateFileA(crash_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                          OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (h == INVALID_HANDLE_VALUE) return;
   DWORD wrote = 0;
@@ -725,7 +737,7 @@ void log_exception(void* ep_void, const char* where) {
   if (InterlockedIncrement(&g_crash_reports) > 6) return;
   SYSTEMTIME st{};
   GetLocalTime(&st);
-  char block[4096];
+  char block[8192];
   size_t used = 0;
   auto add = [&](const char* line) {
     if (!line || used + 2 >= sizeof(block)) return;
@@ -765,6 +777,19 @@ void log_exception(void* ep_void, const char* where) {
   }
   add(line);
 
+  // 寄存器：崩溃发生在释放路径时，ecx/edx/esi/edi 往往就是被释放/被踩坏的那个指针，
+  // 比栈回溯更直接。指向模块的按 "模块+RVA" 打印，否则打原始值。
+  char rax[160], rbx[160], rcx[160], rdx[160], rsi[160], rdi[160];
+  format_code_addr(static_cast<uint32_t>(ctx->Eax), rax, sizeof(rax));
+  format_code_addr(static_cast<uint32_t>(ctx->Ebx), rbx, sizeof(rbx));
+  format_code_addr(static_cast<uint32_t>(ctx->Ecx), rcx, sizeof(rcx));
+  format_code_addr(static_cast<uint32_t>(ctx->Edx), rdx, sizeof(rdx));
+  format_code_addr(static_cast<uint32_t>(ctx->Esi), rsi, sizeof(rsi));
+  format_code_addr(static_cast<uint32_t>(ctx->Edi), rdi, sizeof(rdi));
+  std::snprintf(line, sizeof(line), "  eax=%s ebx=%s ecx=%s edx=%s esi=%s edi=%s", rax, rbx, rcx,
+                rdx, rsi, rdi);
+  add(line);
+
   int frame = 0;
   uint32_t ebp = ctx->Ebp;
   uint32_t eip = ctx->Eip;
@@ -781,7 +806,7 @@ void log_exception(void* ep_void, const char* where) {
   }
 
   int slots = 0;
-  for (int i = 0; i < 48 && slots < 12; ++i) {
+  for (int i = 0; i < 96 && slots < 24; ++i) {
     uint32_t word = 0;
     if (!crash_read_u32(ctx->Esp + static_cast<uint32_t>(i) * 4u, &word)) break;
     HMODULE mod = nullptr;
@@ -798,6 +823,9 @@ void log_exception(void* ep_void, const char* where) {
     ++slots;
   }
   crash_file_write(block);
+  // 主日志里留一行，方便按时间线对照（完整回溯在 .crash 文件里）。
+  log("CRASH captured (%s) eip=%08X -> ra3_overlay.log.crash", where ? where : "unknown",
+      ctx->Eip);
 }
 
 bool ready() { return g_flags != nullptr && g_mc != nullptr; }
@@ -986,21 +1014,32 @@ bool inject(bool spectate_mode) {
     g_hooked = false;
   }
 
+  // Allocate per segment so a partial failure can be retried: keeping the
+  // segments that did succeed and only asking for the missing ones. Failing
+  // to do this left g_mc non-null with the others null, and the next inject()
+  // would skip allocation entirely and memset through a null pointer.
   if (!g_mc) {
     g_mc = static_cast<uint8_t*>(
         VirtualAlloc(nullptr, kMcSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+  }
+  if (!g_mc2) {
     g_mc2 = static_cast<uint8_t*>(
         VirtualAlloc(nullptr, kMc2Size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+  }
+  if (!g_flags) {
     g_flags = static_cast<uint8_t*>(
         VirtualAlloc(nullptr, kFlagsSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+  }
+  if (!g_idb) {
     g_idb = static_cast<uint8_t*>(
         VirtualAlloc(nullptr, kIdbSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!g_mc || !g_mc2 || !g_flags || !g_idb) {
-      log("VirtualAlloc failed for MustCode segments");
-      return false;
-    }
-    log("alloc MC=%p MC2=%p FLAGS=%p IDB=%p", g_mc, g_mc2, g_flags, g_idb);
   }
+  if (!g_mc || !g_mc2 || !g_flags || !g_idb) {
+    log("VirtualAlloc failed for MustCode segments (MC=%p MC2=%p FLAGS=%p IDB=%p)",
+        g_mc, g_mc2, g_flags, g_idb);
+    return false;
+  }
+  log("alloc MC=%p MC2=%p FLAGS=%p IDB=%p", g_mc, g_mc2, g_flags, g_idb);
 
   // Do NOT write the broken relocatable embedded blob. arm_mustcode fills
   // these pages when arm_hooks() runs.
@@ -1024,6 +1063,21 @@ bool inject(bool spectate_mode) {
   return true;
 }
 
+// True when the site holds an E9 jump landing inside this session's MC block.
+// Python only patches sites whose AOB matched, so this is the authoritative
+// post-condition for "hook actually armed" -- restore_hooks must not treat a
+// skipped site as patched, or it would write the def's AOB over live code.
+bool hook_points_into_mc(const OverlayHookDef& def) {
+  if (!g_mc) return false;
+  const auto* site = reinterpret_cast<const uint8_t*>(va_of(def.hook_va));
+  if (site[0] != 0xE9) return false;
+  int32_t rel = 0;
+  std::memcpy(&rel, site + 1, sizeof(rel));
+  const uintptr_t dest = reinterpret_cast<uintptr_t>(site) + 5 + rel;
+  const uintptr_t base = reinterpret_cast<uintptr_t>(g_mc);
+  return dest >= base && dest < base + kMcSize;
+}
+
 bool arm_hooks() {
   std::lock_guard<std::mutex> lock(g_api_mu);
   if (!g_mc || !g_flags) {
@@ -1041,12 +1095,21 @@ bool arm_hooks() {
     return false;
   }
 
-  // Track installed hooks for detach/restore (same set Python patched).
+  // Rebuild the installed set from the bytes actually present, not from the
+  // definition table: Python skips sites whose AOB does not match, so assuming
+  // "all defs are patched" makes detach()/restore_hooks() write the recorded
+  // AOB over code that was never touched.
   g_installed.clear();
+  int skipped = 0;
   for (int i = 0; i < g_hook_def_count; ++i) {
     const auto& def = g_hook_defs[i];
     if (g_spectate_mode &&
         name_in_list(def.name, kPlayerHookNames, kPlayerHookNameCount)) {
+      continue;
+    }
+    if (!hook_points_into_mc(def)) {
+      ++skipped;
+      log("hook %s not armed (site bytes differ), skipped", def.name);
       continue;
     }
     InstalledHook ih{};
@@ -1056,8 +1119,12 @@ bool arm_hooks() {
     std::memcpy(ih.aob, def.aob, def.aob_len);
     g_installed.push_back(ih);
   }
+  if (g_installed.empty()) {
+    log("arm_hooks: no hook verified after arming");
+    return false;
+  }
   g_hooked = true;
-  log("hooks armed count=%d", (int)g_installed.size());
+  log("hooks armed count=%d skipped=%d", (int)g_installed.size(), skipped);
   return true;
 }
 
@@ -1457,9 +1524,9 @@ static const HotkeySlot kDefaultHotkeys[] = {
     {"speed_slow", "speed_slow", 0xBB, false, false, false},
     {"speed_freeze", "speed_freeze", VK_PRIOR, false, false, false},
     {"speed_restore", "speed_restore", VK_NEXT, false, false, false},
-    {"hp_max", "hp_max", 0xDB, false, false, false},
     {"hp_min", "hp_min", 0xDD, false, false, false},
     {"hp_normal", "hp_normal", 0xDC, false, false, false},
+    {"invincible", "invincible", 0xDB, false, false, false},  // `[` 无敌（开 / 关）
     {"unit_rank", "unit_rank", 'P', false, false, false},
     {"unit_kill", "unit_kill", VK_DELETE, false, false, false},
     {"unit_clone", "unit_clone", 'I', false, false, false},
@@ -1471,7 +1538,7 @@ static const HotkeySlot kDefaultHotkeys[] = {
     {"cam_save", "cam_save", 'S', true, false, false},
     // 时间控制（对应 CameraBridge 的时间暂停插件，可自行改键）
     {"time_toggle", "time_toggle", 'T', true, false, false},
-    {"time_pause", "time_pause", 'W', true, true, false},
+    {"time_fast", "time_fast", 'W', true, true, false},
     {"time_restore", "time_restore", 'Q', true, true, false},
     // 动画 / Lua（对应 CameraBridge 的动画跟踪与 Lua 桥，可自行改键）
     {"lua_probe", "lua_probe", 'L', true, false, false},
@@ -1644,9 +1711,10 @@ static const FeatureInfo kFeatures[] = {
     {"speed_slow", u8"慢速 ×10", "engine", 0},
     {"speed_freeze", u8"冻结", "engine", 0},
     {"speed_restore", u8"恢复速度", "engine", 0},
-    {"hp_max", u8"无敌", "engine", 0},
     {"hp_min", u8"残血(1点)", "engine", 0},
     {"hp_normal", u8"恢复血量", "engine", 0},
+    {"invincible", u8"无敌", "engine", 0},
+    {"airdrop", u8"空投箱子", "engine", 0},
     {"unit_rank", u8"满级(3星)", "engine", 0},
     {"unit_kill", u8"摧毁选中", "engine", 0},
     {"unit_clone", u8"复制选中", "engine", 0},
@@ -1664,12 +1732,13 @@ static const FeatureInfo kFeatures[] = {
     {"cam_stop", u8"停止摄像机动画", "engine", 0},
     {"cam_mark", u8"记录摄像机节点", "engine", 0},
     {"cam_save", u8"保存摄像机轨道", "engine", 0},
-    {"time_toggle", u8"时间控制 开/关", "engine", 0},
-    {"time_pause", u8"暂停游戏时间", "engine", 0},
-    {"time_slow", u8"慢放 0.5x", "engine", 0},
+    {"time_toggle", u8"时间加速 开/关", "engine", 0},
     {"time_1x", u8"常速 1.0x", "engine", 0},
-    {"time_fast", u8"快放 2.0x", "engine", 0},
-    {"time_fast3", u8"快放 3.0x", "engine", 0},
+    {"time_fast", u8"加速 2.0x", "engine", 0},
+    {"time_fast3", u8"加速 3.0x", "engine", 0},
+    {"time_fast4", u8"加速 4.0x", "engine", 0},
+    {"time_fast6", u8"加速 6.0x", "engine", 0},
+    {"time_fast8", u8"加速 8.0x", "engine", 0},
     {"time_restore", u8"恢复游戏时间", "engine", 0},
     {"lua_probe", u8"读取动画 Lua 变量", "engine", 0},
     {"lua_dump_state", u8"输出 Lua 状态", "engine", 0},
@@ -1678,24 +1747,33 @@ static const FeatureInfo kFeatures[] = {
 static const char* kGroupRes[] = {"money_sel", "money", "power", "scpoint", "haveallsc", "fastbuild", "oremine"};
 static const char* kGroupSw[] = {"superpower", "disableallsp", "map", "nocbuild",
                                  "protocol_ready", "unit_skill_ready", "disable_protocol"};
-static const char* kGroupAmmo[] = {"ammo", "danger"};
+// 弹药无限 / 危险等级不再单独占一个左侧分组，直接并进「单位操作」页。
 static const char* kGroupUnit[] = {
-    "speed_max", "speed_slow", "speed_freeze", "speed_restore", "hp_max", "hp_min", "hp_normal",
-    "unit_rank", "unit_kill", "unit_clone", "convert_unit", "spawn_unit", "clone_multi",
-                                    "damage_mult", "full_buff", "spawn_rank", "spawn_mcv", "summon_troops"};
+    "danger", "ammo", "speed_max", "speed_slow", "speed_freeze", "speed_restore", "invincible",
+    "airdrop", "hp_min", "hp_normal", "unit_rank", "unit_kill", "unit_clone", "convert_unit",
+    "spawn_unit", "clone_multi", "damage_mult", "full_buff", "spawn_rank", "spawn_mcv",
+    "summon_troops"};
 
-static const char* kGroupTime[] = {"time_toggle", "time_pause", "time_slow", "time_1x",
-                                   "time_fast", "time_fast3", "time_restore"};
+static const char* kGroupTime[] = {"time_toggle", "time_1x", "time_fast", "time_fast3",
+                                   "time_fast4", "time_fast6", "time_fast8", "time_restore"};
+// 时间类快捷键现在并入「时间控制」面板页，不再单独占一个左侧分组。
+// 但按键绑定还是要靠这些 key，所以把这组 key 暴露给 UI。
+const char* const* time_feature_keys(int* count) {
+  if (count) *count = (int)(sizeof(kGroupTime) / sizeof(kGroupTime[0]));
+  return kGroupTime;
+}
 
 static const char* kGroupLua[] = {"lua_probe", "lua_dump_state"};
+// 动画 / Lua 的快捷键也并入「动画 / Lua」面板页，不再单独占一个左侧分组。
+const char* const* lua_feature_keys(int* count) {
+  if (count) *count = (int)(sizeof(kGroupLua) / sizeof(kGroupLua[0]));
+  return kGroupLua;
+}
 
 static const GroupInfo kGroups[] = {
     {u8"资源", kGroupRes, 7, u8"己方默认 +10万；玩家资金从列表选择阵营后加减（默认 1万）"},
     {u8"超武 / 地图", kGroupSw, 7, nullptr},
-    {u8"弹药 / 危险", kGroupAmmo, 2, nullptr},
-    {u8"单位操作", kGroupUnit, 18, u8"需先在游戏里选中单位"},
-    {u8"时间控制", kGroupTime, 7, u8"控制整局游戏速度（0 = 暂停），左边「时间控制」有滑块面板"},
-    {u8"动画 / Lua", kGroupLua, 2, u8"对应 CameraBridge 的动画跟踪与 Lua 桥，细节在左边「动画 / Lua」面板"},
+    {u8"单位操作", kGroupUnit, 21, u8"需先在游戏里选中单位"},
 };
 
 const FeatureInfo* features(int* count) {
