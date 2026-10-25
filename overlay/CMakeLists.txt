@@ -21,6 +21,10 @@ add_library(ra3_overlay SHARED
   src/dllmain.cpp
   src/d3d9_hook.cpp
   src/input.cpp
+  src/skin.cpp
+  src/skin_gallery.cpp
+  src/paint.cpp
+  src/shell.cpp
   src/ui.cpp
   src/unit_icons.cpp
   src/game_api.cpp
@@ -36,6 +40,7 @@ add_library(ra3_overlay SHARED
   ${IMGUI_DIR}/backends/imgui_impl_dx9.cpp
   ${IMGUI_DIR}/backends/imgui_impl_win32.cpp
   ${IMGUI_PLOT_DIR}/src/imgui_plot.cpp
+  src/stats_minimal.cpp
   ${MINHOOK_DIR}/src/buffer.c
   ${MINHOOK_DIR}/src/hook.c
   ${MINHOOK_DIR}/src/trampoline.c
@@ -81,4 +86,45 @@ set_target_properties(ra3_overlay PROPERTIES
   ARCHIVE_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}/bin
   ARCHIVE_OUTPUT_DIRECTORY_DEBUG ${CMAKE_CURRENT_SOURCE_DIR}/bin
   PREFIX ""
+)
+
+# ---------------------------------------------------------------------------
+# 皮肤离线预览工具（开发期用）。
+# 独立 Win32 + D3D9 窗口，只链接 skin / paint 层，不依赖游戏与 game_api，
+# 用来在没有 RA3 对局的情况下核对配色与控件观感。产物放进 bin\preview。
+# ---------------------------------------------------------------------------
+add_executable(ra3_skin_preview WIN32
+  tools/skin_preview/skin_preview.cpp
+  src/skin.cpp
+  src/skin_gallery.cpp
+  src/paint.cpp
+  src/shell.cpp
+  src/stats_minimal.cpp
+  ${IMGUI_DIR}/imgui.cpp
+  ${IMGUI_DIR}/imgui_draw.cpp
+  ${IMGUI_DIR}/imgui_tables.cpp
+  ${IMGUI_DIR}/imgui_widgets.cpp
+  ${IMGUI_DIR}/backends/imgui_impl_dx9.cpp
+  ${IMGUI_DIR}/backends/imgui_impl_win32.cpp
+)
+
+target_include_directories(ra3_skin_preview PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${IMGUI_DIR}
+  ${IMGUI_DIR}/backends
+)
+
+target_compile_definitions(ra3_skin_preview PRIVATE
+  WIN32_LEAN_AND_MEAN
+  NOMINMAX
+  _CRT_SECURE_NO_WARNINGS
+)
+
+target_compile_options(ra3_skin_preview PRIVATE /utf-8)
+target_link_libraries(ra3_skin_preview PRIVATE d3d9 user32 gdi32 dwmapi imm32)
+
+set_target_properties(ra3_skin_preview PROPERTIES
+  OUTPUT_NAME "ra3_skin_preview"
+  RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}/bin/preview
+  RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_CURRENT_SOURCE_DIR}/bin/preview
 )

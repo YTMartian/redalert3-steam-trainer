@@ -29,6 +29,8 @@ dist/
 __pycache__/
 *.pyc
 _build.txt
+# 开发期截图（tools/capture_preview.ps1 的输出，只用于本地核对配色）
+overlay/tools/_shots/
 
 # ---------------------------------------------------------------
 #  运行期输出（每次跑脚本都会重新生成）

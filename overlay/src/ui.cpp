@@ -1,6 +1,11 @@
 #include "ui.h"
 #include "input.h"
 #include "game_api.h"
+#include "paint.h"
+#include "shell.h"
+#include "skin.h"
+#include "skin_gallery.h"
+#include "stats_minimal.h"
 #include "unit_icons.h"
 
 #include <Windows.h>
@@ -14,11 +19,14 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <fstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ui {
@@ -36,6 +44,7 @@ bool g_show_misc = false;
 bool g_stats_open = false;
 bool g_stats_pinned = false;
 bool g_stats_compact = false;
+bool g_stats_minimal = false;
 std::string g_last_msg =
     u8"先启动游戏并进局，再运行修改器。菜单内点「注入」。Home 显隐主菜单。";
 bool g_spectate_inject = false;
@@ -43,9 +52,45 @@ float g_sync_timer = 0.f;
 volatile LONG g_injecting = 0;
 volatile LONG g_engine_busy = 0;
 
+// ---- 悬浮提示的统一入口 ----
+// 提示框的底色 / 文字 / 描边必须成对换（见 skin::TipBg）：只换底色不换字色，
+// 或者反过来，都会出现"浅字压浅框"。所有 tooltip 一律走下面三个函数。
+void TipBegin() {
+  skin::PushTipStyle();
+  ImGui::BeginTooltip();
+}
+void TipEnd() {
+  ImGui::EndTooltip();
+  skin::PopTipStyle();
+}
+void Tip(const char* fmt, ...) {
+  if (!fmt || !fmt[0]) return;
+  char buf[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  std::vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  skin::PushTipStyle();
+  ImGui::SetTooltip("%s", buf);
+  skin::PopTipStyle();
+}
+
 // UI appearance (persisted). Defaults match the previous large layout.
-float g_ui_scale = 1.00f;     // 0.70 ~ 1.30
-float g_ui_opacity = 0.80f;   // 0.35 ~ 1.00
+constexpr float kUiScaleMin = 0.70f;
+constexpr float kUiScaleMax = 3.00f;  // 上限给"高分辨率下想放大看"留余量
+constexpr float kUiOpacityDefault = 0.66f;
+// 战况统计里的兵种 / 建筑图标倍率：默认 1.5 倍（原尺寸偏小，图标里的兵看不清）。
+constexpr float kStatsIconScaleMin = 0.75f;
+constexpr float kStatsIconScaleMax = 2.50f;
+constexpr float kStatsIconScaleDefault = 1.50f;
+
+float g_stats_icon_scale = kStatsIconScaleDefault;
+
+float g_ui_scale = 1.00f;                        // kUiScaleMin ~ kUiScaleMax
+float g_ui_opacity = kUiOpacityDefault;          // 0.35 ~ 1.00
+// 主窗口整窗淡入淡出（0 = 完全不画，1 = 正常）。放在这里是因为 draw() 开头的
+// 提前返回要先看它：菜单刚隐藏的那一帧还得继续画，否则淡出会被掐掉。
+static float s_menu_fade = 0.f;
 // ScaleAllSizes / FontGlobalScale do not affect hardcoded Image sizes.
 static float ui_px(float v) {
   const float s = (g_ui_scale > 0.01f) ? g_ui_scale : 1.f;
@@ -57,6 +102,120 @@ char g_ui_settings_path[MAX_PATH] = {};
 bool g_settings_dirty = false;
 float g_settings_save_timer = 0.f;
 
+// ---------------------------------------------------------------------------
+// P1 语义取色层。
+// 界面代码里不再出现任何字面色值：需要颜色时从这里取，最终都落到皮肤槽位。
+// 这样换皮肤只改 skin.cpp 一张表，ui.cpp 一行都不用动。
+// ---------------------------------------------------------------------------
+inline const skin::Skin& SK() { return skin::Active(); }
+inline ImVec4 CV(ImU32 c) { return skin::Vec4(c); }
+inline ImVec4 CVA(ImU32 c, float mul) { return skin::Vec4A(c, mul); }
+
+// 实心底：把（通常半透明的）卡片色叠在窗底上，得到比窗口高一档的面。
+// 具体合成规则在 skin.cpp，这里只是绑定到"当前皮肤"的薄封装。
+inline ImU32 PanelBg() { return skin::PanelBg(SK()); }
+inline ImU32 PanelBgAlt() { return skin::PanelBgAlt(SK()); }
+// 凹槽 / 输入框 / 滑条轨道底。
+inline ImU32 FieldBg() { return skin::FieldBg(SK()); }
+// 角标、快捷键小块的底：比面再压暗一层。
+inline ImU32 ChipBg() { return skin::ChipBg(SK()); }
+
+// 标题层级
+inline ImU32 HeadingCol() { return SK().accent2; }
+inline ImU32 SubHeadCol() { return SK().text2; }
+
+// 描边
+inline ImU32 EdgeIdle() { return skin::EdgeIdle(SK()); }
+inline ImU32 EdgeHot() { return skin::EdgeHot(SK()); }
+
+// 形状语言：圆角矩形 or 切角。所有自绘控件都走这两个取值，不写字面圆角。
+inline paint::BoxShape ShapeOf(const skin::Skin& s) { return s.shape; }
+inline float ChamferOf(const skin::Skin& s) { return ui_px(s.chamfer); }
+inline float CardR(const skin::Skin& s) { return ui_px(s.cardRadius); }
+
+// 悬停 / 按下的过渡量。
+//
+// ImGui 没有给自绘控件留动画状态，这里用控件 ID 存一个 0..1 的时间量：
+// 悬停时控件是"渐亮"而不是"硬跳"，切换皮肤时也是同一条错觉链的一部分。
+// 键是 ImGuiID（含窗口与 ID 栈），不会串到别的控件上。
+float AnimTo(ImGuiID id, bool target, float speed = 14.f);
+
+// 一块控件底板。皮肤的形状、描边宽度、投影强度都从这里进，
+// 别处只管给颜色，不碰几何。
+struct PlateSpec {
+  ImU32 top = 0;
+  ImU32 bot = 0;
+  ImU32 edge = 0;
+  ImU32 inner = 0;
+  ImU32 shadow = 0;
+  float dy = 2.f;
+  float sigma = 3.f;
+  float sk = 1.f;
+  float th = 1.f;
+};
+
+inline void DrawPlate(ImDrawList* dl, const ImVec2& a, const ImVec2& b, float r,
+                      const PlateSpec& sp) {
+  const skin::Skin& s = SK();
+  paint::Plate pl;
+  pl.top = sp.top;
+  pl.bot = sp.bot;
+  pl.edge = sp.edge;
+  pl.inner = sp.inner;
+  pl.shadow = sp.shadow;
+  pl.dy = sp.dy;
+  pl.sigma = sp.sigma;
+  pl.sk = sp.sk * s.shadowK;
+  pl.th = sp.th * s.strokeW;
+  paint::Panel(dl, a, b, r, ShapeOf(s), ChamferOf(s), pl);
+}
+
+// 小角标 / 小色块：不做投影（一屏几十个，投影会白烧 4 层多边形），
+// 只填 + 描边，但形状仍然跟皮肤走。
+inline void DrawChip(ImDrawList* dl, const ImVec2& a, const ImVec2& b, float r, ImU32 top,
+                     ImU32 bot, ImU32 edge, float th = 1.f) {
+  PlateSpec sp;
+  sp.top = top;
+  sp.bot = bot;
+  sp.edge = edge;
+  sp.th = th;
+  DrawPlate(dl, a, b, r, sp);
+}
+
+// 过渡量实现。用帧号做惰性清理：一个控件不再出现后，几百帧后自动淘汰，
+// 不会随开关 UI 页反复累积。
+struct AnimEntry {
+  float v = 0.f;
+  int frame = 0;
+};
+
+float AnimTo(ImGuiID id, bool target, float speed) {
+  static std::unordered_map<ImGuiID, AnimEntry> tbl;
+  static int frame = 0;
+  static int last_gc = 0;
+  ++frame;
+  if (frame - last_gc > 600) {
+    last_gc = frame;
+    for (auto it = tbl.begin(); it != tbl.end();) {
+      if (frame - it->second.frame > 600) {
+        it = tbl.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  AnimEntry& e = tbl[id];
+  e.frame = frame;
+  const float dest = target ? 1.f : 0.f;
+  const float dt = ImGui::GetIO().DeltaTime;
+  const float k = 1.f - std::exp(-speed * (dt > 0.f ? dt : 0.016f));
+  e.v += (dest - e.v) * k;
+  if (e.v < 0.002f) e.v = 0.f;
+  if (e.v > 0.998f) e.v = 1.f;
+  return e.v;
+}
+
+// ---------------------------------------------------------------------------
 // 杂项 / 真无敌 / 空投的持久化设置（写进 overlay_ui.ini）。
 static int g_misc_shadow_size = 0;     // 0 = 没设置过
 static float g_misc_shadow_dist = 0.f; // 0 = 没设置过
@@ -149,6 +308,28 @@ bool start_engine_async(const char* key) {
   return true;
 }
 
+// 这个目录能不能落盘。DLL 被放在 Program Files 之类的只读目录时，
+// ofstream 会静默失败，表现就是"切了皮肤/改了透明度，重启又变回去"。
+static bool path_writable(const wchar_t* file) {
+  if (GetFileAttributesW(file) != INVALID_FILE_ATTRIBUTES) {
+    return _waccess(file, 2) == 0;  // 2 = W_OK
+  }
+  // 文件还不存在：在目录里建一个 DELETE_ON_CLOSE 的探针文件试一下，
+  // 不留垃圾，也不会在用户没改设置时凭空造出一个空 ini。
+  wchar_t dir[MAX_PATH] = {};
+  wcsncpy_s(dir, file, _TRUNCATE);
+  wchar_t* slash = wcsrchr(dir, L'\\');
+  if (!slash) return false;
+  *slash = 0;
+  wchar_t probe[MAX_PATH] = {};
+  _snwprintf_s(probe, _TRUNCATE, L"%s\\.ra3_ui_probe", dir);
+  HANDLE h = CreateFileW(probe, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                         FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  CloseHandle(h);
+  return true;
+}
+
 bool resolve_ui_settings_path(char* out, size_t out_len) {
   if (!out || out_len < 8) return false;
   HMODULE self = nullptr;
@@ -187,6 +368,25 @@ bool resolve_ui_settings_path(char* out, size_t out_len) {
         CopyFileW(legacy, beside, TRUE);
     }
   }
+  // 紧挨 DLL 写不进去（只读安装目录）时退到 %LOCALAPPDATA%\RA3Overlay。
+  // 两者都存在时优先读 DLL 旁边，保持"绿色版"习惯。
+  if (!path_writable(beside)) {
+    wchar_t base[MAX_PATH] = {};
+    const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+      wchar_t dir[MAX_PATH] = {};
+      _snwprintf_s(dir, _TRUNCATE, L"%s\\RA3Overlay", base);
+      CreateDirectoryW(dir, nullptr);
+      wchar_t alt[MAX_PATH] = {};
+      _snwprintf_s(alt, _TRUNCATE, L"%s\\overlay_ui.ini", dir);
+      // 首次回退时把旧位置的文件带过去，用户感知不到换了地方。
+      if (GetFileAttributesW(alt) == INVALID_FILE_ATTRIBUTES &&
+          GetFileAttributesW(beside) != INVALID_FILE_ATTRIBUTES) {
+        CopyFileW(beside, alt, FALSE);
+      }
+      wcsncpy_s(beside, alt, _TRUNCATE);
+    }
+  }
   return WideCharToMultiByte(CP_UTF8, 0, beside, -1, out, (int)out_len, nullptr,
                              nullptr) > 0;
 }
@@ -197,12 +397,25 @@ float clampf(float v, float lo, float hi) {
   return v;
 }
 
+// g_ui_settings_path 是 UTF-8（WideCharToMultiByte(CP_UTF8) 出来的）。Windows 上
+// std::fstream 的窄字符构造函数按 ANSI 代码页解析路径，装在中文目录（或用户
+// 目录带中文）里会直接打开失败——设置就永远写不进去。统一转宽字符再开。
+static std::wstring utf8_to_wide(const char* s) {
+  if (!s || !*s) return std::wstring();
+  const int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+  if (n <= 0) return std::wstring();
+  std::wstring w(static_cast<size_t>(n), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, s, -1, &w[0], n);
+  w.resize(static_cast<size_t>(n - 1));  // 去掉结尾的 '\0'
+  return w;
+}
+
 void load_ui_settings() {
   if (!g_ui_settings_path[0]) {
     resolve_ui_settings_path(g_ui_settings_path, sizeof(g_ui_settings_path));
   }
   if (!g_ui_settings_path[0]) return;
-  std::ifstream f(g_ui_settings_path);
+  std::ifstream f(utf8_to_wide(g_ui_settings_path).c_str());
   if (!f) return;
   std::string line;
   while (std::getline(f, line)) {
@@ -214,9 +427,15 @@ void load_ui_settings() {
     const std::string key = line.substr(0, eq);
     const std::string val = line.substr(eq + 1);
     if (key == "scale") {
-      g_ui_scale = clampf((float)std::atof(val.c_str()), 0.70f, 1.30f);
+      g_ui_scale = clampf((float)std::atof(val.c_str()), kUiScaleMin, kUiScaleMax);
     } else if (key == "opacity") {
       g_ui_opacity = clampf((float)std::atof(val.c_str()), 0.35f, 1.00f);
+    } else if (key == "stats_icon_scale") {
+      g_stats_icon_scale = clampf((float)std::atof(val.c_str()), kStatsIconScaleMin,
+                                  kStatsIconScaleMax);
+    } else if (key == "theme") {
+      const int idx = skin::IndexOfKey(val.c_str());
+      if (idx >= 0) skin::SetCurrent(idx);
     } else if (key == "unit_inspect_open") {
       g_unit_inspect_open = (val == "1" || val == "true" || val == "yes");
     } else if (key == "stats_pinned") {
@@ -224,6 +443,10 @@ void load_ui_settings() {
       g_stats_pinned = false;
     } else if (key == "stats_compact") {
       g_stats_compact = (val == "1" || val == "true" || val == "yes");
+    } else if (key == "stats_minimal") {
+      g_stats_minimal = (val == "1" || val == "true" || val == "yes");
+      // 两档互斥：老配置文件里两个都为 1 时，以极简为准。
+      if (g_stats_minimal) g_stats_compact = false;
     } else if (key == "money_self_step") {
       game_api::set_money_self_step((int)std::atoi(val.c_str()));
     } else if (key == "money_sel_step") {
@@ -261,6 +484,8 @@ void load_ui_settings() {
       game_api::apply_hotkey_text(key.c_str() + 3, val.c_str());
     }
   }
+  // 皮肤可能比保存时的更亮，恢复时把透明度抬到该皮肤的可读下限。
+  g_ui_opacity = clampf(g_ui_opacity, skin::MinOpacity(skin::Current()), 1.00f);
 }
 
 void save_ui_settings() {
@@ -268,14 +493,23 @@ void save_ui_settings() {
     resolve_ui_settings_path(g_ui_settings_path, sizeof(g_ui_settings_path));
   }
   if (!g_ui_settings_path[0]) return;
-  std::ofstream f(g_ui_settings_path, std::ios::trunc);
+  // 先写 .tmp 再原子替换。切完主题立刻退游戏、或进程被强行结束时，
+  // 直接 trunc 原文件容易留下半截 ini（读回来 theme= 只剩半行）。
+  char tmp_path[MAX_PATH] = {};
+  _snprintf_s(tmp_path, _TRUNCATE, "%s.tmp", g_ui_settings_path);
+  const std::wstring wtmp = utf8_to_wide(tmp_path);
+  const std::wstring wdst = utf8_to_wide(g_ui_settings_path);
+  std::ofstream f(wtmp.c_str(), std::ios::trunc);
   if (!f) return;
   f << "# RA3 Overlay UI settings\n";
   f << "scale=" << g_ui_scale << "\n";
   f << "opacity=" << g_ui_opacity << "\n";
+  f << "stats_icon_scale=" << g_stats_icon_scale << "\n";
+  f << "theme=" << skin::KeyAt(skin::Current()) << "\n";
   f << "unit_inspect_open=" << (g_unit_inspect_open ? 1 : 0) << "\n";
   f << "stats_pinned=" << (g_stats_pinned ? 1 : 0) << "\n";
   f << "stats_compact=" << (g_stats_compact ? 1 : 0) << "\n";
+  f << "stats_minimal=" << (g_stats_minimal ? 1 : 0) << "\n";
   f << "money_self_step=" << game_api::money_self_step() << "\n";
   f << "money_sel_step=" << game_api::money_sel_step() << "\n";
   f << "mcv_faction=" << game_api::mcv_faction() << "\n";
@@ -295,89 +529,29 @@ void save_ui_settings() {
     if (!combo[0]) continue;
     f << "hk." << game_api::hotkey_slot_id(i) << "=" << combo << "\n";
   }
+  f.close();
+  if (!MoveFileExW(wtmp.c_str(), wdst.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+    DeleteFileW(wtmp.c_str());
+  }
   g_settings_dirty = false;
   g_settings_save_timer = 0.f;
 }
 
 void apply_ra3_theme() {
-  // ScaleAllSizes also multiplies _MainScale / WindowMinSize / IndentSpacing /
-  // CellPadding / … — fields we used to leave dirty, so each slider tick
-  // compounded and the whole window width drifted. Always restore a clean
-  // scale=1 snapshot, then scale exactly once.
-  static ImGuiStyle s_base;
-  static bool s_base_ready = false;
-  if (!s_base_ready) {
-    s_base = ImGuiStyle();
-    s_base.WindowPadding = ImVec2(12, 12);
-    s_base.FramePadding = ImVec2(10, 6);
-    s_base.ItemSpacing = ImVec2(10, 8);
-    s_base.ItemInnerSpacing = ImVec2(8, 5);
-    s_base.WindowRounding = 8.0f;
-    s_base.ChildRounding = 6.0f;
-    s_base.FrameRounding = 5.0f;
-    s_base.PopupRounding = 5.0f;
-    s_base.ScrollbarRounding = 6.0f;
-    s_base.GrabRounding = 4.0f;
-    s_base.TabRounding = 5.0f;
-    s_base.WindowBorderSize = 1.0f;
-    s_base.FrameBorderSize = 0.0f;
-    s_base.ScrollbarSize = 12.0f;
-    s_base_ready = true;
-  }
-
+  // 颜色与圆角全部来自当前皮肤（skin.cpp 的语义槽位表）。BuildStyle 每次
+  // 都从 ImGuiStyle() 默认值重建，只在末尾缩放一次，所以拖动缩放滑块不会
+  // 在脏 style 上反复累乘、把窗口宽度顶飞。
   ImGuiStyle& s = ImGui::GetStyle();
-  s = s_base;
-
-  ImGui::StyleColorsDark();
-  ImVec4* c = s.Colors;
-  const float a = g_ui_opacity;
-  const ImVec4 bg(0.08f, 0.09f, 0.11f, a);
-  const ImVec4 panel(0.12f, 0.13f, 0.16f, a);
-  const ImVec4 panel2(0.15f, 0.16f, 0.20f, a);
-  const ImVec4 blue(0.26f, 0.59f, 0.98f, 1.0f);
-  const ImVec4 blue_h(0.36f, 0.66f, 1.00f, 1.0f);
-  const ImVec4 blue_a(0.18f, 0.45f, 0.85f, 1.0f);
-  const ImVec4 text(0.92f, 0.93f, 0.95f, 1.0f);
-  const ImVec4 muted(0.55f, 0.58f, 0.64f, 1.0f);
-  const ImVec4 border(0.25f, 0.28f, 0.35f, a);
-
-  c[ImGuiCol_Text] = text;
-  c[ImGuiCol_TextDisabled] = muted;
-  c[ImGuiCol_WindowBg] = bg;
-  c[ImGuiCol_ChildBg] = panel;
-  c[ImGuiCol_PopupBg] = panel2;
-  c[ImGuiCol_Border] = border;
-  c[ImGuiCol_FrameBg] = ImVec4(0.16f, 0.18f, 0.22f, 1.0f);
-  c[ImGuiCol_FrameBgHovered] = ImVec4(0.20f, 0.24f, 0.32f, 1.0f);
-  c[ImGuiCol_FrameBgActive] = ImVec4(0.22f, 0.28f, 0.40f, 1.0f);
-  c[ImGuiCol_TitleBg] = ImVec4(0.10f, 0.12f, 0.16f, 1.0f);
-  c[ImGuiCol_TitleBgActive] = ImVec4(0.16f, 0.28f, 0.48f, 1.0f);
-  c[ImGuiCol_TitleBgCollapsed] = ImVec4(0.10f, 0.12f, 0.16f, 0.8f);
-  c[ImGuiCol_MenuBarBg] = panel;
-  c[ImGuiCol_ScrollbarBg] = ImVec4(0.08f, 0.09f, 0.11f, 1.0f);
-  c[ImGuiCol_ScrollbarGrab] = ImVec4(0.28f, 0.35f, 0.48f, 1.0f);
-  c[ImGuiCol_ScrollbarGrabHovered] = blue;
-  c[ImGuiCol_ScrollbarGrabActive] = blue_h;
-  c[ImGuiCol_CheckMark] = blue_h;
-  c[ImGuiCol_SliderGrab] = blue;
-  c[ImGuiCol_SliderGrabActive] = blue_h;
-  c[ImGuiCol_Button] = ImVec4(0.20f, 0.40f, 0.70f, 1.0f);
-  c[ImGuiCol_ButtonHovered] = blue_h;
-  c[ImGuiCol_ButtonActive] = blue_a;
-  c[ImGuiCol_Header] = ImVec4(0.22f, 0.40f, 0.70f, 0.85f);
-  c[ImGuiCol_HeaderHovered] = blue;
-  c[ImGuiCol_HeaderActive] = blue_h;
-  c[ImGuiCol_Separator] = border;
-  c[ImGuiCol_Tab] = panel2;
-  c[ImGuiCol_TabHovered] = blue;
-  c[ImGuiCol_TabActive] = ImVec4(0.22f, 0.42f, 0.78f, 1.0f);
-  c[ImGuiCol_TabUnfocused] = panel;
-  c[ImGuiCol_TabUnfocusedActive] = ImVec4(0.18f, 0.32f, 0.55f, 1.0f);
+  skin::BuildStyle(s, skin::Active(), g_ui_opacity);
 
   if (g_ui_scale > 0.01f && g_ui_scale != 1.0f) {
     s.ScaleAllSizes(g_ui_scale);
   }
-  ImGui::GetIO().FontGlobalScale = g_ui_scale;
+  // 字体放大：ImGui 1.92+ 的字体是按"最终像素尺寸"动态栅格化的，把倍数交给
+  // FontScaleMain，字形会以 18 * scale 重新生成。3 倍下文字依然锐利。
+  // 旧的 io.FontGlobalScale 是 1.92 之前的遗留通道，只做位图拉伸，放大就糊。
+  s.FontScaleMain = (g_ui_scale > 0.01f) ? g_ui_scale : 1.f;
+  ImGui::GetIO().FontGlobalScale = 1.f;
 }
 
 void mark_settings_dirty() {
@@ -386,43 +560,118 @@ void mark_settings_dirty() {
   apply_ra3_theme();
 }
 
+// 窗口默认 / 最小尺寸：跟着界面缩放走，并夹到当前分辨率内。
+// 3 倍缩放时 900x720 会变成 2700x2160，比屏幕还大，标题栏会被推到画面外、
+// 拖都拖不回来。所以这里把尺寸收到屏幕内（留一圈边距），内容超出时窗口滚动。
+static ImVec2 scaled_window_size(float w, float h) {
+  ImGuiIO& io = ImGui::GetIO();
+  const float margin = ui_px(56.f);
+  float sw = ui_px(w);
+  float sh = ui_px(h);
+  if (io.DisplaySize.x > 1.f) {
+    const float cap = (std::max)(ui_px(360.f), io.DisplaySize.x - margin);
+    if (sw > cap) sw = cap;
+  }
+  if (io.DisplaySize.y > 1.f) {
+    const float cap = (std::max)(ui_px(280.f), io.DisplaySize.y - margin);
+    if (sh > cap) sh = cap;
+  }
+  return ImVec2(sw, sh);
+}
+
+// ---------------------------------------------------------------------------
+// 皮肤选择：卡片绘制在 skin_gallery.cpp 里，和离线预览工具共用同一份代码。
+// 点一下立刻切换（带 0.26 秒过渡），并写回 overlay_ui.ini。
+// ---------------------------------------------------------------------------
+static void draw_theme_gallery() {
+  const int pick = skin::Gallery(skin::Active(), ui_px(1.f));
+  if (pick < 0 || pick == skin::Current()) return;
+  skin::Select(pick);
+  if (g_ui_opacity < skin::MinOpacity(pick)) g_ui_opacity = skin::MinOpacity(pick);
+  mark_settings_dirty();
+  // 主题是"点一下就该记住"的设置：立刻落盘，不等 0.6 秒的批量保存定时器，
+  // 否则切完马上 Esc 关菜单 / 退游戏，这次选择会丢。
+  save_ui_settings();
+  g_last_msg = std::string(u8"皮肤已切换：") + skin::At(pick).name_cn;
+}
+
+// 分区标题：小号大写英文 + 中文标题 + 一条渐隐分割线。
+// 设置页里裸 ImGui 文字和自绘控件混在一起会显脏，这里统一一下。
+static void section_header(const char* caps, const char* cn) {
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  ImFont* font = ImGui::GetFont();
+  ImGui::Dummy(ImVec2(0.f, ui_px(26.f)));
+  const ImVec2 p = ImGui::GetItemRectMin();
+  paint::TextTracked(dl, font, ui_px(10.f), ImVec2(p.x, p.y + ui_px(2.f)),
+                     skin::Fade(SK().text3, 0.95f), caps, ui_px(1.f));
+  paint::Text(dl, font, ui_px(15.f), ImVec2(p.x, p.y + ui_px(15.f)), SK().accent2, cn);
+  const float w = ImGui::GetContentRegionAvail().x;
+  const float y = p.y + ui_px(37.f);
+  dl->AddRectFilledMultiColor(ImVec2(p.x, y), ImVec2(p.x + w, y + 1.f),
+                              skin::Fade(SK().divider, 0.9f), skin::WithA(SK().divider, 0), 0,
+                              skin::Fade(SK().divider, 0.9f));
+  ImGui::SetCursorScreenPos(ImVec2(p.x, y + ui_px(8.f)));
+}
+
 void draw_settings_panel() {
-  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"界面设置");
+  const skin::Skin& sk = skin::Active();
+  ImGui::TextColored(skin::Vec4(sk.accent2), u8"界面设置");
   ImGui::TextDisabled(u8"界面和快捷键自动保存到和 DLL 同一目录的 overlay_ui.ini");
   ImGui::Separator();
   ImGui::Spacing();
 
+  section_header("THEME", u8"皮肤");
+  ImGui::TextDisabled(u8"共 %d 套；点选即时生效（0.26 秒过渡）并自动保存", skin::Count());
+  ImGui::Spacing();
+  draw_theme_gallery();
+  ImGui::Spacing();
+
+  section_header("DISPLAY", u8"显示");
   float scale = g_ui_scale;
   ImGui::TextUnformatted(u8"界面缩放");
   ImGui::SetNextItemWidth(-1.f);
-  if (ImGui::SliderFloat("##ui_scale", &scale, 0.70f, 1.30f, "%.2f")) {
-    g_ui_scale = clampf(scale, 0.70f, 1.30f);
+  if (ImGui::SliderFloat("##ui_scale", &scale, kUiScaleMin, kUiScaleMax, "%.2f")) {
+    g_ui_scale = clampf(scale, kUiScaleMin, kUiScaleMax);
     mark_settings_dirty();
   }
-  ImGui::TextDisabled(u8"同时影响字体与控件尺寸（默认 1.00）");
+  ImGui::TextDisabled(u8"同时影响字体与控件尺寸（默认 1.00，上限 %.1f）", kUiScaleMax);
 
   ImGui::Spacing();
   ImGui::TextUnformatted(u8"透明度");
+  const float op_min = skin::MinOpacity(skin::Current());
   float opacity_pct = g_ui_opacity * 100.f;
   ImGui::SetNextItemWidth(-1.f);
-  if (ImGui::SliderFloat("##ui_opacity", &opacity_pct, 35.f, 100.f, "%.0f%%")) {
-    g_ui_opacity = clampf(opacity_pct / 100.f, 0.35f, 1.00f);
+  if (ImGui::SliderFloat("##ui_opacity", &opacity_pct, op_min * 100.f, 100.f, "%.0f%%")) {
+    g_ui_opacity = clampf(opacity_pct / 100.f, op_min, 1.00f);
     mark_settings_dirty();
   }
-  ImGui::TextDisabled(u8"窗口背景不透明度（默认 80%%）");
+  ImGui::TextDisabled(u8"窗口背景不透明度（默认 %d%%；亮色皮肤下限 %d%%）",
+                      (int)(kUiOpacityDefault * 100.f + 0.5f), (int)(op_min * 100.f + 0.5f));
 
   ImGui::Spacing();
-  ImGui::Separator();
-  ImGui::Spacing();
-  if (ImGui::Button(u8"恢复默认", ImVec2(140, 0))) {
-    g_ui_scale = 1.00f;
-    g_ui_opacity = 0.80f;
-    g_unit_inspect_open = true;
+  ImGui::TextUnformatted(u8"战况统计图标大小");
+  float icon_scale = g_stats_icon_scale;
+  ImGui::SetNextItemWidth(-1.f);
+  if (ImGui::SliderFloat("##stats_icon_scale", &icon_scale, kStatsIconScaleMin,
+                         kStatsIconScaleMax, "%.2fx")) {
+    g_stats_icon_scale = clampf(icon_scale, kStatsIconScaleMin, kStatsIconScaleMax);
     mark_settings_dirty();
-    g_settings_save_timer = 0.05f;
+  }
+  ImGui::TextDisabled(u8"兵种 / 建筑图标的放大倍数（默认 %.2fx）", kStatsIconScaleDefault);
+
+  ImGui::Spacing();
+  section_header("RESET", u8"重置");
+  if (ImGui::Button(u8"恢复默认", ImVec2(ui_px(140.f), 0))) {
+    g_ui_scale = 1.00f;
+    g_ui_opacity = kUiOpacityDefault;
+    g_stats_icon_scale = kStatsIconScaleDefault;
+    g_unit_inspect_open = true;
+    skin::Select(0);
+    mark_settings_dirty();
+    save_ui_settings();
   }
   ImGui::SameLine();
-  if (ImGui::Button(u8"立即保存", ImVec2(140, 0))) {
+  if (ImGui::Button(u8"立即保存", ImVec2(ui_px(140.f), 0))) {
     save_ui_settings();
     g_last_msg = u8"界面设置已保存";
   }
@@ -592,11 +841,10 @@ static int trend_hover_index(int count) {
 static void draw_trend_chart(const char* title, const TrendTrack* tr) {
   const char* names[5] = {u8"建造", u8"损失", u8"消灭", u8"收入", u8"支出"};
   const ImU32 cols[5] = {
-      IM_COL32(130, 214, 156, 255), IM_COL32(232, 122, 112, 255), IM_COL32(242, 186, 96, 255),
-      IM_COL32(176, 132, 255, 255), IM_COL32(156, 186, 214, 255),
+      SK().good, SK().bad, SK().warn, SK().accent2, skin::Fade(SK().text2, 0.95f),
   };
 
-  ImGui::TextColored(ImVec4(0.70f, 0.78f, 0.86f, 1.f), "%s", title);
+  ImGui::TextColored(CV(SubHeadCol()), "%s", title);
   ImGui::SameLine(0.f, 14.f);
   draw_trend_legend(names, cols, 3);
   draw_trend_legend(names + 3, cols + 3, 2);
@@ -653,7 +901,7 @@ static void draw_trend_chart(const char* title, const TrendTrack* tr) {
   const TrendPt& pt = tr->pts[idx];
   int sec = (int)(pt.t + 0.5f);
   if (sec < 0) sec = 0;
-  ImGui::BeginTooltip();
+  TipBegin();
   ImGui::Text("%d:%02d", sec / 60, sec % 60);
   for (int s = 0; s < 3; ++s) {
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(cols[s]), u8"%s  %u", names[s],
@@ -665,19 +913,17 @@ static void draw_trend_chart(const char* title, const TrendTrack* tr) {
     format_uint_grouped(num, sizeof(num), trend_total(pt, s));
     ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(cols[s]), u8"%s  %s", names[s], num);
   }
-  ImGui::EndTooltip();
+  TipEnd();
 }
 
 void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
+  // 玩家色来自游戏数据，保留；未着色时回落到皮肤语义色。
   ImVec4 accent(p.color_r / 255.f, p.color_g / 255.f, p.color_b / 255.f, 1.f);
   if (!p.has_color) {
-    accent = p.is_local ? ImVec4(0.95f, 0.78f, 0.28f, 1.f) : ImVec4(0.55f, 0.62f, 0.72f, 1.f);
+    accent = p.is_local ? CV(SK().money) : CV(SK().text2);
   }
-  const ImVec4 panel = ImVec4(0.08f, 0.10f, 0.14f, 0.92f);
-  const ImVec4 money_col = ImVec4(1.00f, 0.86f, 0.38f, 1.f);
-  const ImVec4 power_ok = ImVec4(0.35f, 0.85f, 0.62f, 1.f);
-  const ImVec4 power_warn = ImVec4(0.95f, 0.55f, 0.28f, 1.f);
-  const ImVec4 power_bad = ImVec4(0.95f, 0.35f, 0.32f, 1.f);
+  const ImVec4 panel = CV(PanelBg());
+  const ImVec4 money_col = CV(SK().money);
 
   ImGui::PushID((int)p.player_id ? (int)p.player_id : index);
   ImGui::PushStyleColor(ImGuiCol_ChildBg, panel);
@@ -698,10 +944,10 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
   const float sw = ImGui::GetTextLineHeight();
   const ImVec2 sw0 = ImGui::GetCursorScreenPos();
   dl->AddRectFilled(sw0, ImVec2(sw0.x + sw, sw0.y + sw), ImGui::GetColorU32(accent), 3.f);
-  dl->AddRect(sw0, ImVec2(sw0.x + sw, sw0.y + sw), IM_COL32(255, 255, 255, 50), 3.f, 0, 1.f);
+  dl->AddRect(sw0, ImVec2(sw0.x + sw, sw0.y + sw), skin::Fade(SK().cardInnerHi, 0.28f), 3.f, 0, 1.f);
   ImGui::Dummy(ImVec2(sw, sw));
   ImGui::SameLine(0.f, 8.f);
-  ImGui::TextColored(ImVec4(0.93f, 0.95f, 0.98f, 1.f), "%s", title);
+  ImGui::TextColored(CV(SK().text), "%s", title);
   if (p.is_local) {
     ImGui::SameLine();
     ImGui::TextDisabled(u8"己方");
@@ -740,16 +986,16 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
     format_uint_grouped(total_s, sizeof(total_s), p.power_total);
     std::snprintf(ratio_s, sizeof(ratio_s), "%s / %s", used_s, total_s);
 
-    float frac = 0.f;
-    if (p.power_total > 0) {
-      frac = (float)p.power_used / (float)p.power_total;
-      if (frac > 1.f) frac = 1.f;
-    }
-    ImVec4 bar = power_ok;
-    if (frac >= 0.95f) bar = power_bad;
-    else if (frac >= 0.75f) bar = power_warn;
+    // 使用 > 总量（含 0 产能但有消耗）一律红；数值和进度条同一个判定。
+    const skin::PowerLevel lv = skin::PowerLevelOf(p.power_used, p.power_total);
+    float frac = (p.power_total > 0) ? (float)p.power_used / (float)p.power_total : 1.f;
+    if (frac > 1.f) frac = 1.f;
+    const ImVec4 bar = CV(skin::PowerColor(SK(), lv));
+    const ImVec4 ratio_col = (lv == skin::PowerLevel::Deficit)
+                                 ? CV(skin::PowerColor(SK(), lv))
+                                 : CV(skin::Fade(SK().accent2, 0.96f));
 
-    ImGui::TextColored(ImVec4(0.85f, 0.92f, 1.f, 1.f), "%s", ratio_s);
+    ImGui::TextColored(ratio_col, "%s", ratio_s);
     ImGui::PushStyleColor(ImGuiCol_PlotHistogram, bar);
     ImGui::ProgressBar(frac, ImVec2(ImGui::GetContentRegionAvail().x, 8.f), "");
     ImGui::PopStyleColor();
@@ -775,8 +1021,8 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
     ImGui::PopStyleColor();
     ImGui::Dummy(ImVec2(0.f, 3.f));
 
-    const float icon_sz = ui_px(42.f);
-    const float gap = ui_px(4.f);
+    const float icon_sz = ui_px(42.f) * g_stats_icon_scale;
+    const float gap = ui_px(4.f) * g_stats_icon_scale;
     const float pad = ui_px(2.f);
     const float cell_w = icon_sz + pad * 2.f;
     const float cell_h = icon_sz + pad * 2.f;
@@ -792,7 +1038,7 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
       if (n <= 0) return;
 
       ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(gap, ui_px(3.f)));
-      ImGui::TextColored(ImVec4(0.70f, 0.78f, 0.90f, 1.f), "%s", title);
+      ImGui::TextColored(CV(SubHeadCol()), "%s", title);
       ImGui::SameLine(0.f, ui_px(6.f));
       ImGui::TextDisabled("%d", buildings ? p.building_total : p.unit_total);
 
@@ -815,8 +1061,8 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
         const ImVec2 chip1 = ImVec2(p0.x + cell_w, p0.y + cell_h);
 
-        draw->AddRectFilled(p0, chip1, IM_COL32(12, 16, 24, 180), round);
-        draw->AddRect(p0, chip1, accent_u32, round, 0, 1.0f);
+        DrawChip(draw, p0, chip1, round, skin::Over(skin::Fade(SK().win0, 0.86f), SK().win1),
+                 skin::Over(skin::Fade(SK().win0, 0.70f), SK().win1), accent_u32, 1.f);
 
         IDirect3DTexture9* tex = unit_icons::get(r.key, r.name, r.is_building);
         ImGui::SetCursorScreenPos(ImVec2(p0.x + pad, p0.y + pad));
@@ -826,18 +1072,18 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
           ImGui::Dummy(ImVec2(icon_sz, icon_sz));
           draw->AddRectFilled(ImVec2(p0.x + pad, p0.y + pad),
                               ImVec2(p0.x + pad + icon_sz, p0.y + pad + icon_sz),
-                              IM_COL32(40, 48, 60, 220), ui_px(3.f));
+                              EdgeIdle(), ui_px(3.f));
           const char* short_l = buildings ? u8"建" : u8"兵";
           const ImVec2 sts = ImGui::CalcTextSize(short_l);
           draw->AddText(ImVec2(p0.x + pad + (icon_sz - sts.x) * 0.5f,
                                p0.y + pad + (icon_sz - sts.y) * 0.5f),
-                        IM_COL32(200, 210, 220, 255), short_l);
+                        SK().text2, short_l);
         }
         if (ImGui::IsMouseHoveringRect(p0, chip1)) {
-          ImGui::BeginTooltip();
+          TipBegin();
           ImGui::TextUnformatted(r.name[0] ? r.name : r.key);
           ImGui::TextDisabled("%s  × %d", buildings ? u8"建筑" : u8"部队", r.count);
-          ImGui::EndTooltip();
+          TipEnd();
         }
 
         char cnt[16];
@@ -847,9 +1093,9 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
         const float by1 = chip1.y - pad;
         const float bx0 = bx1 - cts.x - 6.f;
         const float by0 = by1 - cts.y - 2.f;
-        draw->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), IM_COL32(8, 10, 14, 230),
+        draw->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), ChipBg(),
                             ui_px(3.f));
-        draw->AddText(ImVec2(bx0 + 3.f, by0 + 1.f), IM_COL32(255, 230, 160, 255), cnt);
+        draw->AddText(ImVec2(bx0 + 3.f, by0 + 1.f), SK().money, cnt);
 
         ImGui::SetCursorScreenPos(ImVec2(p0.x, p0.y));
         ImGui::Dummy(ImVec2(cell_w, cell_h));
@@ -863,22 +1109,22 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
     };
 
     const ImU32 unit_accent =
-        p.is_local ? IM_COL32(200, 160, 50, 120) : IM_COL32(70, 130, 210, 120);
+        skin::Fade(p.is_local ? SK().money : SK().accent, 0.50f);
     const ImU32 bld_accent =
-        p.is_local ? IM_COL32(180, 140, 40, 140) : IM_COL32(90, 150, 220, 140);
+        skin::Fade(p.is_local ? SK().money : SK().accent, 0.58f);
     const bool has_bld = p.building_total > 0;
     const bool has_proto = p.protocol_count > 0;
     draw_roster_section(u8"部队", false, unit_accent, has_bld || has_proto);
     draw_roster_section(u8"建筑", true, bld_accent, has_proto);
     if (p.protocol_count > 0) {
       ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(gap, ui_px(3.f)));
-      ImGui::TextColored(ImVec4(0.70f, 0.78f, 0.90f, 1.f), u8"协议");
+      ImGui::TextColored(CV(SubHeadCol()), u8"协议");
       ImGui::SameLine(0.f, ui_px(6.f));
       ImGui::TextDisabled("%d", p.protocol_count);
       const float avail = ImGui::GetContentRegionAvail().x;
       float used_x = 0.f;
       bool row_started = false;
-      const ImU32 proto_accent = IM_COL32(120, 196, 168, 160);
+      const ImU32 proto_accent = skin::Fade(SK().good, 0.70f);
       for (int i = 0; i < p.protocol_count; ++i) {
         const auto& pr = p.protocols[i];
         if (row_started && used_x + cell_w + gap > avail) {
@@ -890,18 +1136,18 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
         ImGui::PushID(pr.key[0] ? pr.key : pr.name);
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
         const ImVec2 chip1(p0.x + cell_w, p0.y + cell_h);
-        draw->AddRectFilled(p0, chip1, IM_COL32(12, 22, 20, 180), round);
-        draw->AddRect(p0, chip1, proto_accent, round, 0, 1.0f);
+        DrawChip(draw, p0, chip1, round, skin::Over(skin::Fade(SK().good, 0.10f), SK().win1),
+                 skin::Over(skin::Fade(SK().good, 0.06f), SK().win1), proto_accent, 1.f);
         IDirect3DTexture9* tex = unit_icons::get(pr.key, pr.name, false);
         ImGui::SetCursorScreenPos(ImVec2(p0.x + pad, p0.y + pad));
         if (tex) ImGui::Image((ImTextureID)tex, ImVec2(icon_sz, icon_sz));
         else ImGui::Dummy(ImVec2(icon_sz, icon_sz));
         if (ImGui::IsMouseHoveringRect(p0, chip1)) {
-          ImGui::BeginTooltip();
+          TipBegin();
           ImGui::TextUnformatted(pr.name[0] ? pr.name : pr.key);
           if (pr.remain_sec > 0) ImGui::TextDisabled(u8"剩余 %d 秒", pr.remain_sec);
           else ImGui::TextDisabled(u8"就绪");
-          ImGui::EndTooltip();
+          TipEnd();
         }
         if (pr.remain_sec > 0) {
           char clk[16];
@@ -912,9 +1158,9 @@ void draw_player_econ_card(const game_api::PlayerEconomy& p, int index) {
           const float by1 = chip1.y - pad;
           const float bx0 = bx1 - cts.x - 6.f;
           const float by0 = by1 - cts.y - 2.f;
-          draw->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), IM_COL32(8, 10, 14, 230),
+          draw->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), ChipBg(),
                               ui_px(3.f));
-          draw->AddText(ImVec2(bx0 + 3.f, by0 + 1.f), IM_COL32(255, 214, 120, 255), clk);
+          draw->AddText(ImVec2(bx0 + 3.f, by0 + 1.f), SK().money, clk);
         }
         ImGui::SetCursorScreenPos(ImVec2(p0.x, p0.y));
         ImGui::Dummy(ImVec2(cell_w, cell_h));
@@ -964,21 +1210,23 @@ void text_ellipsis(const char* s, float max_w) {
   std::memcpy(buf + n, ell, 3);
   buf[n + 3] = 0;
   ImGui::TextUnformatted(buf);
-  if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", s);
+  if (ImGui::IsItemHovered()) Tip("%s", s);
 }
 
 // Draw one compact chip at an absolute screen position (no ImGui layout side effects).
-void draw_compact_icon_at(ImDrawList* draw, const ImVec2& p0, const game_api::RosterType& r,
-                          float cell, float icon_sz, ImU32 border, bool building, bool defeated) {
+// 极简模式复用同一份画法（draw_minimal_unit_chip），所以两种模式下的兵种格子
+// 必须像素一致——想改外观只改这里。
+void draw_compact_icon_ex(ImDrawList* draw, const ImVec2& p0, const char* key, const char* name,
+                          int count, float cell, float icon_sz, ImU32 border, bool building,
+                          bool defeated, bool show_tip = true) {
   const ImVec2 chip1(p0.x + cell, p0.y + cell);
-  const ImU32 fill = building ? IM_COL32(32, 24, 14, 210) : IM_COL32(14, 20, 32, 210);
-  const float round = ui_px(4.f);
-  draw->AddRectFilled(p0, chip1, fill, round);
-  draw->AddRect(p0, chip1, border, round, 0, 1.0f);
+  const ImU32 fill = building ? skin::Over(skin::Fade(SK().money, 0.13f), SK().win1) : PanelBg();
+  const float round = ui_px(SK().cardRadius * 0.30f);
+  DrawChip(draw, p0, chip1, round, fill, skin::Mix(fill, SK().win1, 0.35f), border, 1.f);
 
   const float inset = (cell - icon_sz) * 0.5f;
-  IDirect3DTexture9* tex = unit_icons::get(r.key, r.name, r.is_building);
-  const ImU32 tint = defeated ? IM_COL32(158, 158, 158, 204) : IM_COL32(255, 255, 255, 255);
+  IDirect3DTexture9* tex = unit_icons::get(key, name, building);
+  const ImU32 tint = defeated ? skin::Fade(SK().text3, 0.88f) : IM_COL32(255, 255, 255, 255);
   if (tex) {
     draw->AddImage((ImTextureID)tex, ImVec2(p0.x + inset, p0.y + inset),
                    ImVec2(p0.x + inset + icon_sz, p0.y + inset + icon_sz), ImVec2(0, 0),
@@ -986,36 +1234,43 @@ void draw_compact_icon_at(ImDrawList* draw, const ImVec2& p0, const game_api::Ro
   } else {
     draw->AddRectFilled(ImVec2(p0.x + inset, p0.y + inset),
                         ImVec2(p0.x + inset + icon_sz, p0.y + inset + icon_sz),
-                        IM_COL32(40, 48, 60, 220), ui_px(3.f));
+                        EdgeIdle(), ui_px(3.f));
     const char* short_l = building ? u8"建" : u8"兵";
     const ImVec2 sts = ImGui::CalcTextSize(short_l);
     draw->AddText(ImVec2(p0.x + inset + (icon_sz - sts.x) * 0.5f,
                          p0.y + inset + (icon_sz - sts.y) * 0.5f),
-                  IM_COL32(200, 210, 220, 255), short_l);
+                  SK().text2, short_l);
   }
-  if (ImGui::IsMouseHoveringRect(p0, chip1)) {
-    ImGui::BeginTooltip();
-    ImGui::TextUnformatted(r.name[0] ? r.name : r.key);
-    ImGui::TextDisabled("%s  × %d", building ? u8"建筑" : u8"部队", r.count);
-    ImGui::EndTooltip();
+  if (show_tip && ImGui::IsMouseHoveringRect(p0, chip1)) {
+    TipBegin();
+    ImGui::TextUnformatted(name && name[0] ? name : (key ? key : ""));
+    ImGui::TextDisabled("%s  × %d", building ? u8"建筑" : u8"部队", count);
+    TipEnd();
   }
 
   char cnt[16];
-  std::snprintf(cnt, sizeof(cnt), "%d", r.count);
+  std::snprintf(cnt, sizeof(cnt), "%d", count);
   ImFont* font = ImGui::GetFont();
-  const float csz = (std::max)(10.f, ImGui::GetFontSize() * 0.72f);
+  // 数量角标跟着格子走：图标放大 1.5 倍，数字也放大，否则角标会小得看不清。
+  const float csz = (std::max)(10.f, (std::min)(cell * 0.40f, ImGui::GetFontSize() * 1.5f));
   const ImVec2 cts = font->CalcTextSizeA(csz, FLT_MAX, 0.f, cnt);
   const float bx1 = chip1.x - 1.f;
   const float by1 = chip1.y - 1.f;
-  const float bx0 = bx1 - cts.x - 5.f;
-  const float by0 = by1 - cts.y - 1.f;
-  draw->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), IM_COL32(8, 10, 14, 230), ui_px(3.f));
-  draw->AddText(font, csz, ImVec2(bx0 + 2.5f, by0), IM_COL32(255, 228, 150, 255), cnt);
+  const float bx0 = bx1 - cts.x - cell * 0.14f;
+  const float by0 = by1 - cts.y - cell * 0.05f;
+  draw->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), ChipBg(), ui_px(3.f));
+  draw->AddText(font, csz, ImVec2(bx0 + cell * 0.07f, by0), SK().money, cnt);
+}
+
+void draw_compact_icon_at(ImDrawList* draw, const ImVec2& p0, const game_api::RosterType& r,
+                          float cell, float icon_sz, ImU32 border, bool building, bool defeated) {
+  draw_compact_icon_ex(draw, p0, r.key, r.name, r.count, cell, icon_sz, border, building, defeated);
 }
 
 void draw_compact_icon_row(const game_api::PlayerEconomy& p, bool buildings, bool defeated) {
-  const float icon_sz = ui_px(32.f);
-  const float cell = ui_px(34.f);
+  // 图标尺寸走"界面缩放 × 战况统计图标倍率"（设置里可调，默认 1.5 倍）。
+  const float icon_sz = ui_px(32.f) * g_stats_icon_scale;
+  const float cell = ui_px(34.f) * g_stats_icon_scale;
   const float gap = ui_px(3.f);
   const float row_gap = ui_px(2.f);  // space after this row before the next
   const float label_w = ui_px(56.f);
@@ -1037,15 +1292,16 @@ void draw_compact_icon_row(const game_api::PlayerEconomy& p, bool buildings, boo
 
   const ImVec2 ts = ImGui::CalcTextSize(head);
   if (n <= 0) {
-    draw->AddText(ImVec2(row0.x, row0.y), IM_COL32(176, 196, 220, 255), head);
+    draw->AddText(ImVec2(row0.x, row0.y), skin::Fade(SK().text2, 0.95f), head);
     // Grow layout via Dummy only — do not SetCursor beyond content first.
     ImGui::Dummy(ImVec2(avail, ts.y + row_gap));
     return;
   }
 
   const ImU32 border = buildings
-                           ? (p.is_local ? IM_COL32(196, 148, 64, 200) : IM_COL32(214, 164, 86, 190))
-                           : (p.is_local ? IM_COL32(214, 176, 72, 180) : IM_COL32(96, 156, 224, 180));
+                           ? skin::Fade(SK().money, buildings ? 0.78f : 0.72f)
+                           : (p.is_local ? skin::Fade(SK().money, 0.70f)
+                                         : skin::Fade(SK().accent, 0.72f));
   const float icons_x = row0.x + label_w;
   const float wrap_w = (std::max)(cell, avail - label_w);
 
@@ -1064,7 +1320,7 @@ void draw_compact_icon_row(const game_api::PlayerEconomy& p, bool buildings, boo
   }
 
   const float block_h = (float)rows * cell + (float)(rows - 1) * gap;
-  draw->AddText(ImVec2(row0.x, row0.y + (block_h - ts.y) * 0.5f), IM_COL32(176, 196, 220, 255),
+  draw->AddText(ImVec2(row0.x, row0.y + (block_h - ts.y) * 0.5f), skin::Fade(SK().text2, 0.95f),
                 head);
   // Reserve the drawn block with Dummy so AutoResize / parent bounds grow.
   ImGui::Dummy(ImVec2(avail, block_h + row_gap));
@@ -1073,14 +1329,11 @@ void draw_compact_icon_row(const game_api::PlayerEconomy& p, bool buildings, boo
 void draw_compact_player(const game_api::PlayerEconomy& p, int index) {
   ImVec4 accent(p.color_r / 255.f, p.color_g / 255.f, p.color_b / 255.f, 1.f);
   if (!p.has_color) {
-    accent = p.is_local ? ImVec4(0.95f, 0.78f, 0.28f, 1.f) : ImVec4(0.55f, 0.62f, 0.72f, 1.f);
+    accent = p.is_local ? CV(SK().money) : CV(SK().text2);
   }
-  const ImVec4 money_col(1.00f, 0.86f, 0.38f, 1.f);
-  const ImVec4 power_ok(0.45f, 0.90f, 0.62f, 1.f);
-  const ImVec4 power_warn(0.95f, 0.62f, 0.28f, 1.f);
-  const ImVec4 power_bad(0.95f, 0.38f, 0.34f, 1.f);
-  const ImVec4 muted(0.55f, 0.60f, 0.68f, 1.f);
-  const ImVec4 name_col = p.defeated ? muted : ImVec4(0.94f, 0.96f, 0.98f, 1.f);
+  const ImVec4 money_col = CV(SK().money);
+  const ImVec4 muted = CV(skin::Fade(SK().text3, 0.92f));
+  const ImVec4 name_col = p.defeated ? muted : CV(SK().text);
 
   char label[96];
   const char* title = p.name[0] ? p.name : u8"玩家";
@@ -1097,13 +1350,11 @@ void draw_compact_player(const game_api::PlayerEconomy& p, int index) {
     format_uint_grouped(used_s, sizeof(used_s), p.power_used);
     format_uint_grouped(total_s, sizeof(total_s), p.power_total);
     std::snprintf(power_s, sizeof(power_s), "%s/%s", used_s, total_s);
-    if (p.power_total > 0) {
-      frac = (float)p.power_used / (float)p.power_total;
-      if (frac > 1.f) frac = 1.f;
-    }
-    power_col = power_ok;
-    if (frac >= 0.95f) power_col = power_bad;
-    else if (frac >= 0.75f) power_col = power_warn;
+    // 使用 > 总量（含 0 产能但有消耗）一律红：bar 和数值都用同一判定。
+    const skin::PowerLevel lv = skin::PowerLevelOf(p.power_used, p.power_total);
+    frac = (p.power_total > 0) ? (float)p.power_used / (float)p.power_total : 1.f;
+    if (frac > 1.f) frac = 1.f;
+    power_col = CV(skin::PowerColor(SK(), lv));
   } else {
     std::snprintf(power_s, sizeof(power_s), u8"—");
   }
@@ -1159,7 +1410,7 @@ void draw_compact_player(const game_api::PlayerEconomy& p, int index) {
     float x = 0.f;
     float y = 0.f;
     int rows = 1;
-    const ImU32 border = IM_COL32(96, 186, 156, 190);
+    const ImU32 border = skin::Fade(SK().good, 0.74f);
     for (int i = 0; i < p.protocol_count; ++i) {
       const auto& pr = p.protocols[i];
       if (x > 0.f && x + cell > wrap_w) {
@@ -1169,22 +1420,23 @@ void draw_compact_player(const game_api::PlayerEconomy& p, int index) {
       }
       const ImVec2 p0(icons_x + x, row0.y + y);
       const ImVec2 chip1(p0.x + cell, p0.y + cell);
-      pdraw->AddRectFilled(p0, chip1, IM_COL32(14, 28, 24, 210), ui_px(4.f));
-      pdraw->AddRect(p0, chip1, border, ui_px(4.f), 0, 1.0f);
+      DrawChip(pdraw, p0, chip1, ui_px(SK().cardRadius * 0.30f),
+               skin::Over(skin::Fade(SK().good, 0.12f), SK().win1),
+               skin::Over(skin::Fade(SK().good, 0.07f), SK().win1), border, 1.f);
       const float inset = (cell - icon_sz) * 0.5f;
       IDirect3DTexture9* tex = unit_icons::get(pr.key, pr.name, false);
-      const ImU32 tint = p.defeated ? IM_COL32(158, 158, 158, 204) : IM_COL32(255, 255, 255, 255);
+      const ImU32 tint = p.defeated ? skin::Fade(SK().text3, 0.88f) : IM_COL32(255, 255, 255, 255);
       if (tex) {
         pdraw->AddImage((ImTextureID)tex, ImVec2(p0.x + inset, p0.y + inset),
                         ImVec2(p0.x + inset + icon_sz, p0.y + inset + icon_sz), ImVec2(0, 0),
                         ImVec2(1, 1), tint);
       }
       if (ImGui::IsMouseHoveringRect(p0, chip1)) {
-        ImGui::BeginTooltip();
+        TipBegin();
         ImGui::TextUnformatted(pr.name[0] ? pr.name : pr.key);
         if (pr.remain_sec > 0) ImGui::TextDisabled(u8"剩余 %d 秒", pr.remain_sec);
         else ImGui::TextDisabled(u8"就绪");
-        ImGui::EndTooltip();
+        TipEnd();
       }
       if (pr.remain_sec > 0) {
         char clk[16];
@@ -1197,14 +1449,14 @@ void draw_compact_player(const game_api::PlayerEconomy& p, int index) {
         const float by1 = chip1.y - 1.f;
         const float bx0 = bx1 - cts.x - 5.f;
         const float by0 = by1 - cts.y - 1.f;
-        pdraw->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), IM_COL32(8, 10, 14, 230),
+        pdraw->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1), ChipBg(),
                              ui_px(3.f));
-        pdraw->AddText(font, csz, ImVec2(bx0 + 2.5f, by0), IM_COL32(255, 214, 120, 255), clk);
+        pdraw->AddText(font, csz, ImVec2(bx0 + 2.5f, by0), SK().money, clk);
       }
       x += cell + gap;
     }
     const float block_h = (float)rows * cell + (float)(rows - 1) * gap;
-    pdraw->AddText(ImVec2(row0.x, row0.y + (block_h - ts.y) * 0.5f), IM_COL32(150, 214, 186, 255),
+    pdraw->AddText(ImVec2(row0.x, row0.y + (block_h - ts.y) * 0.5f), skin::Fade(SK().good, 0.95f),
                    head);
     ImGui::Dummy(ImVec2(avail_p, block_h + row_gap));
   }
@@ -1215,8 +1467,14 @@ void draw_compact_player(const game_api::PlayerEconomy& p, int index) {
   ImGui::PopID();
 
   dl->ChannelsSetCurrent(0);
-  const ImU32 bg = (index & 1) ? IM_COL32(18, 24, 34, 150) : IM_COL32(24, 32, 44, 130);
-  dl->AddRectFilled(ImVec2(origin.x, r0.y), ImVec2(origin.x + avail, r1.y), bg, 4.f);
+  // 玩家卡底：斑马纹行底，形状跟皮肤（切角皮肤下卡片是斜角）。
+  {
+    const ImU32 top = (index & 1) ? skin::Fade(SK().cardInnerLo, 0.60f)
+                                  : skin::Fade(SK().cardInnerHi, 0.05f);
+    const ImU32 bot = (index & 1) ? skin::Fade(SK().cardInnerLo, 0.35f) : skin::WithA(top, 0);
+    DrawChip(dl, ImVec2(origin.x, r0.y), ImVec2(origin.x + avail, r1.y),
+             ui_px(SK().cardRadius * 0.26f), top, bot, skin::Fade(EdgeIdle(), 0.55f), 1.f);
+  }
   dl->AddRectFilled(ImVec2(origin.x, r0.y), ImVec2(origin.x + 3.f, r1.y), ImGui::GetColorU32(accent),
                     2.f);
   dl->ChannelsMerge();
@@ -1226,6 +1484,133 @@ void draw_stats_compact(const game_api::MatchEconomy& st) {
   ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.f, 3.f));
   for (int i = 0; i < st.player_count; ++i) {
     draw_compact_player(st.players[i], i);
+  }
+  ImGui::PopStyleVar();
+}
+
+// ---------------- 极简模式：一个玩家一行 ----------------
+//
+// 排版（列宽、右对齐、窄窗口截断）在 stats_minimal.cpp 里：那里不碰游戏数据，
+// 离线预览能渲染同一份实现做像素核对。这里只做数据适配 + 悬停明细。
+void draw_stats_minimal(const game_api::MatchEconomy& st) {
+  static std::vector<stats_minimal::Row> rows;
+  // 兵种列表每行一段，单独放一个池子：Row 里只存指针，扩容时不会悬空。
+  static std::vector<stats_minimal::UnitIcon> units;
+  // 图标倍率是设置项：每帧同步一次，改滑块立刻见效。
+  stats_minimal::SetChipScale(g_stats_icon_scale);
+  rows.clear();
+  units.clear();
+  rows.reserve((size_t)st.player_count);
+
+  size_t unit_hint = 0;
+  for (int i = 0; i < st.player_count; ++i) unit_hint += (size_t)st.players[i].roster_count;
+  units.reserve(unit_hint);
+
+  for (int i = 0; i < st.player_count; ++i) {
+    const auto& p = st.players[i];
+    stats_minimal::Row r;
+    r.name = p.name;
+    r.is_local = p.is_local;
+    r.defeated = p.defeated;
+    r.has_color = p.has_color;
+    r.color_r = p.color_r;
+    r.color_g = p.color_g;
+    r.color_b = p.color_b;
+    r.has_money = p.has_money;
+    r.money = p.money;
+    r.has_power = p.has_power;
+    r.power_used = p.power_used;
+    r.power_total = p.power_total;
+    r.unit_total = p.unit_total;
+    r.building_total = p.building_total;
+    // 极简只上兵种图标，建筑不上（建筑数量放悬停里看）。
+    const size_t first = units.size();
+    for (int k = 0; k < p.roster_count; ++k) {
+      const auto& rt = p.roster[k];
+      if (rt.is_building || rt.count <= 0) continue;
+      stats_minimal::UnitIcon u;
+      u.key = rt.key;
+      u.name = rt.name;
+      u.count = rt.count;
+      units.push_back(u);
+    }
+    r.unit_count = (int)(units.size() - first);
+    rows.push_back(r);
+  }
+  // 指针在全部 push_back 之后再取：中途扩容会让先取的地址失效。
+  size_t cur = 0;
+  for (size_t i = 0; i < rows.size(); ++i) {
+    rows[i].units = rows[i].unit_count > 0 ? &units[cur] : nullptr;
+    cur += (size_t)rows[i].unit_count;
+  }
+
+  // 行距压到 0：行高已经在 DrawRow 里算好，再叠一层 ItemSpacing 就不"紧密"了。
+  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.f, 0.f));
+  const float px = ui_px(1.f);
+  const float avail = ImGui::GetContentRegionAvail().x;
+
+  // 诊断：极简模式的兵种图标"有没有东西可画"取决于 roster 是否被扫描填上。
+  // 每 2 秒记一行，roster=N units=M 能直接区分"数据空"和"排版挤掉"；
+  // 后面再跟每条 roster 的 名字:数量:建筑位，一次就能看清是分类错了还是根本没数据。
+  {
+    static float s_t = 0.f;
+    s_t += ImGui::GetIO().DeltaTime;
+    if (s_t >= 2.f) {
+      s_t = 0.f;
+      char buf[1024];
+      int o = std::snprintf(buf, sizeof(buf), "minimal: avail=%.0f win=%.0f players=%d |", avail,
+                            ImGui::GetWindowSize().x, st.player_count);
+      for (int i = 0; i < st.player_count; ++i) {
+        o += std::snprintf(buf + o, sizeof(buf) - (size_t)o, " [%d roster=%d units=%d tot=%d]", i,
+                           st.players[i].roster_count, rows[i].unit_count,
+                           st.players[i].unit_total);
+        if (i >= 2) continue;
+        for (int k = 0; k < st.players[i].roster_count && o < (int)sizeof(buf) - 40; ++k) {
+          const auto& rt = st.players[i].roster[k];
+          o += std::snprintf(buf + o, sizeof(buf) - (size_t)o, " %s:%d:b%d",
+                             rt.name[0] ? rt.name : rt.key, rt.count, rt.is_building ? 1 : 0);
+        }
+      }
+      game_api::log("%s", buf);
+    }
+  }
+  stats_minimal::Cols cols;
+  stats_minimal::Measure(&cols, rows.data(), (int)rows.size(), avail, px);
+  stats_minimal::DrawHeader(cols, px);
+
+  for (int i = 0; i < (int)rows.size(); ++i) {
+    ImVec2 r0{}, r1{};
+    stats_minimal::DrawRow(rows[i], i, cols, px, &r0, &r1);
+    if (!ImGui::IsMouseHoveringRect(r0, r1)) continue;
+
+    // 一行塞不下的信息放悬停：兵力明细和比分。表格本体只留资金、电力、兵种图标。
+    const auto& p = st.players[i];
+    char money_s[32], power_s[48];
+    if (p.has_money) format_uint_grouped(money_s, sizeof(money_s), p.money);
+    else std::snprintf(money_s, sizeof(money_s), u8"—");
+    if (p.has_power) {
+      char used[24], total[24];
+      format_uint_grouped(used, sizeof(used), p.power_used);
+      format_uint_grouped(total, sizeof(total), p.power_total);
+      std::snprintf(power_s, sizeof(power_s), "%s/%s", used, total);
+    } else {
+      std::snprintf(power_s, sizeof(power_s), u8"—");
+    }
+    TipBegin();
+    ImGui::TextUnformatted(p.name[0] ? p.name : u8"玩家");
+    ImGui::TextDisabled(u8"资金 %s   电力 %s", money_s, power_s);
+    ImGui::TextDisabled(u8"部队 %d   建筑 %d", p.unit_total, p.building_total);
+    if (p.has_score) {
+      ImGui::TextDisabled(u8"造兵 %u  被杀 %u  击杀 %u", p.units_built,
+                          p.units_lost, p.units_destroyed);
+    }
+    for (int k = 0; k < p.roster_count; ++k) {
+      const auto& rt = p.roster[k];
+      if (rt.count <= 0) continue;
+      ImGui::TextDisabled("%s%s x%d", rt.name[0] ? rt.name : rt.key,
+                          rt.is_building ? u8"（建筑）" : "", rt.count);
+    }
+    TipEnd();
   }
   ImGui::PopStyleVar();
 }
@@ -1268,28 +1653,36 @@ void draw_stats_panel() {
   }
   sample_trends(st);
 
-  ImGui::TextColored(ImVec4(0.78f, 0.90f, 1.0f, 1.f), u8"战况总览");
-  if (st.spectator) {
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(1.f, 0.78f, 0.40f, 1.f), u8"观战");
+  // 极简模式把"战况总览"这一整行省掉：一屏就那几行玩家，标题只是白占高度。
+  // 观战标记和方数并到表头下面那一行里由 stats_minimal 的列宽自然带出来。
+  if (!g_stats_minimal) {
+    ImGui::TextColored(CV(SK().accent2), u8"战况总览");
+    if (st.spectator) {
+      ImGui::SameLine();
+      ImGui::TextColored(CV(SK().money), u8"观战");
+    }
+    if (st.valid) {
+      char count_s[32];
+      std::snprintf(count_s, sizeof(count_s), u8"%d 方", st.player_count);
+      const float count_w = ImGui::CalcTextSize(count_s).x;
+      ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - count_w);
+      ImGui::TextDisabled("%s", count_s);
+    }
+    ImGui::PushStyleColor(ImGuiCol_Separator, CVA(SK().accent, 0.55f));
+    ImGui::Separator();
+    ImGui::PopStyleColor();
+    if (!g_stats_compact) ImGui::Spacing();
   }
-  if (st.valid) {
-    char count_s[32];
-    std::snprintf(count_s, sizeof(count_s), u8"%d 方", st.player_count);
-    const float count_w = ImGui::CalcTextSize(count_s).x;
-    ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - count_w);
-    ImGui::TextDisabled("%s", count_s);
-  }
-  ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.35f, 0.48f, 0.65f, 0.55f));
-  ImGui::Separator();
-  ImGui::PopStyleColor();
-  if (!g_stats_compact) ImGui::Spacing();
 
   if (!st.valid) {
     ImGui::TextWrapped(u8"%s", st.note[0] ? st.note : u8"暂无数据：请先进入对局。");
     return;
   }
 
+  if (g_stats_minimal) {
+    draw_stats_minimal(st);
+    return;
+  }
   if (g_stats_compact) {
     draw_stats_compact(st);
     return;
@@ -1301,31 +1694,102 @@ void draw_stats_panel() {
 }
 
 void draw_stats_window() {
-  if (!g_stats_open) return;
+  if (!g_stats_open) {
+    shell::ResetDrag("stats");
+    return;
+  }
   if (!input::menu_visible() && !g_stats_pinned) {
     g_stats_open = false;
+    shell::ResetDrag("stats");
     return;
   }
 
-  ImGui::SetNextWindowSize(ImVec2(420, 640), ImGuiCond_FirstUseEver);
-  ImGui::SetNextWindowPos(ImVec2(950, 28), ImGuiCond_FirstUseEver);
-  ImGui::SetNextWindowSizeConstraints(ImVec2(320, 280), ImVec2(FLT_MAX, FLT_MAX));
+  // 极简模式要放兵种图标，横向要宽一点；但一屏只有几个玩家，纵向可以矮很多。
+  // 宽度随图标倍率一起长：图标放大后 580 一行只放得下两三个。
+  const ImVec2 st_size =
+      g_stats_minimal
+          ? scaled_window_size(420.f + 160.f * g_stats_icon_scale,
+                               200.f + 100.f * g_stats_icon_scale)
+          : scaled_window_size(420.f, 640.f);
+  // 默认贴右边；高缩放下 950 可能已经在屏幕外，按当前窗口尺寸反算。
+  // 位置在 Begin 之前定好（理由同主窗口）：拖动位移先吃掉，内容不会落后一帧。
+  static ImVec2 s_stats_pos(-1.f, -1.f);
+  if (s_stats_pos.x < 0.f) {
+    s_stats_pos.x = (std::max)(ui_px(12.f), ImGui::GetIO().DisplaySize.x - st_size.x - ui_px(20.f));
+    s_stats_pos.y = ui_px(28.f);
+  }
+  // 切模式时窗口尺寸会变：记住上一帧的尺寸，变了就强制设一次，并把它拉回屏幕内
+  // （否则贴着右边缘的窗口换成宽版会整块探出屏幕）。
+  static ImVec2 s_last_size(-1.f, -1.f);
+  const bool size_changed = (s_last_size.x != st_size.x || s_last_size.y != st_size.y);
+  if (size_changed && s_last_size.x > 0.f) {
+    const float max_x = ImGui::GetIO().DisplaySize.x - st_size.x - ui_px(20.f);
+    s_stats_pos.x = (std::max)(ui_px(12.f), (std::min)(s_stats_pos.x, max_x));
+  }
+  s_last_size = st_size;
+  shell::DragUpdate("stats", &s_stats_pos);
+  ImGui::SetNextWindowPos(s_stats_pos, ImGuiCond_Always);
+  ImGui::SetNextWindowSize(st_size, size_changed ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSizeConstraints(
+      ImVec2((std::min)(ui_px(320.f), st_size.x), (std::min)(ui_px(280.f), st_size.y)),
+      ImVec2(FLT_MAX, FLT_MAX));
   ImGui::SetNextWindowBgAlpha(g_ui_opacity);
 
   // Pinned: no close button — must uncheck 固定 to hide.
-  ImGuiWindowFlags flags = ImGuiWindowFlags_None;
-  bool* p_open = nullptr;
+  // 和主菜单同一套外壳：去掉 ImGui 的直角标题条与矩形底色，标题栏自己画。
+  // NoMove 见 shell.h：位移统一由 DragUpdate 处理，避免两处叠加。
+  ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBackground |
+                           ImGuiWindowFlags_NoMove;
   bool open = g_stats_open;
   if (g_stats_pinned) {
     flags |= ImGuiWindowFlags_NoCollapse;
-  } else {
-    p_open = &open;
   }
 
-  if (!ImGui::Begin(u8"战况统计", p_open, flags)) {
+  // 极简模式整套内边距收紧：省下来的高度正好多显示两三个玩家。
+  const ImVec2 pad_normal = ImGui::GetStyle().WindowPadding;
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                      g_stats_minimal ? ImVec2(ui_px(8.f), ui_px(6.f)) : pad_normal);
+
+  if (!ImGui::Begin(u8"战况统计", nullptr, flags)) {
     ImGui::End();
-    if (!g_stats_pinned && !open) g_stats_open = false;
+    ImGui::PopStyleVar();
     return;
+  }
+
+  // 排查用：每 2 秒记一次滚动区实况。滚轮没反应到底是"没东西可滚"、
+  // "窗口没被 hover"、还是"滚了又被钳回 0"，这几项能直接分辨。
+  {
+    static float s_diag_t = 0.f;
+    s_diag_t += ImGui::GetIO().DeltaTime;
+    if (s_diag_t >= 2.f) {
+      s_diag_t = 0.f;
+      const ImVec2 wp = ImGui::GetWindowPos();
+      const ImVec2 ws = ImGui::GetWindowSize();
+      game_api::log(
+          "stats: pos=(%.0f,%.0f) size=(%.0f,%.0f) scrollmax=(%.0f,%.0f) scroll=(%.0f,%.0f) "
+          "hovered=%d want_mouse=%d wheel=%.0f",
+          wp.x, wp.y, ws.x, ws.y, ImGui::GetScrollMaxX(), ImGui::GetScrollMaxY(),
+          ImGui::GetScrollX(), ImGui::GetScrollY(),
+          ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) ? 1 : 0,
+          ImGui::GetIO().WantCaptureMouse ? 1 : 0, ImGui::GetIO().MouseWheel);
+    }
+  }
+
+  {
+    shell::Hit sh;
+    const ImVec2 content0 = ImGui::GetCursorScreenPos();
+    const ImVec2 wp = ImGui::GetWindowPos();
+    // 极简模式下标题栏也缩一档：窗体和内容一起变紧凑，不然只剩内容挤、标题还是原尺寸。
+    const float shell_scale = g_stats_minimal ? g_ui_scale * 0.80f : g_ui_scale;
+    const float shell_h = shell::Draw(ImGui::GetWindowDrawList(), wp,
+                                      ImVec2(wp.x + ImGui::GetWindowSize().x,
+                                             wp.y + ImGui::GetWindowSize().y),
+                                      shell_scale, g_ui_opacity, u8"战况统计",
+                                      g_stats_minimal ? u8" · 极简" : u8" · 实时", true, &sh,
+                                      !g_stats_pinned, "stats");
+    ImGui::SetCursorScreenPos(
+        ImVec2(content0.x, wp.y + shell_h + ui_px(g_stats_minimal ? 3.f : 6.f)));
+    if (sh.close) open = false;
   }
 
   if (ImGui::Checkbox(u8"固定", &g_stats_pinned)) {
@@ -1336,19 +1800,58 @@ void draw_stats_window() {
     } else if (!input::menu_visible()) {
       g_stats_open = false;
       ImGui::End();
+      ImGui::PopStyleVar();
       return;
     }
   }
   ImGui::SameLine();
-  if (ImGui::Checkbox(u8"精简", &g_stats_compact)) mark_settings_dirty();
+  // 精简 / 极简是两档显示密度，互斥：勾一个自动退另一个。
+  if (ImGui::Checkbox(u8"精简", &g_stats_compact)) {
+    if (g_stats_compact) g_stats_minimal = false;
+    mark_settings_dirty();
+  }
   ImGui::SameLine();
-  ImGui::TextDisabled(g_stats_compact ? u8"图标、资金、电力"
-                                      : (g_stats_pinned ? u8"主菜单隐藏后仍显示"
-                                                        : u8"取消固定后可关闭本窗口"));
+  if (ImGui::Checkbox(u8"极简", &g_stats_minimal)) {
+    if (g_stats_minimal) g_stats_compact = false;
+    mark_settings_dirty();
+  }
+  // 极简模式不再解释一遍自己：那一行提示只在标准 / 精简下有用，留着白占一行高度。
+  if (!g_stats_minimal) {
+    ImGui::TextDisabled(g_stats_compact ? u8"图标、资金、电力"
+                                        : (g_stats_pinned ? u8"主菜单隐藏后仍显示"
+                                                          : u8"取消固定后可关闭本窗口"));
+  }
 
-  ImGui::Spacing();
+  if (!g_stats_minimal) ImGui::Spacing();
+  // 列表放进独立滚动区。
+  //
+  // 之前依赖根窗口的隐式滚动：内容尺寸由 CursorMaxPos 推算，而统计面板大量用
+  // 绝对坐标 + Dummy 预留高度画格子，只要有一处算少，ScrollMax.y 就是 0 ——
+  // 滚轮再怎么滚也没东西可滚。子窗口的滚动区是显式容器，内容超出就一定滚，
+  // 而且标题行（固定 / 精简）留在滚动区上面，不会跟着一起滚走。
+  ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.f, 0.f, 0.f, 0.f));
+  ImGui::BeginChild("##stats_body", ImVec2(0.f, 0.f), ImGuiChildFlags_None);
+  const float body_y0 = ImGui::GetScrollY();
   draw_stats_panel();
+  // 兜底滚动：鼠标明明在列表里，但 ImGui 把这一格滚轮派给了别人（hover 被抢）
+  // 时，自己吃下来。只在"ImGui 自己没滚成"的情况下生效，不会滚两倍。
+  {
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.MouseWheel != 0.f && !io.WantTextInput && ImGui::GetScrollY() == body_y0) {
+      const ImVec2 wp0 = ImGui::GetWindowPos();
+      const ImVec2 ws0 = ImGui::GetWindowSize();
+      if (ImGui::IsMouseHoveringRect(wp0, ImVec2(wp0.x + ws0.x, wp0.y + ws0.y))) {
+        float step = 5.f * ImGui::GetFontSize();
+        const float max_step = ImGui::GetWindowHeight() * 0.67f;
+        if (step > max_step) step = max_step;
+        ImGui::SetScrollY(body_y0 - io.MouseWheel * step);
+      }
+    }
+  }
+  ImGui::EndChild();
+  ImGui::PopStyleColor();
   ImGui::End();
+  ImGui::PopStyleVar();
 
   if (!g_stats_pinned && !open) g_stats_open = false;
 }
@@ -1361,6 +1864,20 @@ bool init(IDirect3DDevice9* device, void* hwnd) {
   g_hwnd = static_cast<HWND>(hwnd);
 
   load_ui_settings();
+
+  // 极简模式的行图标走 unit_icons 的纹理缓存；stats_minimal 自己不链接它
+  // （预览工具没有游戏纹理），所以在这里注入一次。
+  stats_minimal::SetIconProvider(
+      [](const char* key, const char* name, bool building) -> ImTextureID {
+        return (ImTextureID)unit_icons::get(key, name, building);
+      });
+  // 极简模式一个格子的画法直接用精简模式那份：同一个函数，两种模式长得一样。
+  stats_minimal::SetChipRenderer(
+      [](ImDrawList* dl, ImVec2 p0, float cell, const stats_minimal::UnitIcon& u,
+         ImU32 border, bool defeated) {
+        draw_compact_icon_ex(dl, p0, u.key, u.name, u.count, cell, cell * 0.94f, border,
+                             /*building*/ false, defeated, /*show_tip*/ false);
+      });
 
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
@@ -1378,17 +1895,23 @@ bool init(IDirect3DDevice9* device, void* hwnd) {
       "C:\\Windows\\Fonts\\simsun.ttc",
   };
   bool font_ok = false;
+  const char* font_used = "(default)";
   for (const char* path : font_candidates) {
     if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) {
       // ChineseFull builds a huge atlas and freezes the first open for seconds.
       // Common glyphs cover the UI; missing rare chars fall back to '?'.
-      io.Fonts->AddFontFromFileTTF(path, 18.0f, &cfg,
-                                   io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
-      font_ok = true;
+      ImFont* f = io.Fonts->AddFontFromFileTTF(path, 18.0f, &cfg,
+                                               io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+      font_ok = (f != nullptr);
+      font_used = font_ok ? path : "(load failed)";
       break;
     }
   }
   if (!font_ok) io.Fonts->AddFontDefault();
+  // 中文字全部显示成 '?' 时，第一件事就是看这一行：字体文件没加载上，
+  // ImGui 会退回内置 ASCII 字体，所有汉字都会变成替换字符。
+  game_api::log("font: %s ok=%d scale=%.2f fonts=%d", font_used, font_ok ? 1 : 0,
+                g_ui_scale, io.Fonts->Fonts.Size);
 
   apply_ra3_theme();
 
@@ -1409,8 +1932,8 @@ bool init(IDirect3DDevice9* device, void* hwnd) {
     InitializeCriticalSection(&g_async_cs);
     g_async_cs_ready = true;
   }
-  game_api::log("ImGui UI ready scale=%.2f opacity=%.2f", g_ui_scale,
-                g_ui_opacity);
+  game_api::log("ImGui UI ready scale=%.2f opacity=%.2f build=%s %s", g_ui_scale,
+                g_ui_opacity, __DATE__, __TIME__);
   return true;
 }
 
@@ -1460,36 +1983,46 @@ static bool draw_hud_tile(const char* id, const char* title, const char* hotkey,
   const bool held = enabled && ImGui::IsItemActive();
   ImDrawList* dl = ImGui::GetWindowDrawList();
   const ImVec2 p1(p0.x + sz.x, p0.y + sz.y);
-  const float rnd = 10.f;
+  const float rnd = ui_px(SK().cardRadius * 0.62f);
+  // 悬停/按下的过渡量：控件是渐亮而不是硬跳。
+  const ImGuiID tile_id = ImGui::GetItemID();
+  const float hv = AnimTo(tile_id, hov, 16.f);
+  const float av = AnimTo(tile_id + 1u, held, 26.f);
 
-  ImU32 bg;
+  ImU32 top;
+  ImU32 bot;
   ImU32 edge;
   ImU32 bar;
   if (!enabled) {
-    bg = IM_COL32(24, 28, 36, 150);
-    edge = IM_COL32(70, 80, 96, 110);
-    bar = IM_COL32(80, 90, 110, 80);
+    top = skin::WithA(skin::Over(SK().card1, SK().win1), 150);
+    bot = top;
+    edge = skin::Fade(SK().text3, 0.45f);
+    bar = skin::Fade(SK().text3, 0.32f);
   } else if (active) {
-    bg = held ? IM_COL32(10, 72, 124, 250) : hov ? IM_COL32(16, 92, 154, 248)
-                                                 : IM_COL32(12, 58, 112, 240);
-    edge = IM_COL32(110, 220, 255, 240);
-    bar = IM_COL32(80, 230, 255, 255);
+    top = skin::Mix(SK().win1, SK().accent, 0.50f + 0.14f * hv + 0.12f * av);
+    bot = skin::Mix(SK().win1, SK().accent, 0.62f + 0.14f * hv + 0.12f * av);
+    edge = SK().accent2;
+    bar = SK().accent2;
   } else {
-    bg = held ? IM_COL32(26, 46, 74, 245) : hov ? IM_COL32(30, 50, 82, 240)
-                                                : IM_COL32(16, 22, 34, 230);
-    edge = hov ? IM_COL32(96, 168, 236, 220) : IM_COL32(64, 92, 128, 170);
-    bar = hov ? IM_COL32(90, 170, 240, 220) : IM_COL32(52, 96, 150, 140);
+    top = skin::Mix(PanelBg(), SK().accent, 0.14f * hv + 0.16f * av);
+    bot = skin::Mix(PanelBg(), skin::Darken(SK().win1, 0.35f), 0.55f);
+    edge = skin::Mix(EdgeIdle(), SK().accent, 0.55f * hv);
+    bar = skin::Fade(SK().accent, 0.55f + 0.30f * hv);
   }
 
-  dl->AddRectFilled(ImVec2(p0.x + 2.f, p0.y + 3.f), ImVec2(p1.x + 2.f, p1.y + 3.f),
-                    IM_COL32(0, 0, 0, 80), rnd);
-  dl->AddRectFilled(p0, p1, bg, rnd);
-  dl->PushClipRect(p0, p1, true);
-  dl->AddRectFilledMultiColor(p0, p1, IM_COL32(255, 255, 255, active ? 28 : 16),
-                              IM_COL32(255, 255, 255, active ? 28 : 16), IM_COL32(0, 0, 0, 0),
-                              IM_COL32(0, 0, 0, 0));
-  dl->PopClipRect();
-  dl->AddRect(p0, p1, edge, rnd, 0, (hov || active) ? 1.7f : 1.0f);
+  // 整块底板走 paint::Panel：投影、渐变、顶部高光、描边一次画完，
+  // 形状（圆角 / 切角）与描边宽度由皮肤决定。
+  PlateSpec ps;
+  ps.top = top;
+  ps.bot = bot;
+  ps.edge = edge;
+  ps.inner = skin::Fade(SK().cardInnerHi, active ? 0.16f : 0.08f);
+  ps.shadow = SK().shadow;
+  ps.dy = ui_px(2.f) + ui_px(2.f) * av;
+  ps.sigma = ui_px(4.f);
+  ps.sk = 1.f + 0.6f * hv;
+  ps.th = (hov || active) ? 1.6f : 1.f;
+  DrawPlate(dl, p0, p1, rnd, ps);
   dl->AddRectFilled(ImVec2(p0.x + 2.f, p0.y + 9.f), ImVec2(p0.x + 5.f, p1.y - 9.f), bar, 2.f);
 
   dl->PushClipRect(ImVec2(p0.x + 12.f, p0.y + 3.f), ImVec2(p1.x - 8.f, p1.y - 3.f), true);
@@ -1497,18 +2030,20 @@ static bool draw_hud_tile(const char* id, const char* title, const char* hotkey,
   const bool has_key = hotkey && hotkey[0];
   const float ty = p0.y + (has_key ? 7.f : (sz.y - ts.y) * 0.5f);
   dl->AddText(ImVec2(p0.x + 14.f, ty),
-              enabled ? IM_COL32(236, 244, 252, 255) : IM_COL32(150, 158, 170, 180),
+              enabled ? SK().text : skin::Fade(SK().text3, 0.90f),
               title ? title : "");
   if (has_key) {
     const ImVec2 bs = ImGui::CalcTextSize(hotkey);
     const ImVec2 b0(p1.x - bs.x - 14.f, p1.y - bs.y - 7.f);
     dl->AddRectFilled(ImVec2(b0.x - 6.f, b0.y - 2.f), ImVec2(p1.x - 8.f, b0.y + bs.y + 2.f),
-                      IM_COL32(6, 14, 26, 200), 4.f);
-    dl->AddText(b0, enabled ? IM_COL32(150, 206, 255, 240) : IM_COL32(120, 140, 160, 140),
+                      ChipBg(), 4.f);
+    dl->AddText(b0, enabled ? skin::Fade(SK().accent2, 0.94f) : skin::Fade(SK().text3, 0.70f),
                 hotkey);
   }
   if (active) {
-    dl->AddCircleFilled(ImVec2(p1.x - 12.f, p0.y + 12.f), 3.5f, IM_COL32(140, 255, 220, 245));
+    const ImVec2 dot(p1.x - 12.f, p0.y + 12.f);
+    paint::Glow(dl, dot, ui_px(4.f), SK().accentGlow, 3);
+    dl->AddCircleFilled(dot, 3.5f, SK().accent2);
   }
   dl->PopClipRect();
 
@@ -1526,19 +2061,35 @@ static bool draw_nav_item(const char* id, const char* label, bool selected) {
   const bool hov = ImGui::IsItemHovered();
   ImDrawList* dl = ImGui::GetWindowDrawList();
   const ImVec2 p1(p0.x + w, p0.y + h);
-  if (selected || hov) {
-    const ImU32 bg = selected ? IM_COL32(14, 52, 98, 235) : IM_COL32(26, 36, 52, 190);
-    dl->AddRectFilled(p0, p1, bg, 7.f);
-    dl->AddRect(p0, p1, selected ? IM_COL32(90, 196, 255, 200) : IM_COL32(70, 100, 140, 120),
-                7.f, 0, 1.f);
+  const float rnd = ui_px(SK().cardRadius * 0.46f);
+  const float hv = AnimTo(ImGui::GetItemID(), hov || selected, 18.f);
+  if (hv > 0.01f) {
+    PlateSpec ps;
+    if (selected) {
+      ps.top = skin::Mix(SK().win1, SK().accent, 0.34f);
+      ps.bot = skin::Mix(SK().win1, SK().accent, 0.46f);
+      ps.edge = EdgeHot();
+      ps.inner = skin::Fade(SK().accent2, 0.22f);
+      ps.th = 1.2f;
+    } else {
+      ps.top = skin::Fade(SK().cardInnerHi, 0.10f * hv);
+      ps.bot = skin::Fade(SK().cardInnerLo, 0.30f * hv);
+      ps.edge = skin::Fade(EdgeIdle(), hv);
+    }
+    ps.shadow = selected ? SK().shadow : 0;
+    ps.dy = ui_px(1.f);
+    ps.sigma = ui_px(2.5f);
+    ps.sk = 1.f;
+    DrawPlate(dl, p0, p1, rnd, ps);
   }
   if (selected) {
+    // 左侧指示条：选中态的唯一"硬"元素，切角皮肤下同样保持竖直。
     dl->AddRectFilled(ImVec2(p0.x + 1.f, p0.y + 5.f), ImVec2(p0.x + 4.f, p1.y - 5.f),
-                      IM_COL32(110, 220, 255, 255), 2.f);
+                      SK().accent2, 2.f);
   }
   const ImVec2 ts = ImGui::CalcTextSize(label ? label : "");
   dl->AddText(ImVec2(p0.x + 12.f, p0.y + (h - ts.y) * 0.5f),
-              selected ? IM_COL32(220, 242, 255, 255) : IM_COL32(186, 198, 214, 235),
+              selected ? SK().text : skin::Mix(skin::Fade(SK().text2, 0.94f), SK().text, hv),
               label ? label : "");
   ImGui::PopID();
   return pressed;
@@ -1623,8 +2174,8 @@ static bool draw_gear_button(const char* id, const char* tip, bool* right_click)
   ImDrawList* dl = ImGui::GetWindowDrawList();
   const ImVec2 c(p0.x + s * 0.5f, p0.y + s * 0.5f);
   const float r = s * 0.22f;
-  const ImU32 col = hov ? IM_COL32(150, 214, 255, 255) : IM_COL32(168, 184, 204, 230);
-  if (hov) dl->AddCircleFilled(c, s * 0.40f, IM_COL32(36, 64, 102, 200), 18);
+  const ImU32 col = hov ? SK().accent2 : skin::Fade(SK().text2, 0.92f);
+  if (hov) paint::Glow(dl, c, s * 0.40f, SK().accentGlow, 3);
   dl->AddCircle(c, r, col, 16, 1.7f);
   dl->AddCircleFilled(c, r * 0.42f, col, 12);
   for (int i = 0; i < 8; ++i) {
@@ -1634,7 +2185,7 @@ static bool draw_gear_button(const char* id, const char* tip, bool* right_click)
     dl->AddLine(ImVec2(c.x + cs * (r * 0.72f), c.y + sn * (r * 0.72f)),
                 ImVec2(c.x + cs * (r + s * 0.16f), c.y + sn * (r + s * 0.16f)), col, 2.2f);
   }
-  if (hov && tip && tip[0]) ImGui::SetTooltip("%s", tip);
+  if (hov && tip && tip[0]) Tip("%s", tip);
   ImGui::PopID();
   return pressed;
 }
@@ -1647,19 +2198,44 @@ static bool draw_switch(const char* id, bool on, bool enabled) {
   const bool pressed = ImGui::InvisibleButton("##sw", ImVec2(w, h));
   const bool hov = ImGui::IsItemHovered();
   ImDrawList* dl = ImGui::GetWindowDrawList();
-  const ImU32 track = !enabled ? IM_COL32(46, 52, 62, 150)
-                               : on ? IM_COL32(22, 118, 176, 245) : IM_COL32(46, 54, 68, 235);
-  const ImU32 knob = !enabled ? IM_COL32(140, 148, 158, 170)
-                              : on ? IM_COL32(236, 250, 255, 255) : IM_COL32(176, 188, 204, 235);
-  dl->AddRectFilled(p0, ImVec2(p0.x + w, p0.y + h), track, h * 0.5f);
-  dl->AddRect(p0, ImVec2(p0.x + w, p0.y + h),
-              on && enabled ? IM_COL32(120, 214, 255, 220) : IM_COL32(86, 100, 120, 150), h * 0.5f,
-              0, 1.3f);
+  const ImGuiID sid = ImGui::GetItemID();
+  const float hv = AnimTo(sid, hov, 18.f);
+  // 开/关也要过渡：滑块滑过去、轨道渐亮，而不是瞬间跳到另一侧。
+  const float tv = AnimTo(sid + 1u, on, 20.f);
+  const ImVec2 p1(p0.x + w, p0.y + h);
+
+  PlateSpec ps;
+  if (!enabled) {
+    ps.top = skin::WithA(skin::Over(SK().card1, SK().win1), 150);
+    ps.bot = ps.top;
+    ps.edge = skin::Fade(SK().text3, 0.40f);
+  } else {
+    const ImU32 off = skin::WithA(skin::Over(SK().card0, SK().win1), 235);
+    const ImU32 on_c = skin::Mix(SK().win1, SK().accent, 0.62f + 0.14f * hv);
+    ps.top = skin::Mix(off, on_c, tv);
+    ps.bot = skin::Mix(skin::Darken(off, 0.25f), skin::Mix(on_c, SK().accent, 0.35f), tv);
+    ps.edge = skin::Mix(skin::Fade(SK().text3, 0.55f), skin::Fade(SK().accent2, 0.90f), tv);
+    ps.inner = skin::Fade(SK().cardInnerHi, 0.10f + 0.10f * tv);
+  }
+  ps.shadow = skin::Fade(SK().shadow, 0.55f);
+  ps.dy = ui_px(1.f);
+  ps.sigma = ui_px(2.f);
+  ps.th = 1.3f;
+  // 轨道用胶囊圆角；切角皮肤下 paint 会改用八角形，看得到棱角。
+  DrawPlate(dl, p0, p1, h * 0.5f, ps);
+
   const float pad = 3.f;
   const float kr = (h - pad * 2.f) * 0.5f;
-  const float kx = on ? (p0.x + w - pad - kr) : (p0.x + pad + kr);
-  dl->AddCircleFilled(ImVec2(kx, p0.y + h * 0.5f), kr, knob, 18);
-  if (hov) ImGui::SetTooltip("%s", !enabled ? u8"请先注入" : on ? u8"点击关闭" : u8"点击开启");
+  const float kx = p0.x + pad + kr + (w - pad * 2.f - kr * 2.f) * tv;
+  const ImVec2 kc(kx, p0.y + h * 0.5f);
+  const ImU32 knob = !enabled ? skin::Fade(SK().text3, 0.85f)
+                              : skin::Mix(skin::Fade(SK().knob1, 0.92f), SK().knob0, tv);
+  if (enabled && tv > 0.02f) {
+    paint::Glow(dl, kc, kr * 1.4f, skin::Fade(SK().accentGlow, 0.55f * tv), 3);
+  }
+  paint::Knob(dl, kc, kr, knob, skin::Darken(knob, 0.22f), SK().shadow, ui_px(1.f),
+              ui_px(2.2f), SK().shadowK * 0.9f);
+  if (hov) Tip("%s", !enabled ? u8"请先注入" : on ? u8"点击关闭" : u8"点击开启");
   ImGui::PopID();
   return enabled && pressed;
 }
@@ -1748,15 +2324,21 @@ static void draw_hotkey_row(const game_api::FeatureInfo* f, bool armed, bool as_
   const ImVec2 origin = ImGui::GetCursorScreenPos();
   const float row_h = gear;
   ImDrawList* dl = ImGui::GetWindowDrawList();
-  dl->AddRectFilled(origin, ImVec2(origin.x + avail, origin.y + row_h), IM_COL32(16, 22, 34, 215),
-                    8.f);
-  dl->AddRect(origin, ImVec2(origin.x + avail, origin.y + row_h), IM_COL32(58, 84, 116, 150), 8.f,
-              0, 1.f);
+  {
+    PlateSpec ps;
+    ps.top = PanelBg();
+    ps.bot = skin::Mix(PanelBg(), SK().win1, 0.40f);
+    ps.edge = EdgeIdle();
+    ps.inner = skin::Fade(SK().cardInnerHi, 0.05f);
+    ps.th = 1.f;
+    DrawPlate(dl, origin, ImVec2(origin.x + avail, origin.y + row_h),
+              ui_px(SK().cardRadius * 0.5f), ps);
+  }
 
   const ImVec2 ts = ImGui::CalcTextSize(f->label);
   dl->PushClipRect(ImVec2(origin.x + 4.f, origin.y), ImVec2(origin.x + name_w - 4.f, origin.y + row_h),
                    true);
-  dl->AddText(ImVec2(origin.x + 12.f, origin.y + (row_h - ts.y) * 0.5f), IM_COL32(232, 240, 248, 255),
+  dl->AddText(ImVec2(origin.x + 12.f, origin.y + (row_h - ts.y) * 0.5f), SK().text,
               f->label);
   dl->PopClipRect();
   ImGui::Dummy(ImVec2(name_w, row_h));
@@ -1836,22 +2418,29 @@ static void draw_compact_cell(const game_api::FeatureInfo* f, int cols) {
   const ImVec2 origin = ImGui::GetCursorScreenPos();
   ImDrawList* dl = ImGui::GetWindowDrawList();
   const bool on = as_switch && game_api::feature_enabled(f->key);
-  dl->AddRectFilled(origin, ImVec2(origin.x + g_pair_w, origin.y + row_h),
-                    on ? IM_COL32(12, 40, 72, 230) : IM_COL32(16, 22, 34, 215), 6.f);
-  dl->AddRect(origin, ImVec2(origin.x + g_pair_w, origin.y + row_h),
-              on ? IM_COL32(90, 190, 240, 200) : IM_COL32(58, 84, 116, 150), 6.f, 0, 1.f);
+  {
+    // 行底板：开着的行整块染 accent，未开的行只给一层极淡的高光。
+    PlateSpec ps;
+    const float r = ui_px(SK().cardRadius * 0.38f);
+    ps.top = on ? skin::Mix(PanelBg(), SK().accent, 0.30f) : PanelBg();
+    ps.bot = on ? skin::Mix(PanelBg(), SK().accent, 0.20f) : skin::Mix(PanelBg(), SK().win1, 0.35f);
+    ps.edge = on ? skin::Mix(EdgeIdle(), SK().accent, 0.72f) : EdgeIdle();
+    ps.inner = skin::Fade(SK().cardInnerHi, on ? 0.10f : 0.05f);
+    ps.th = 1.f;
+    DrawPlate(dl, origin, ImVec2(origin.x + g_pair_w, origin.y + row_h), r, ps);
+  }
 
   const bool name_click = ImGui::InvisibleButton("##name", ImVec2(name_w, row_h));
   if (ImGui::IsItemHovered()) {
     const char* hk = game_api::hotkey_hint(f->key);
-    if (hk && hk[0]) ImGui::SetTooltip("%s\n%s", f->label, hk);
-    else ImGui::SetTooltip("%s", f->label);
+    if (hk && hk[0]) Tip("%s\n%s", f->label, hk);
+    else Tip("%s", f->label);
   }
   const ImVec2 ts = ImGui::CalcTextSize(f->label);
   dl->PushClipRect(ImVec2(origin.x + 2.f, origin.y), ImVec2(origin.x + name_w - 2.f, origin.y + row_h),
                    true);
   dl->AddText(ImVec2(origin.x + 8.f, origin.y + (row_h - ts.y) * 0.5f),
-              action_ok ? IM_COL32(232, 240, 248, 255) : IM_COL32(150, 158, 170, 180), f->label);
+              action_ok ? SK().text : skin::Fade(SK().text3, 0.90f), f->label);
   dl->PopClipRect();
   if (has_hk) {
     ImGui::SameLine(0.f, inner);
@@ -1893,10 +2482,16 @@ static void draw_money_cell(const game_api::FeatureInfo* f, int cols) {
   ImGui::PushID(f->key);
   const ImVec2 origin = ImGui::GetCursorScreenPos();
   ImDrawList* dl = ImGui::GetWindowDrawList();
-  dl->AddRectFilled(origin, ImVec2(origin.x + g_pair_w, origin.y + row_h), IM_COL32(16, 22, 34, 215),
-                    6.f);
-  dl->AddRect(origin, ImVec2(origin.x + g_pair_w, origin.y + row_h), IM_COL32(58, 84, 116, 150), 6.f,
-              0, 1.f);
+  {
+    PlateSpec ps;
+    const float r = ui_px(SK().cardRadius * 0.38f);
+    ps.top = PanelBg();
+    ps.bot = skin::Mix(PanelBg(), SK().win1, 0.40f);
+    ps.edge = EdgeIdle();
+    ps.inner = skin::Fade(SK().cardInnerHi, 0.05f);
+    ps.th = 1.f;
+    DrawPlate(dl, origin, ImVec2(origin.x + g_pair_w, origin.y + row_h), r, ps);
+  }
 
   const bool name_click = ImGui::InvisibleButton("##name", ImVec2(name_w, row_h));
   const bool name_right = ImGui::IsItemClicked(ImGuiMouseButton_Right);
@@ -1904,21 +2499,21 @@ static void draw_money_cell(const game_api::FeatureInfo* f, int cols) {
     const char* hk = game_api::hotkey_hint(f->key);
     if (sel) {
       if (hk && hk[0]) {
-        ImGui::SetTooltip(u8"%s\n每次 %d\n%s\n点击名称修改每次金额", f->label, step, hk);
+        Tip(u8"%s\n每次 %d\n%s\n点击名称修改每次金额", f->label, step, hk);
       } else {
-        ImGui::SetTooltip(u8"%s\n每次 %d\n点击名称修改每次金额", f->label, step);
+        Tip(u8"%s\n每次 %d\n点击名称修改每次金额", f->label, step);
       }
     } else if (hk && hk[0]) {
-      ImGui::SetTooltip(u8"%s\n每次 %d\n%s\n点击名称修改每次金额", f->label, step, hk);
+      Tip(u8"%s\n每次 %d\n%s\n点击名称修改每次金额", f->label, step, hk);
     } else {
-      ImGui::SetTooltip(u8"%s\n每次 %d\n点击名称修改每次金额", f->label, step);
+      Tip(u8"%s\n每次 %d\n点击名称修改每次金额", f->label, step);
     }
   }
   if (name_click || name_right) ImGui::OpenPopup("##step");
   const ImVec2 ts = ImGui::CalcTextSize(f->label);
   dl->PushClipRect(ImVec2(origin.x + 2.f, origin.y), ImVec2(origin.x + name_w - 2.f, origin.y + row_h),
                    true);
-  dl->AddText(ImVec2(origin.x + 8.f, origin.y + (row_h - ts.y) * 0.5f), IM_COL32(232, 240, 248, 255),
+  dl->AddText(ImVec2(origin.x + 8.f, origin.y + (row_h - ts.y) * 0.5f), SK().text,
               f->label);
   dl->PopClipRect();
   if (ImGui::BeginPopup("##step")) {
@@ -1944,7 +2539,7 @@ static void draw_money_cell(const game_api::FeatureInfo* f, int cols) {
     game_api::beep(ok ? "click" : "error");
   }
   if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip(u8"+ %d", sel ? game_api::money_sel_step() : game_api::money_self_step());
+    Tip(u8"+ %d", sel ? game_api::money_sel_step() : game_api::money_self_step());
   }
   ImGui::SameLine(0.f, 2.f);
   if (ImGui::Button("-", ImVec2(btn_w, row_h))) {
@@ -1956,7 +2551,7 @@ static void draw_money_cell(const game_api::FeatureInfo* f, int cols) {
     game_api::beep(ok ? "click" : "error");
   }
   if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip(u8"- %d", sel ? game_api::money_sel_step() : game_api::money_self_step());
+    Tip(u8"- %d", sel ? game_api::money_sel_step() : game_api::money_self_step());
   }
   ImGui::PopID();
   end_grid_cell();
@@ -1969,19 +2564,32 @@ static bool draw_mcv_choice(const char* id, const char* type_id, const char* tip
   const bool pressed = ImGui::InvisibleButton("##mcv", ImVec2(s, s));
   const bool hov = ImGui::IsItemHovered();
   ImDrawList* dl = ImGui::GetWindowDrawList();
-  const ImU32 bg = selected ? IM_COL32(12, 48, 88, 245) : IM_COL32(16, 22, 34, 235);
-  const ImU32 edge = selected ? IM_COL32(110, 220, 255, 255)
-                              : hov ? IM_COL32(96, 168, 236, 230) : IM_COL32(64, 92, 128, 180);
-  dl->AddRectFilled(p0, ImVec2(p0.x + s, p0.y + s), bg, 8.f);
-  dl->AddRect(p0, ImVec2(p0.x + s, p0.y + s), edge, 8.f, 0, selected ? 2.2f : 1.2f);
+  const float hv = AnimTo(ImGui::GetItemID(), hov, 18.f);
+  const float sel = selected ? 1.f : 0.f;
+  const ImVec2 p1(p0.x + s, p0.y + s);
+  {
+    PlateSpec ps;
+    ps.top = skin::Mix(PanelBg(), SK().accent, 0.30f * sel + 0.10f * hv);
+    ps.bot = skin::Mix(PanelBg(), SK().win1, 0.30f - 0.20f * sel);
+    ps.edge = skin::Mix(EdgeIdle(), skin::Mix(SK().accent, SK().accent2, sel),
+                        0.62f * hv + 0.38f * sel);
+    ps.inner = skin::Fade(SK().cardInnerHi, selected ? 0.12f : 0.06f);
+    ps.shadow = selected ? skin::Fade(SK().shadow, 0.7f) : 0;
+    ps.dy = ui_px(1.f);
+    ps.sigma = ui_px(2.5f);
+    ps.th = selected ? 1.8f : 1.f;
+    DrawPlate(dl, p0, p1, ui_px(SK().cardRadius * 0.48f), ps);
+  }
   IDirect3DTexture9* tex = unit_icons::get(type_id, "MCV", false);
   if (tex) {
     dl->AddImage((ImTextureID)tex, ImVec2(p0.x + 4.f, p0.y + 4.f), ImVec2(p0.x + s - 4.f, p0.y + s - 4.f));
   }
   if (selected) {
-    dl->AddCircleFilled(ImVec2(p0.x + s - 10.f, p0.y + 10.f), 3.5f, IM_COL32(140, 255, 220, 245));
+    const ImVec2 dot(p0.x + s - 10.f, p0.y + 10.f);
+    paint::Glow(dl, dot, 4.f, SK().accentGlow, 3);
+    dl->AddCircleFilled(dot, 3.5f, SK().accent2);
   }
-  if (hov) ImGui::SetTooltip("%s", tip);
+  if (hov) Tip("%s", tip);
   ImGui::PopID();
   return pressed;
 }
@@ -2006,33 +2614,44 @@ static int draw_danger_slider(int level, bool enabled, float width) {
     if (picked > 2) picked = 2;
   }
   if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip(u8"拖动选择：正常 / 高 / 最高");
+    Tip(u8"拖动选择：正常 / 高 / 最高");
   }
 
   ImDrawList* dl = ImGui::GetWindowDrawList();
   const float rnd = h * 0.45f;
   const float seg = w / 3.f;
-  ImU32 accent = IM_COL32(90, 100, 116, 160);
+  ImU32 accent = skin::Fade(SK().text3, 0.62f);
   if (enabled) {
-    accent = picked == 2 ? IM_COL32(255, 96, 88, 255)
-                          : picked == 1 ? IM_COL32(255, 186, 72, 255)
-                                        : IM_COL32(90, 210, 255, 255);
+    accent = picked == 2 ? SK().bad : picked == 1 ? SK().warn : SK().accent2;
   }
-  dl->AddRectFilled(origin, ImVec2(origin.x + w, origin.y + h), IM_COL32(10, 16, 26, 235), rnd);
-  const float xL = origin.x + seg * (float)picked;
-  const float xR = xL + seg;
-  ImDrawFlags corners = ImDrawFlags_RoundCornersNone;
-  if (picked == 0) corners = ImDrawFlags_RoundCornersLeft;
-  else if (picked == 2) corners = ImDrawFlags_RoundCornersRight;
-  const ImU32 fill = enabled ? (accent & 0x00FFFFFFu) | 0x55000000u : IM_COL32(70, 80, 96, 80);
-  dl->AddRectFilled(ImVec2(xL, origin.y), ImVec2(xR, origin.y + h), fill, rnd, corners);
-  dl->AddRect(origin, ImVec2(origin.x + w, origin.y + h),
-              enabled ? accent : IM_COL32(80, 90, 108, 140), rnd, 0, 1.2f);
+  // 轨道：整条凹槽。形状随皮肤（圆角 / 切角），描边用当前档位的语义色。
+  {
+    PlateSpec ps;
+    ps.top = FieldBg();
+    ps.bot = skin::Mix(FieldBg(), SK().win1, 0.35f);
+    ps.edge = enabled ? skin::Fade(accent, 0.90f) : skin::Fade(SK().text3, 0.55f);
+    ps.inner = skin::Fade(SK().cardInnerLo, 0.55f);
+    ps.th = 1.2f;
+    DrawPlate(dl, origin, ImVec2(origin.x + w, origin.y + h), rnd, ps);
+  }
+  // 选中段：内缩一圈单独画，避免用 ImDrawFlags 圆角标志
+  //（切角形状下那套标志无效，会露出直角）。
+  {
+    const float inset = 2.f;
+    const float xL = origin.x + seg * (float)picked + inset;
+    const float xR = xL + seg - inset * 2.f;
+    PlateSpec ps;
+    ps.top = skin::Fade(accent, enabled ? 0.42f : 0.22f);
+    ps.bot = skin::Fade(accent, enabled ? 0.26f : 0.13f);
+    ps.edge = skin::Fade(accent, enabled ? 0.80f : 0.30f);
+    ps.th = 1.f;
+    DrawPlate(dl, ImVec2(xL, origin.y + inset), ImVec2(xR, origin.y + h - inset),
+              std::max(0.f, rnd - inset), ps);
+  }
   for (int i = 0; i < 3; ++i) {
     const ImVec2 ts = ImGui::CalcTextSize(names[i]);
     const float tx = origin.x + seg * ((float)i + 0.5f) - ts.x * 0.5f;
-    const ImU32 tc = (enabled && i == picked) ? IM_COL32(244, 250, 255, 255)
-                                               : IM_COL32(150, 164, 182, 210);
+    const ImU32 tc = (enabled && i == picked) ? SK().text : skin::Fade(SK().text2, 0.84f);
     dl->AddText(ImVec2(tx, origin.y + (h - ts.y) * 0.5f), tc, names[i]);
   }
   ImGui::PopID();
@@ -2063,7 +2682,7 @@ static int draw_rank_slider(int level, bool* dragging) {
     if (picked > 3) picked = 3;
   }
   if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip(u8"拖动选择出场等级：不设置 / 一级 / 二级 / 三级");
+    Tip(u8"拖动选择出场等级：不设置 / 一级 / 二级 / 三级");
   }
 
   ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -2072,27 +2691,47 @@ static int draw_rank_slider(int level, bool* dragging) {
   const float x1 = origin.x + w - pad;
   const float span = std::max(1.f, x1 - x0);
   const float gx = x0 + span * ((float)picked / 3.f);
-  ImU32 accent = IM_COL32(150, 160, 172, 220);
-  if (picked == 1) accent = IM_COL32(90, 210, 255, 255);
-  else if (picked == 2) accent = IM_COL32(255, 186, 72, 255);
-  else if (picked == 3) accent = IM_COL32(255, 120, 72, 255);
-  const float track_h = 6.f;
-  dl->AddRectFilled(ImVec2(x0, cy - track_h * 0.5f), ImVec2(x1, cy + track_h * 0.5f),
-                    IM_COL32(16, 22, 34, 235), track_h);
-  dl->AddRectFilled(ImVec2(x0, cy - track_h * 0.5f), ImVec2(gx, cy + track_h * 0.5f), accent,
-                    track_h);
+  ImU32 accent = skin::Fade(SK().text3, 0.88f);
+  if (picked == 1) accent = SK().accent2;
+  else if (picked == 2) accent = SK().warn;
+  else if (picked == 3) accent = SK().bad;
+  const float track_h = 7.f;
+  {
+    // 轨道凹槽 + 已选区间的亮条。用 plate 而不是 AddRectFilled，
+    // 切角皮肤下轨道两端也是斜的，不会突然冒出直角。
+    PlateSpec ps;
+    ps.top = FieldBg();
+    ps.bot = skin::Mix(FieldBg(), SK().win1, 0.40f);
+    ps.edge = skin::Fade(EdgeIdle(), 0.80f);
+    ps.inner = skin::Fade(SK().cardInnerLo, 0.45f);
+    ps.th = 1.f;
+    DrawPlate(dl, ImVec2(x0, cy - track_h * 0.5f), ImVec2(x1, cy + track_h * 0.5f),
+              track_h * 0.5f, ps);
+
+    if (gx > x0 + 1.f) {
+      PlateSpec f;
+      f.top = skin::Fade(accent, 0.85f);
+      f.bot = skin::Darken(accent, 0.25f);
+      f.edge = skin::Fade(accent, 0.55f);
+      f.th = 0.8f;
+      DrawPlate(dl, ImVec2(x0, cy - track_h * 0.5f), ImVec2(gx, cy + track_h * 0.5f),
+                track_h * 0.5f, f);
+    }
+  }
   for (int i = 0; i < 4; ++i) {
     const float tx = x0 + span * ((float)i / 3.f);
     const bool lit = i <= picked;
     dl->AddCircleFilled(ImVec2(tx, cy), i == picked ? 3.2f : 2.2f,
-                        lit ? accent : IM_COL32(70, 86, 108, 210));
+                        lit ? accent : skin::Fade(SK().text3, 0.55f));
     const ImVec2 ts = ImGui::CalcTextSize(names[i]);
-    const ImU32 tc = i == picked ? accent : IM_COL32(160, 172, 188, 210);
+    const ImU32 tc = i == picked ? accent : skin::Fade(SK().text2, 0.84f);
     dl->AddText(ImVec2(tx - ts.x * 0.5f, origin.y + track_y + grab_r + 4.f), tc, names[i]);
   }
-  dl->AddCircleFilled(ImVec2(gx, cy), grab_r, IM_COL32(10, 16, 26, 255));
+  paint::Shadow(dl, ImVec2(gx - grab_r, cy - grab_r), ImVec2(gx + grab_r, cy + grab_r), grab_r,
+                SK().shadow, 1.5f, 3.f, SK().shadowK);
+  dl->AddCircleFilled(ImVec2(gx, cy), grab_r, ChipBg());
   dl->AddCircleFilled(ImVec2(gx, cy), grab_r - 3.2f, accent);
-  dl->AddCircle(ImVec2(gx, cy), grab_r, IM_COL32(230, 244, 255, 230), 0, 1.4f);
+  dl->AddCircle(ImVec2(gx, cy), grab_r, skin::Fade(SK().cardInnerHi, 0.90f), 0, 1.4f);
   ImGui::PopID();
   return picked;
 }
@@ -2126,10 +2765,16 @@ static bool draw_summon_icon(const char* tip, const char* icon_id, const char* i
   const bool hovered = ImGui::IsItemHovered();
   const bool clicked = ImGui::IsItemClicked();
   ImDrawList* draw = ImGui::GetWindowDrawList();
-  draw->AddRectFilled(p0, ImVec2(p0.x + kIcon, p0.y + kIcon), IM_COL32(16, 22, 32, 220), ui_px(4.f));
-  draw->AddRect(p0, ImVec2(p0.x + kIcon, p0.y + kIcon),
-                hovered ? IM_COL32(255, 214, 120, 255) : IM_COL32(70, 96, 130, 255), ui_px(4.f), 0,
-                hovered ? 2.f : 1.f);
+  {
+    PlateSpec ps;
+    const float hvk = AnimTo(ImGui::GetItemID(), hovered, 18.f);
+    ps.top = skin::Mix(PanelBg(), SK().money, 0.08f * hvk);
+    ps.bot = skin::Mix(PanelBg(), SK().win1, 0.30f);
+    ps.edge = skin::Mix(EdgeIdle(), SK().money, hvk);
+    ps.inner = skin::Fade(SK().cardInnerHi, 0.06f);
+    ps.th = hovered ? 1.8f : 1.f;
+    DrawPlate(draw, p0, ImVec2(p0.x + kIcon, p0.y + kIcon), ui_px(SK().cardRadius * 0.30f), ps);
+  }
   IDirect3DTexture9* tex = nullptr;
   if (icon_id && icon_id[0]) tex = unit_icons::get(icon_id, icon_name, false);
   if (tex) {
@@ -2157,14 +2802,14 @@ static bool draw_summon_icon(const char* tip, const char* icon_id, const char* i
     label[taken] = 0;
     const ImVec2 ts = ImGui::CalcTextSize(label);
     draw->AddText(ImVec2(p0.x + (kIcon - ts.x) * 0.5f, p0.y + (kIcon - ts.y) * 0.5f),
-                  hovered ? IM_COL32(255, 226, 160, 255) : IM_COL32(196, 210, 232, 255), label);
+                  hovered ? SK().money : skin::Fade(SK().text, 0.88f), label);
   }
   if (hovered && tip && tip[0]) {
-    ImGui::BeginTooltip();
+    TipBegin();
     ImGui::TextUnformatted(tip);
     if (icon_id && icon_id[0] && tip != icon_id) ImGui::TextDisabled("%s", icon_id);
     if (removable) ImGui::TextDisabled(u8"点击拿掉");
-    ImGui::EndTooltip();
+    TipEnd();
   }
   return clicked;
 }
@@ -2276,8 +2921,16 @@ static void draw_summon_candidate_box(const game_api::BuildLockEntry* cat, int c
   const ImVec2 r1 = ImGui::GetItemRectMax();
 
   dl->ChannelsSetCurrent(0);
-  dl->AddRectFilled(r0, ImVec2(r0.x + full_w, r1.y), IM_COL32(12, 18, 28, 220), 6.f);
-  dl->AddRect(r0, ImVec2(r0.x + full_w, r1.y), IM_COL32(70, 96, 130, 220), 6.f, 0, 1.2f);
+  {
+    // 候选槽：内嵌的"料盘"，比普通行再凹一层（渐变反向 + 无投影）。
+    PlateSpec ps;
+    ps.top = skin::Mix(PanelBgAlt(), SK().win1, 0.45f);
+    ps.bot = skin::Mix(PanelBgAlt(), SK().win1, 0.25f);
+    ps.edge = skin::Fade(EdgeIdle(), 0.85f);
+    ps.inner = skin::Fade(SK().cardInnerLo, 0.55f);
+    ps.th = 1.2f;
+    DrawPlate(dl, r0, ImVec2(r0.x + full_w, r1.y), ui_px(SK().cardRadius * 0.42f), ps);
+  }
   dl->ChannelsMerge();
   if (remove_at >= 0 && remove_at < (int)g_summon_sel.size()) {
     g_summon_sel.erase(g_summon_sel.begin() + remove_at);
@@ -2461,10 +3114,16 @@ static void draw_summon_unit_icons() {
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
         ImGui::InvisibleButton("##ico_missing", ImVec2(kIcon, kIcon));
         ImDrawList* draw = ImGui::GetWindowDrawList();
-        draw->AddRectFilled(p0, ImVec2(p0.x + kIcon, p0.y + kIcon),
-                            IM_COL32(16, 22, 32, 140), ui_px(4.f));
-        draw->AddRect(p0, ImVec2(p0.x + kIcon, p0.y + kIcon), IM_COL32(60, 66, 78, 200),
-                      ui_px(4.f));
+        {
+          // 本版本没有的对象：不投影、不描亮，只留一个压暗的空位。
+          PlateSpec ps;
+          ps.top = skin::Fade(PanelBg(), 0.62f);
+          ps.bot = ps.top;
+          ps.edge = skin::Fade(EdgeIdle(), 0.55f);
+          ps.th = 1.f;
+          DrawPlate(draw, p0, ImVec2(p0.x + kIcon, p0.y + kIcon),
+                    ui_px(SK().cardRadius * 0.30f), ps);
+        }
         char label[24] = {};
         size_t taken = 0;
         for (size_t k = 0; extra.name[k] && taken < sizeof(label) - 1;) {
@@ -2479,13 +3138,13 @@ static void draw_summon_unit_icons() {
         label[taken] = 0;
         const ImVec2 ts = ImGui::CalcTextSize(label);
         draw->AddText(ImVec2(p0.x + (kIcon - ts.x) * 0.5f, p0.y + (kIcon - ts.y) * 0.5f),
-                      IM_COL32(110, 118, 132, 255), label);
+                      skin::Fade(SK().text3, 0.90f), label);
         if (ImGui::IsItemHovered()) {
-          ImGui::BeginTooltip();
+          TipBegin();
           ImGui::TextUnformatted(extra.name);
           ImGui::TextDisabled("%s", extra.id);
           ImGui::TextDisabled(u8"本版本的对象模板库里没有这个对象");
-          ImGui::EndTooltip();
+          TipEnd();
         }
       }
       ImGui::PopID();
@@ -2560,16 +3219,23 @@ static uint32_t draw_player_picker(const char* scope, uint32_t* selected) {
     const bool on = s.player == *selected;
     const bool hov = ImGui::IsItemHovered();
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImU32 bg = on ? IM_COL32(12, 48, 88, 245) : IM_COL32(16, 22, 34, 230);
-    const ImU32 edge = on ? IM_COL32(110, 220, 255, 255)
-                          : hov ? IM_COL32(96, 168, 236, 220) : IM_COL32(64, 92, 128, 170);
-    dl->AddRectFilled(p0, ImVec2(p0.x + w, p0.y + h), bg, 6.f);
-    dl->AddRect(p0, ImVec2(p0.x + w, p0.y + h), edge, 6.f, 0, on ? 1.6f : 1.f);
+    const float hv = AnimTo(ImGui::GetItemID(), hov, 18.f);
+    const float selk = on ? 1.f : 0.f;
+    {
+      PlateSpec ps;
+      ps.top = skin::Mix(PanelBg(), SK().accent, 0.30f * selk + 0.08f * hv);
+      ps.bot = skin::Mix(PanelBg(), SK().win1, 0.32f - 0.22f * selk);
+      ps.edge = skin::Mix(EdgeIdle(), skin::Mix(SK().accent, SK().accent2, selk),
+                          0.62f * hv + 0.38f * selk);
+      ps.inner = skin::Fade(SK().cardInnerHi, on ? 0.10f : 0.05f);
+      ps.th = on ? 1.6f : 1.f;
+      DrawPlate(dl, p0, ImVec2(p0.x + w, p0.y + h), ui_px(SK().cardRadius * 0.34f), ps);
+    }
     const ImU32 dot = s.has_color ? IM_COL32(s.color_r, s.color_g, s.color_b, 255)
-                                  : (s.is_local ? IM_COL32(240, 200, 80, 255) : IM_COL32(140, 170, 210, 255));
+                                  : (s.is_local ? SK().money : skin::Fade(SK().text2, 0.95f));
     dl->AddRectFilled(ImVec2(p0.x + 6.f, p0.y + (h - 12.f) * 0.5f),
                       ImVec2(p0.x + 18.f, p0.y + (h + 12.f) * 0.5f), dot, 2.f);
-    dl->AddText(ImVec2(p0.x + 22.f, p0.y + (h - ts.y) * 0.5f), IM_COL32(232, 240, 248, 255), label);
+    dl->AddText(ImVec2(p0.x + 22.f, p0.y + (h - ts.y) * 0.5f), SK().text, label);
     ImGui::PopID();
     ImGui::PopID();
     if (pressed) *selected = s.player;
@@ -2646,7 +3312,7 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
                                                       : game_api::money_self_step());
     std::snprintf(sub_l, sizeof(sub_l), u8"- %d", sel ? game_api::money_sel_step()
                                                       : game_api::money_self_step());
-    if (ImGui::Button(add_l, ImVec2(140, 0))) {
+    if (ImGui::Button(add_l, ImVec2(ui_px(140.f), 0))) {
       std::string msg;
       bool ok = sel ? game_api::adjust_selected_player_money(game_api::money_sel_step(), &msg)
                     : game_api::adjust_local_money(game_api::money_self_step(), &msg);
@@ -2654,7 +3320,7 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
       game_api::beep(ok ? "click" : "error");
     }
     ImGui::SameLine();
-    if (ImGui::Button(sub_l, ImVec2(140, 0))) {
+    if (ImGui::Button(sub_l, ImVec2(ui_px(140.f), 0))) {
       std::string msg;
       const int d = sel ? game_api::money_sel_step() : game_api::money_self_step();
       bool ok = sel ? game_api::adjust_selected_player_money(-d, &msg)
@@ -2711,12 +3377,18 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
     const float slider_w = std::max(120.f, avail - name_w - gear_w - gap * 2.f - 8.f);
     const ImVec2 origin = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(origin, ImVec2(origin.x + avail, origin.y + row_h), IM_COL32(16, 22, 34, 215),
-                      8.f);
-    dl->AddRect(origin, ImVec2(origin.x + avail, origin.y + row_h), IM_COL32(58, 84, 116, 150), 8.f,
-                0, 1.f);
+    {
+      PlateSpec ps;
+      ps.top = PanelBg();
+      ps.bot = skin::Mix(PanelBg(), SK().win1, 0.40f);
+      ps.edge = EdgeIdle();
+      ps.inner = skin::Fade(SK().cardInnerHi, 0.05f);
+      ps.th = 1.f;
+      DrawPlate(dl, origin, ImVec2(origin.x + avail, origin.y + row_h),
+                ui_px(SK().cardRadius * 0.5f), ps);
+    }
     dl->AddText(ImVec2(origin.x + 12.f, origin.y + (row_h - ts.y) * 0.5f),
-                IM_COL32(232, 240, 248, 255), f->label);
+                SK().text, f->label);
     ImGui::Dummy(ImVec2(name_w, row_h));
     ImGui::SameLine(0.f, gap);
     draw_feature_gear(f->key);
@@ -2960,7 +3632,7 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
           game_api::crate_select(sel, count);
           game_api::beep("click");
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", game_api::crate_kind_name(i));
+        if (ImGui::IsItemHovered()) Tip("%s", game_api::crate_kind_name(i));
       }
       ImGui::EndCombo();
     }
@@ -2972,7 +3644,7 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
       mark_settings_dirty();
       game_api::crate_select(sel, count);
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip(u8"空投个数（1~20）");
+    if (ImGui::IsItemHovered()) Tip(u8"空投个数（1~20）");
     ImGui::SameLine(0.f, gap);
     if (!action_ok) ImGui::BeginDisabled();
     if (ImGui::Button(u8"空投", ImVec2(drop_w, 0))) run_feature_action(f);
@@ -3074,13 +3746,22 @@ static void draw_lock_faction_icons(const game_api::BuildLockEntry* cat, int cou
       ImGui::InvisibleButton("##ico", ImVec2(kIcon, kIcon));
       const bool hovered = ImGui::IsItemHovered();
       const bool clicked = ImGui::IsItemClicked();
-      const ImU32 bg = want_banned ? IM_COL32(48, 22, 22, 220) : IM_COL32(16, 22, 32, 220);
-      const ImU32 edge = hovered ? IM_COL32(255, 214, 120, 255)
-                                 : (want_banned ? IM_COL32(180, 90, 80, 255)
-                                                : IM_COL32(70, 96, 130, 255));
-      draw->AddRectFilled(p0, ImVec2(p0.x + kIcon, p0.y + kIcon), bg, ui_px(4.f));
-      draw->AddRect(p0, ImVec2(p0.x + kIcon, p0.y + kIcon), edge, ui_px(4.f), 0,
-                    hovered ? 2.f : 1.f);
+      const float hvk = AnimTo(ImGui::GetItemID(), hovered, 18.f);
+      {
+        PlateSpec ps;
+        ps.top = skin::Mix(want_banned ? skin::Over(skin::Fade(SK().bad, 0.26f), SK().win1)
+                                       : PanelBg(),
+                           SK().money, 0.06f * hvk);
+        ps.bot = skin::Mix(want_banned ? skin::Over(skin::Fade(SK().bad, 0.16f), SK().win1)
+                                       : PanelBg(),
+                           SK().win1, 0.30f);
+        ps.edge = skin::Mix(want_banned ? skin::Fade(SK().bad, 0.92f) : EdgeIdle(), SK().money,
+                            hvk);
+        ps.inner = skin::Fade(SK().cardInnerHi, 0.06f);
+        ps.th = hovered ? 1.8f : 1.f;
+        DrawPlate(draw, p0, ImVec2(p0.x + kIcon, p0.y + kIcon),
+                  ui_px(SK().cardRadius * 0.30f), ps);
+      }
       const char* icon_id = e.icon_id[0] ? e.icon_id : e.type_id;
       const char* icon_name = e.icon_name[0] ? e.icon_name : e.name;
       IDirect3DTexture9* tex = unit_icons::get(icon_id, icon_name, e.building);
@@ -3091,13 +3772,13 @@ static void draw_lock_faction_icons(const game_api::BuildLockEntry* cat, int cou
         const char* mark = e.building ? u8"建" : u8"兵";
         const ImVec2 ts = ImGui::CalcTextSize(mark);
         draw->AddText(ImVec2(p0.x + (kIcon - ts.x) * 0.5f, p0.y + (kIcon - ts.y) * 0.5f),
-                      IM_COL32(210, 216, 224, 255), mark);
+                      skin::Fade(SK().text, 0.92f), mark);
       }
       if (hovered) {
-        ImGui::BeginTooltip();
+        TipBegin();
         ImGui::TextUnformatted(e.name[0] ? e.name : e.type_id);
         if (e.paired) ImGui::TextDisabled(u8"车厂和船厂一起限制");
-        ImGui::EndTooltip();
+        TipEnd();
       }
       if (clicked) {
         std::string msg;
@@ -3120,7 +3801,7 @@ static void draw_lock_faction_icons(const game_api::BuildLockEntry* cat, int cou
 }
 
 static void draw_build_lock_panel() {
-  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"建造限制");
+  ImGui::TextColored(CV(HeadingCol()), u8"建造限制");
   ImGui::SameLine();
   ImGui::TextDisabled(u8"对局内所有玩家生效");
 
@@ -3128,9 +3809,9 @@ static void draw_build_lock_panel() {
   const game_api::BuildLockEntry* cat = game_api::build_lock_catalog(&count);
   const float pane = ImGui::GetContentRegionAvail().y * 0.5f - 4.f;
 
-  ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.12f, 0.10f, 0.55f));
+  ImGui::PushStyleColor(ImGuiCol_ChildBg, CVA(SK().good, 0.10f));
   ImGui::BeginChild("##build_allow", ImVec2(0, pane), ImGuiChildFlags_Borders);
-  ImGui::TextColored(ImVec4(0.55f, 0.86f, 0.62f, 1.f), u8"允许");
+  ImGui::TextColored(CV(SK().good), u8"允许");
   ImGui::SameLine();
   ImGui::TextDisabled(u8"点击图标后移到下方");
   if (count <= 0) {
@@ -3141,9 +3822,9 @@ static void draw_build_lock_panel() {
   ImGui::EndChild();
   ImGui::PopStyleColor();
 
-  ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.14f, 0.08f, 0.08f, 0.55f));
+  ImGui::PushStyleColor(ImGuiCol_ChildBg, CVA(SK().bad, 0.10f));
   ImGui::BeginChild("##build_deny", ImVec2(0, 0), ImGuiChildFlags_Borders);
-  ImGui::TextColored(ImVec4(0.93f, 0.55f, 0.48f, 1.f), u8"禁止");
+  ImGui::TextColored(CV(SK().bad), u8"禁止");
   ImGui::SameLine();
   ImGui::TextDisabled(u8"点击图标后恢复建造");
   if (count <= 0) {
@@ -3202,7 +3883,7 @@ void draw_camera_panel() {
     game_api::camera_apply(&s_edit);
   };
 
-  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"摄像机");
+  ImGui::TextColored(CV(HeadingCol()), u8"摄像机");
   ImGui::SameLine();
   const int hook_state = game_api::camera_hook_state();
   if (hook_state == 1 && have_live) {
@@ -3210,7 +3891,7 @@ void draw_camera_panel() {
   } else if (hook_state == 1) {
     ImGui::TextDisabled(u8"hook 已就绪，等待游戏更新相机…");
   } else if (hook_state < 0) {
-    ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.45f, 1.f), u8"相机 hook 安装失败，请重新注入");
+    ImGui::TextColored(CV(SK().bad), u8"相机 hook 安装失败，请重新注入");
   } else {
     ImGui::TextDisabled(u8"未就绪（仅零售版 1.12 支持）");
   }
@@ -3235,7 +3916,7 @@ void draw_camera_panel() {
         game_api::beep(tk ? "on" : "off");
       }
       if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip(u8"打开后引擎每次设置相机都会被改成这里的目标值；关掉恢复游戏自己控制。"
+        Tip(u8"打开后引擎每次设置相机都会被改成这里的目标值；关掉恢复游戏自己控制。"
                           u8"退出遭遇战时会自动关闭，避免卡死。");
       }
       ImGui::SameLine();
@@ -3286,7 +3967,7 @@ void draw_camera_panel() {
         game_api::beep("click");
       }
       ImGui::SameLine();
-      if (ImGui::Button(u8"读取游戏当前", ImVec2(120, 0))) {
+      if (ImGui::Button(u8"读取游戏当前", ImVec2(ui_px(120.f), 0))) {
         if (have_live) {
           s_edit = live;
           s_follow = true;
@@ -3294,7 +3975,7 @@ void draw_camera_panel() {
         game_api::beep("click");
       }
       ImGui::SameLine();
-      if (ImGui::Button(u8"停止接管", ImVec2(90, 0))) {
+      if (ImGui::Button(u8"停止接管", ImVec2(ui_px(90.f), 0))) {
         game_api::camera_set_takeover(false);
         game_api::beep("off");
       }
@@ -3382,7 +4063,7 @@ void draw_camera_panel() {
       const int key_n = game_api::camera_key_count();
 
       ImGui::Spacing();
-      if (ImGui::Button(st == 1 ? u8"暂停" : u8"播放", ImVec2(80, 0))) {
+      if (ImGui::Button(st == 1 ? u8"暂停" : u8"播放", ImVec2(ui_px(80.f), 0))) {
         if (st == 1) {
           game_api::camera_play_pause();
         } else if (key_n < 2) {
@@ -3432,7 +4113,7 @@ void draw_camera_panel() {
         }
       }
       ImGui::SameLine();
-      if (ImGui::Button(u8"清空轨迹", ImVec2(80, 0))) {
+      if (ImGui::Button(u8"清空轨迹", ImVec2(ui_px(80.f), 0))) {
         game_api::camera_keys_clear();
         game_api::beep("off");
       }
@@ -3527,8 +4208,8 @@ void draw_camera_panel() {
       if (avail.y < 60.f) avail.y = 60.f;
       ImGui::InvisibleButton("##cam_pathmap", avail);
       ImDrawList* dl = ImGui::GetWindowDrawList();
-      dl->AddRectFilled(p0, ImVec2(p0.x + avail.x, p0.y + avail.y), IM_COL32(14, 18, 24, 230), 4.f);
-      dl->AddRect(p0, ImVec2(p0.x + avail.x, p0.y + avail.y), IM_COL32(70, 80, 100, 200), 4.f);
+      dl->AddRectFilled(p0, ImVec2(p0.x + avail.x, p0.y + avail.y), FieldBg(), 4.f);
+      dl->AddRect(p0, ImVec2(p0.x + avail.x, p0.y + avail.y), EdgeIdle(), 4.f);
       if (key_n >= 1) {
         float minx = 0.f, maxx = 0.f, miny = 0.f, maxy = 0.f;
         for (int i = 0; i < key_n; ++i) {
@@ -3558,11 +4239,11 @@ void draw_camera_panel() {
           game_api::CameraKey k;
           if (!game_api::camera_key(i, &k)) continue;
           const ImVec2 pt = map_pt(k.x, k.y);
-          if (i > 0) dl->AddLine(prev, pt, IM_COL32(90, 170, 255, 220), 2.f);
-          dl->AddCircleFilled(pt, 4.f, IM_COL32(255, 210, 90, 255));
+          if (i > 0) dl->AddLine(prev, pt, skin::Fade(SK().accent, 0.86f), 2.f);
+          dl->AddCircleFilled(pt, 4.f, SK().warn);
           char num[8];
           std::snprintf(num, sizeof(num), "%d", i + 1);
-          dl->AddText(ImVec2(pt.x + 6.f, pt.y - 16.f), IM_COL32(220, 230, 250, 255), num);
+          dl->AddText(ImVec2(pt.x + 6.f, pt.y - 16.f), skin::Fade(SK().text, 0.92f), num);
           prev = pt;
         }
         ImGui::SetCursorScreenPos(ImVec2(p0.x + 8.f, p0.y + 6.f));
@@ -3577,7 +4258,7 @@ void draw_camera_panel() {
       const int fired = game_api::camera_events_fired();
       ImGui::TextDisabled(u8"事件触发一次后不会自动重置，需要手动点「重置已触发」（和 CameraBridge 一致）");
       ImGui::Spacing();
-      if (ImGui::Button(u8"添加事件", ImVec2(100, 0))) {
+      if (ImGui::Button(u8"添加事件", ImVec2(ui_px(100.f), 0))) {
         game_api::CameraEvent ev;
         ev.t = 0.f;
         ev.base = 0;
@@ -3590,7 +4271,7 @@ void draw_camera_panel() {
         game_api::beep("click");
       }
       ImGui::SameLine();
-      ImGui::TextColored(ImVec4(0.95f, 0.85f, 0.5f, 1.f), u8"%d / %d 个事件已触发", fired, ev_n);
+      ImGui::TextColored(CV(SK().money), u8"%d / %d 个事件已触发", fired, ev_n);
       ImGui::SameLine();
       if (ImGui::Button(u8"清空", ImVec2(70, 0))) game_api::camera_events_clear();
 
@@ -3671,7 +4352,7 @@ void draw_camera_panel() {
 
           ImGui::TableSetColumnIndex(4);
           if (ev.fired) {
-            ImGui::TextColored(ImVec4(0.55f, 0.9f, 0.6f, 1.f), u8"已触发");
+            ImGui::TextColored(CV(SK().good), u8"已触发");
           } else {
             ImGui::TextDisabled(u8"待触发");
           }
@@ -3714,17 +4395,17 @@ void draw_camera_panel() {
         ImGui::EndCombo();
       }
       ImGui::SameLine();
-      if (ImGui::Button(u8"新建", ImVec2(60, 0))) {
+      if (ImGui::Button(u8"新建", ImVec2(ui_px(60.f), 0))) {
         game_api::camera_config_add(u8"新轨迹");
         game_api::beep("click");
       }
       ImGui::SameLine();
-      if (ImGui::Button(u8"克隆", ImVec2(60, 0))) {
+      if (ImGui::Button(u8"克隆", ImVec2(ui_px(60.f), 0))) {
         game_api::camera_config_clone(active, u8"");
         game_api::beep("click");
       }
       ImGui::SameLine();
-      if (ImGui::Button(u8"删除", ImVec2(60, 0))) {
+      if (ImGui::Button(u8"删除", ImVec2(ui_px(60.f), 0))) {
         if (!game_api::camera_config_remove(active)) game_api::beep("error");
         else game_api::beep("off");
       }
@@ -3744,12 +4425,12 @@ void draw_camera_panel() {
       }
 
       ImGui::Spacing();
-      if (ImGui::Button(u8"保存到文件", ImVec2(120, 0))) {
+      if (ImGui::Button(u8"保存到文件", ImVec2(ui_px(120.f), 0))) {
         const bool ok = game_api::camera_config_save();
         game_api::beep(ok ? "click" : "error");
       }
       ImGui::SameLine();
-      if (ImGui::Button(u8"从文件读取", ImVec2(120, 0))) {
+      if (ImGui::Button(u8"从文件读取", ImVec2(ui_px(120.f), 0))) {
         game_api::camera_config_load();
         s_note_cfg = -1;
         game_api::beep("click");
@@ -3789,7 +4470,7 @@ void draw_time_panel() {
     s_inited = true;
   }
 
-  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"时间控制（加速·实验）");
+  ImGui::TextColored(CV(HeadingCol()), u8"时间控制（加速·实验）");
   ImGui::SameLine();
   ImGui::TextDisabled(u8"候选旋钮 [0xCB4098] logicFPS / [0xCB409C] updateFPS");
 
@@ -3807,7 +4488,7 @@ void draw_time_panel() {
   const int update_fps = probe.update_fps > 0 ? probe.update_fps : 30;
   ImGui::Text(u8"logicFPS = %d", logic_fps);
   ImGui::SameLine();
-  ImGui::TextColored(ImVec4(0.75f, 0.9f, 0.75f, 1.f), u8"| updateFPS = %d", update_fps);
+  ImGui::TextColored(CV(SK().good), u8"| updateFPS = %d", update_fps);
   ImGui::SameLine();
   ImGui::TextDisabled(u8"| edi = %d", update_fps / (logic_fps > 0 ? logic_fps : 1));
   if (probe.original_logic_fps > 0) {
@@ -3821,10 +4502,10 @@ void draw_time_panel() {
   }
 
   ImGui::Spacing();
-  ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.f),
+  ImGui::TextColored(CV(SK().bad),
                      u8"硬性不变式：logicFPS >= 1 且 updateFPS >= logicFPS。"
                      u8"破坏后者会让 0x0065516D 的整除得 0，再在 0x0065519A 处除零崩溃");
-  ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.f),
+  ImGui::TextColored(CV(SK().bad),
                      u8"（上一版就是这么崩的）。所以减速/暂停做不了，只能加速。"
                      u8"旧实现写的 [[0xCE8138]+0x54] 其实是亮度，早已停止写入。");
 
@@ -3962,7 +4643,7 @@ void draw_time_panel() {
   ImGui::Spacing();
   ImGui::Separator();
   ImGui::Spacing();
-  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"快进到指定对局时间");
+  ImGui::TextColored(CV(HeadingCol()), u8"快进到指定对局时间");
 
   float now_s = 0.f;
   const bool have_clock = game_api::battle_clock(&now_s);
@@ -4011,7 +4692,7 @@ void draw_time_panel() {
     ImGui::SameLine();
     ImGui::TextDisabled(u8"把倍率拉到快进倍率，到达目标时间后自动回到常速。");
   } else {
-    ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.35f, 1.f), u8"快进中：目标 %s，倍率 %.1fx",
+    ImGui::TextColored(CV(SK().warn), u8"快进中：目标 %s，倍率 %.1fx",
                        fmt_clock(game_api::time_control_ff_target()).c_str(),
                        game_api::time_control_ff_speed());
     if (ImGui::Button(u8"取消快进")) {
@@ -4039,7 +4720,7 @@ static void draw_lua_hotkey_section() {
 void draw_lua_panel() {
   const bool ready = game_api::lua_bridge_ready();  const int hooks = game_api::lua_bridge_hook_state();
 
-  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"动画 / Lua");
+  ImGui::TextColored(CV(HeadingCol()), u8"动画 / Lua");
   ImGui::SameLine();
   if (ready) {
     ImGui::TextDisabled(u8"lua_State = 0x%X（Lua API 命中 %d 次）", game_api::lua_bridge_state(),
@@ -4117,7 +4798,7 @@ void draw_lua_panel() {
   ImGui::Spacing();
   ImGui::Separator();
   ImGui::Spacing();
-  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"读写任意 Lua 全局变量");
+  ImGui::TextColored(CV(HeadingCol()), u8"读写任意 Lua 全局变量");
   ImGui::TextDisabled(u8"对应原版 RA3LuaBridge 暴露的 getglobal / setglobal。");
 
   static char s_name[128] = "willSwitchAnimation";
@@ -4189,7 +4870,7 @@ static void draw_misc_panel() {
 
   const bool any_ok = st.flags_ok || st.shadow_size_ok || st.shadow_dist_ok || st.light.ok;
 
-  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"杂项操作");
+  ImGui::TextColored(CV(HeadingCol()), u8"杂项操作");
   ImGui::SameLine();
   if (!any_ok) {
     ImGui::TextDisabled(u8"未读到（仅零售版 1.12、且进入对局后可用）");
@@ -4212,7 +4893,7 @@ static void draw_misc_panel() {
     s_ui_inited = true;
   }
 
-  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"隐藏显示");
+  ImGui::TextColored(CV(HeadingCol()), u8"隐藏显示");
   ImGui::Spacing();
   {
     std::string msg;
@@ -4243,7 +4924,7 @@ static void draw_misc_panel() {
   ImGui::Spacing();
   ImGui::Separator();
   ImGui::Spacing();
-  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"阴影");
+  ImGui::TextColored(CV(HeadingCol()), u8"阴影");
   ImGui::Spacing();
 
   // 下拉/滑条显示「想要的值」：优先 ini 里保存的，其次才是游戏当前值。
@@ -4321,7 +5002,7 @@ static void draw_misc_panel() {
   ImGui::Spacing();
   ImGui::Separator();
   ImGui::Spacing();
-  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"光照颜色");
+  ImGui::TextColored(CV(HeadingCol()), u8"光照颜色");
   ImGui::SameLine();
   ImGui::TextDisabled(u8"点击色块打开调色盘（1.000 = 255）");
 
@@ -4428,8 +5109,8 @@ static void draw_unit_inspector() {
     s_sel_t = now;
   }
 
-  ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.10f, 0.12f, 0.16f, 0.80f));
-  ImGui::BeginChild("##inspect", ImVec2(0, 210), ImGuiChildFlags_Borders);
+  ImGui::PushStyleColor(ImGuiCol_ChildBg, CVA(SK().card0, 0.80f));
+  ImGui::BeginChild("##inspect", ImVec2(0, ui_px(210.f)), ImGuiChildFlags_Borders);
 
   if (!info.valid) {
     ImGui::TextWrapped(u8"在游戏中选中单位后，这里显示其实体指针、血量、速度、星级等。");
@@ -4550,7 +5231,7 @@ static void draw_unit_inspector() {
       ImGui::TextWrapped("%s", s_edit_msg.c_str());
     }
     ImGui::Dummy(ImVec2(0, 12));
-    if (ImGui::Button(u8"保存", ImVec2(120, 0))) {
+    if (ImGui::Button(u8"保存", ImVec2(ui_px(120.f), 0))) {
       std::string msg;
       if (game_api::set_unit_display_name(s_edit_key, s_edit_name, &msg)) {
         g_last_msg = msg;
@@ -4563,7 +5244,7 @@ static void draw_unit_inspector() {
       }
     }
     ImGui::SameLine();
-    if (ImGui::Button(u8"取消", ImVec2(120, 0))) {
+    if (ImGui::Button(u8"取消", ImVec2(ui_px(120.f), 0))) {
       s_edit_open = false;
       ImGui::CloseCurrentPopup();
     }
@@ -4585,7 +5266,7 @@ static void draw_unit_ops_extra() {
   ImGui::Spacing();
   ImGui::Separator();
   ImGui::Spacing();
-  ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), u8"单位操作扩展");
+  ImGui::TextColored(CV(HeadingCol()), u8"单位操作扩展");
 
   // ---- 在游戏中禁用输入 ----
   bool input_off = game_api::game_input_disabled();
@@ -4692,9 +5373,29 @@ void pump_pending_settings() {
 
 void draw() {
   if (!g_inited) return;
-  if (!input::menu_visible() && !(g_stats_open && g_stats_pinned)) return;
+  // 淡出期间菜单已经不可见，但还要再画 0.16 秒把它淡完。
+  if (!input::menu_visible() && !(g_stats_open && g_stats_pinned) && s_menu_fade <= 0.f) return;
+
+  // 字体自检：中文全变 '?' 说明字形没栅格化出来（ImGui 会退回 fallback '?'）。
+  // 汉字是等宽的，'中' 的宽度必然明显大于 'A'；两个一样宽就说明拿到的是替换字符。
+  // 只在前几帧和每隔 ~10 秒打一行，开销可忽略。
+  {
+    static int s_probe = 0;
+    ++s_probe;
+    if (s_probe <= 3 || s_probe % 600 == 0) {
+      const ImVec2 a = ImGui::CalcTextSize("A");
+      const ImVec2 cjk = ImGui::CalcTextSize(u8"中");
+      const float ratio = (a.x > 0.01f) ? cjk.x / a.x : 0.f;
+      game_api::log("font probe: ascii=%.2f cjk=%.2f ratio=%.2f fonts=%d %s", a.x, cjk.x, ratio,
+                    ImGui::GetIO().Fonts->Fonts.Size,
+                    (ratio < 1.3f) ? "CJK MISSING (rendering '?')" : "cjk ok");
+    }
+  }
 
   g_sync_timer += ImGui::GetIO().DeltaTime;
+  // 皮肤过渡：切换后的 ~0.26 秒内逐帧重建 style，整窗平滑换色。
+  skin::Update(ImGui::GetIO().DeltaTime);
+  if (skin::Transitioning()) apply_ra3_theme();
   if (g_sync_timer > 1.0f) {
     g_sync_timer = 0.f;
     game_api::sync_spectator_hooks();
@@ -4724,19 +5425,81 @@ void draw() {
     game_api::set_hotkey_capture(false);
   }
 
-  if (input::menu_visible()) {
+  // ---- 整窗淡入淡出 ----
+  // 菜单隐藏时不是"啪"地消失：0.16 秒淡到透明再停画，和皮肤过渡是同一套观感。
+  // 淡出一半时菜单仍要接受输入（否则会有一瞬间点了没反应），所以整段逻辑不动，
+  // 只是把颜色和 ImGuiStyle 的 alpha 一起压下去。
+  {
+    const bool want = input::menu_visible();
+    const float dt = (std::max)(0.f, (std::min)(0.1f, ImGui::GetIO().DeltaTime));
+    const float k = 1.f - std::exp(-(want ? 18.f : 26.f) * dt);
+    s_menu_fade += ((want ? 1.f : 0.f) - s_menu_fade) * k;
+    if (s_menu_fade < 0.004f) s_menu_fade = 0.f;
+    if (s_menu_fade > 0.996f) s_menu_fade = 1.f;
+    // 菜单彻底淡完再清拖动状态：否则窗口隐藏期间点击旧标题栏位置，会攒出一个
+    // 幽灵位移，下次打开菜单窗口直接跳一下。
+    if (s_menu_fade <= 0.f) shell::ResetDrag("menu");
+  }
+
+  if (s_menu_fade > 0.f) {
+    const float fade = s_menu_fade;
+    // 外壳是自绘的，取色来自皮肤：把淡出乘进皮肤槽位，几十个控件一起淡。
+    skin::SetFade(fade);
+    // 原生控件（文字 / 按钮 / 子窗口）走 ImGui 自己的 alpha。
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, fade);
+
     // Collapsed inspector frees ~220px; allow a shorter window in that state.
-    const float kInspectBodyH = 220.f;
+    const float kInspectBodyH = ui_px(220.f);
     const float win_min_h = g_unit_inspect_open ? 620.f : 400.f;
-    ImGui::SetNextWindowSize(ImVec2(900, 720), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(780, win_min_h), ImVec2(FLT_MAX, FLT_MAX));
-    ImGui::SetNextWindowPos(ImVec2(28, 28), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowBgAlpha(g_ui_opacity);
+    const ImVec2 win_def = scaled_window_size(900.f, 720.f);
+    // 位置在 Begin 之前定好：拖动位移先吃掉，窗口和内容同一帧移动。
+    static ImVec2 s_menu_pos(28.f, 28.f);
+    shell::DragUpdate("menu", &s_menu_pos);
+    ImGui::SetNextWindowPos(s_menu_pos, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(win_def, ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSizeConstraints(
+        ImVec2((std::min)(ui_px(780.f), win_def.x), (std::min)(ui_px(win_min_h), win_def.y)),
+        ImVec2(FLT_MAX, FLT_MAX));
 
-    ImGui::Begin(u8"红色警戒3 · 进程内菜单", nullptr, ImGuiWindowFlags_NoCollapse);
+    // 标题栏 / 外框自己画：NoTitleBar 去掉 ImGui 的直角标题条，
+    // NoBackground 去掉它的矩形底色，整块外壳由 ui::shell::Draw 负责。
+    // NoMove：位移由 shell::DragUpdate 在 Begin 之前算，ImGui 不要再从空白处
+    // 拖一次，否则两处位移叠加成两倍速。
+    ImGui::Begin(u8"红色警戒3 · 进程内菜单", nullptr,
+                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar |
+                     ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove);
 
-    ImGui::TextColored(ImVec4(0.55f, 0.75f, 1.0f, 1.f), u8"RA3 Overlay");
-    ImGui::SameLine();
+    shell::Hit shell_hit;
+    const ImVec2 content0 = ImGui::GetCursorScreenPos();
+    const ImVec2 wp = ImGui::GetWindowPos();
+    const float shell_h = shell::Draw(ImGui::GetWindowDrawList(), wp,
+                                      ImVec2(wp.x + ImGui::GetWindowSize().x,
+                                             wp.y + ImGui::GetWindowSize().y),
+                                      g_ui_scale, g_ui_opacity, u8"红色警戒3", u8" · 进程内菜单",
+                                      true, &shell_hit, true, "menu");
+    // 正文从标题栏下面开始。横向沿用 WindowPadding，纵向让开外壳。
+    ImGui::SetCursorScreenPos(ImVec2(content0.x, wp.y + shell_h + ui_px(6.f)));
+    if (shell_hit.close) input::set_menu_visible(false);
+
+    // 顶部状态 + 按钮行。界面放大到 2 倍以上时这一行放不下，逐项检查剩余宽度，
+    // 放不下就换行 —— 否则"隐藏""调试"会被窗口右边缘直接裁掉，点不到。
+    auto wrap_if_fits = [](float next_w) {
+      const float right = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+      if (ImGui::GetItemRectMax().x + ImGui::GetStyle().ItemSpacing.x + next_w <= right) {
+        ImGui::SameLine();
+      }
+    };
+    auto btn_w = [](const char* label) {
+      return ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 2.f;
+    };
+    auto chk_w = [](const char* label) {
+      return ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x +
+             ImGui::CalcTextSize(label).x;
+    };
+    const char* inject_label = game_api::hooks_armed() ? u8"重新注入" : u8"注入";
+
+    ImGui::TextColored(skin::Vec4(skin::Active().accent2), u8"RA3 Overlay");
+    wrap_if_fits(ui_px(220.f));
     {
       static int s_sel_n = 0;
       static double s_sel_t = -1.0;
@@ -4749,9 +5512,9 @@ void draw() {
     }
 
     const bool busy = InterlockedCompareExchange(&g_injecting, 0, 0) != 0;
+    wrap_if_fits((std::max)(ui_px(100.f), btn_w(inject_label)));
     if (busy) ImGui::BeginDisabled();
-    if (ImGui::Button(game_api::hooks_armed() ? u8"重新注入" : u8"注入",
-                      ImVec2(100, 0))) {
+    if (ImGui::Button(inject_label, ImVec2(ui_px(100.f), 0))) {
       if (InterlockedCompareExchange(&g_injecting, 1, 0) == 0) {
         g_last_msg = u8"正在注入…";
         g_async_result.done = false;
@@ -4765,39 +5528,39 @@ void draw() {
       }
     }
     if (busy) ImGui::EndDisabled();
-    ImGui::SameLine();
-    if (ImGui::Button(u8"卸载", ImVec2(60, 0))) {
+    wrap_if_fits(ui_px(60.f));
+    if (ImGui::Button(u8"卸载", ImVec2(ui_px(60.f), 0))) {
       game_api::detach();
       g_last_msg = u8"已还原 hook";
       game_api::beep("off");
     }
-    ImGui::SameLine();
+    wrap_if_fits(chk_w(u8"观战模式"));
     ImGui::Checkbox(u8"观战模式", &g_spectate_inject);
-    ImGui::SameLine();
-    if (ImGui::Button(u8"设置", ImVec2(60, 0))) {
+    wrap_if_fits(ui_px(60.f));
+    if (ImGui::Button(u8"设置", ImVec2(ui_px(60.f), 0))) {
       g_show_settings = true;
     }
-    ImGui::SameLine();
-    if (ImGui::Button(u8"统计", ImVec2(60, 0))) {
+    wrap_if_fits(ui_px(60.f));
+    if (ImGui::Button(u8"统计", ImVec2(ui_px(60.f), 0))) {
       g_stats_open = true;
     }
-    ImGui::SameLine();
-    if (ImGui::Button(u8"隐藏", ImVec2(60, 0))) input::set_menu_visible(false);
-    ImGui::SameLine();
+    wrap_if_fits(ui_px(60.f));
+    if (ImGui::Button(u8"隐藏", ImVec2(ui_px(60.f), 0))) input::set_menu_visible(false);
+    wrap_if_fits(chk_w(u8"调试"));
     ImGui::Checkbox(u8"调试", &g_show_debug_status);
     if (ImGui::IsItemHovered()) {
-      ImGui::SetTooltip(u8"在下方固定高度的信息框内显示底层状态；默认关闭，避免长日志把窗口撑高跳动。");
+      Tip(u8"在下方固定高度的信息框内显示底层状态；默认关闭，避免长日志把窗口撑高跳动。");
     }
 
     ImGui::Spacing();
     ImGui::PushStyleColor(ImGuiCol_ChildBg,
-                          ImVec4(0.12f, 0.14f, 0.18f, g_ui_opacity));
+                          skin::Vec4A(skin::Active().sidebar1, g_ui_opacity));
     // 固定高度：内容超出时在框内滚动，绝不改变主窗口布局。
-    const float msg_h = g_show_debug_status ? 72.f : 44.f;
+    const float msg_h = ui_px(g_show_debug_status ? 72.f : 44.f);
     ImGui::BeginChild("##msg", ImVec2(0, msg_h), true,
                       ImGuiWindowFlags_None);
     if (g_show_debug_status) {
-      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.72f, 0.78f, 0.88f, 1.f));
+      ImGui::PushStyleColor(ImGuiCol_Text, skin::Vec4(skin::Active().text2));
       ImGui::TextUnformatted(game_api::status_text());
       ImGui::PopStyleColor();
       ImGui::Separator();
@@ -4812,10 +5575,12 @@ void draw() {
 
     int group_count = 0;
     const game_api::GroupInfo* groups = game_api::groups(&group_count);
-    const float inspect_header_h = ImGui::GetFrameHeightWithSpacing() + 6.f;
+    const float inspect_header_h = ImGui::GetFrameHeightWithSpacing() + ui_px(6.f);
     const float inspect_reserve =
         g_unit_inspect_open ? (inspect_header_h + kInspectBodyH) : inspect_header_h;
-    const float side_w = 156.f;
+    // 侧栏宽度必须跟着界面缩放走：3 倍缩放下 156px 放不下"单位操作"四个字，
+    // 会直接把导航文字裁掉。
+    const float side_w = ui_px(156.f);
 
     ImGui::BeginChild("##side", ImVec2(side_w, -inspect_reserve), true);
     for (int i = 0; i < group_count; ++i) {
@@ -4914,7 +5679,7 @@ void draw() {
       draw_misc_panel();
     } else if (g_group >= 0 && g_group < group_count) {
       const auto& g = groups[g_group];
-      ImGui::TextColored(ImVec4(0.65f, 0.82f, 1.0f, 1.f), "%s", g.name);
+      ImGui::TextColored(skin::Vec4(skin::Active().accent2), "%s", g.name);
       if (g.subtitle) ImGui::TextDisabled("%s", g.subtitle);
       ImGui::Separator();
       ImGui::Spacing();
@@ -4958,9 +5723,89 @@ void draw() {
     draw_unit_inspector();
 
     ImGui::End();
+    ImGui::PopStyleVar();
+    skin::SetFade(1.f);
   }
 
   draw_stats_window();
+}
+
+// Ctrl+F12：把画完 overlay 的后备缓冲导成 BMP，放在 DLL 旁边。
+//
+// 投影、边缘分层、滚动条到底长什么样，这类问题靠描述对不齐；直接看像素最省事。
+// 只用 D3D9 的 GetRenderTargetData + 一个 24 位 BMP 头，不引额外依赖。
+static void dump_back_buffer(IDirect3DDevice9* device) {
+  IDirect3DSurface9* bb = nullptr;
+  if (FAILED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return;
+  D3DSURFACE_DESC desc{};
+  bb->GetDesc(&desc);
+  if (desc.Format != D3DFMT_A8R8G8B8 && desc.Format != D3DFMT_X8R8G8B8) {
+    game_api::log("ui: dump skipped, back buffer format=%d", (int)desc.Format);
+    bb->Release();
+    return;
+  }
+  IDirect3DSurface9* sys = nullptr;
+  HRESULT hr = device->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format,
+                                                  D3DPOOL_SYSTEMMEM, &sys, nullptr);
+  if (SUCCEEDED(hr)) hr = device->GetRenderTargetData(bb, sys);
+  D3DLOCKED_RECT lr{};
+  if (SUCCEEDED(hr)) hr = sys->LockRect(&lr, nullptr, D3DLOCK_READONLY);
+
+  if (SUCCEEDED(hr)) {
+    static int s_seq = 0;
+    wchar_t path[MAX_PATH] = {};
+    HMODULE self = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&dump_back_buffer), &self) &&
+        self && GetModuleFileNameW(self, path, MAX_PATH)) {
+      wchar_t* slash = std::wcsrchr(path, L'\\');
+      if (slash) slash[1] = 0;
+      std::swprintf(path + std::wcslen(path), MAX_PATH - std::wcslen(path),
+                    L"overlay_shot_%02d.bmp", s_seq++ % 100);
+      FILE* f = nullptr;
+      if (_wfopen_s(&f, path, L"wb") == 0 && f) {
+        const int w = (int)desc.Width, h = (int)desc.Height;
+        const int row = (w * 3 + 3) & ~3;
+        const int img = row * h;
+        unsigned char hdr[54] = {};
+        hdr[0] = 'B';
+        hdr[1] = 'M';
+        const int file_size = 54 + img;
+        std::memcpy(hdr + 2, &file_size, 4);
+        const int off = 54;
+        std::memcpy(hdr + 10, &off, 4);
+        std::memcpy(hdr + 14, &off, 4);
+        const int bi = 40;
+        std::memcpy(hdr + 18, &bi, 4);
+        std::memcpy(hdr + 22, &w, 4);
+        std::memcpy(hdr + 26, &h, 4);
+        const short planes = 1, bpp = 24;
+        std::memcpy(hdr + 28, &planes, 2);
+        std::memcpy(hdr + 30, &bpp, 2);
+        std::memcpy(hdr + 34, &img, 4);
+        std::fwrite(hdr, 1, 54, f);
+        unsigned char* zeros = static_cast<unsigned char*>(std::calloc(row, 1));
+        for (int y = h - 1; y >= 0; --y) {
+          const unsigned char* src =
+              static_cast<const unsigned char*>(lr.pBits) + (size_t)y * (size_t)lr.Pitch;
+          unsigned char* dst = zeros;
+          for (int x = 0; x < w; ++x) {
+            dst[x * 3 + 0] = src[x * 4 + 0];
+            dst[x * 3 + 1] = src[x * 4 + 1];
+            dst[x * 3 + 2] = src[x * 4 + 2];
+          }
+          std::fwrite(zeros, 1, (size_t)row, f);
+        }
+        std::free(zeros);
+        std::fclose(f);
+        game_api::log("ui: back buffer dumped to %ls (%dx%d)", path, w, h);
+      }
+    }
+    sys->UnlockRect();
+  }
+  if (sys) sys->Release();
+  if (bb) bb->Release();
 }
 
 void end_frame(IDirect3DDevice9* device) {
@@ -4968,6 +5813,13 @@ void end_frame(IDirect3DDevice9* device) {
   ImGui::EndFrame();
   ImGui::Render();
   ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+
+  // Ctrl+F12 存一张当前帧（含 overlay），方便核对投影 / 滚动条这类观感问题。
+  static bool s_dump_prev = false;
+  const bool dump_now = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 &&
+                        (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
+  if (dump_now && !s_dump_prev) dump_back_buffer(device);
+  s_dump_prev = dump_now;
 }
 
 bool overlay_visible() {
