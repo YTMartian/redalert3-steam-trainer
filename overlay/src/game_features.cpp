@@ -75,6 +75,30 @@ bool write_u32(uint32_t addr, uint32_t v) {
   return true;
 }
 
+// 游戏对象上的指针随时会过期（单位被摧毁后内存会被堆复用），而无敌补血是
+// 每 50ms 定时跑一次的**写**操作：一次写到野指针上就够把堆写坏。日志里那次
+// 崩溃 EIP 落在堆空闲块合并函数里，就是这类"写坏堆、几秒后才炸"的典型表现。
+// 所以凡是拿游戏对象地址算出来的读写，一律走 SEH 兜底的版本。
+static bool safe_read_f32(uint32_t addr, float* out) {
+  if (!out) return false;
+  __try {
+    *out = *reinterpret_cast<float*>(addr);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+static bool safe_write_f32(uint32_t addr, float v) {
+  __try {
+    *reinterpret_cast<float*>(addr) = v;
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+// 实现在后面（CallJob 附近）。这里先声明，写血量要用。
+static bool safe_read_u32(uint32_t addr, uint32_t* out);
+
 uint32_t local_owner() {
   const uint32_t base = loaded_module();
   if (!base) return 0;
@@ -135,10 +159,12 @@ constexpr float kHpLockValue = 1.0e9f;
 constexpr float kHpSaneMax = 1.5e9f;
 
 static bool hp_object_sane(uint32_t hp) {
-  if (!uprising_active()) return true;
-  const float cur = read_f32(hp + 4);
-  const float mx = read_f32(hp + 0xC);
-  const float alt = read_f32(hp + 0x10);
+  float cur = 0.f, mx = 0.f, alt = 0.f;
+  if (!safe_read_f32(hp + 4, &cur) || !safe_read_f32(hp + 0xC, &mx) ||
+      !safe_read_f32(hp + 0x10, &alt)) {
+    return false;
+  }
+  if (!uprising_active()) return true;  // 零售版这三个槽位没逐版本核对过，只做可读性校验
   if (!(cur >= 0.f && cur <= kHpSaneMax)) return false;
   if (!(mx >= 0.f && mx <= kHpSaneMax)) return false;
   if (!(alt >= 0.f && alt <= kHpSaneMax)) return false;
@@ -191,18 +217,20 @@ bool restore_speed_node(uint32_t node) {
 }
 
 bool write_entity_hp(uint32_t ent, const char* mode) {
-  uint32_t hp = read_u32(ent + ent_off(kEntHp, kEntHpEp1));
+  uint32_t hp = 0;
+  if (!safe_read_u32(ent + ent_off(kEntHp, kEntHpEp1), &hp)) return false;
   if (!is_ptr(hp)) return false;
   if (!hp_object_sane(hp)) return false;
   if (std::strcmp(mode, "max") == 0) {
-    return write_f32(hp + 4, kHpLockValue) && write_f32(hp + 0xC, kHpLockValue);
+    return safe_write_f32(hp + 4, kHpLockValue) && safe_write_f32(hp + 0xC, kHpLockValue);
   }
   if (std::strcmp(mode, "min") == 0) {
-    return write_f32(hp + 4, 1.f);
+    return safe_write_f32(hp + 4, 1.f);
   }
   if (std::strcmp(mode, "normal") == 0) {
-    float mx = read_f32(hp + 0x10);
-    return write_f32(hp + 4, mx) && write_f32(hp + 0xC, mx);
+    float mx = 0.f;
+    if (!safe_read_f32(hp + 0x10, &mx)) return false;
+    return safe_write_f32(hp + 4, mx) && safe_write_f32(hp + 0xC, mx);
   }
   return false;
 }
@@ -2013,11 +2041,141 @@ static DWORD g_inv_next_tick = 0;             // 50ms 节流
 static DWORD g_inv_log_tick = 0;
 static DWORD g_inv_off_battle_tick = 0;       // 离开战局的起始时刻（宽限用）
 
+// ---- 目标身份指纹 + 销毁记录 ----
+// 只记住 GameObject 指针是不够的：单位被鬼王（冲撞）碾压、或走任何"直接摧毁"
+// 的路径之后，引擎会把对象内存还给堆，之后又被别的对象复用。锁血是每 50ms
+// 一次的**写**操作，只要有一轮写到旧地址，就可能落进别人的对象甚至堆控制块里——
+// 崩的时候堆已经在别处了（最后一次日志的 EIP 就落在堆空闲块合并函数里，
+// 读的是个垃圾地址 0x56D8DB84）。
+//
+// 两道闸：
+//   1) 每个目标记下 [模板指针 / 血量对象 / 血上限]，每轮先校验，对不上就摘掉；
+//   2) 销毁钩子把刚销毁的地址写进环形缓冲，命中就立刻剔除，绝不再写。
+struct InvFingerprint {
+  uint32_t unit_data = 0;  // GameObject+4：ThingTemplate*，对象被复用后必然不同
+  uint32_t hp = 0;         // GameObject+0x33C：血量对象
+  float hp_cap = 0.f;      // 血量对象+0x10：血量上限（升级/科技会微调，容差 2%）
+};
+static std::map<uint32_t, InvFingerprint> g_inv_fp;
+
+constexpr int kInvDeadRing = 256;
+static uint32_t g_inv_dead_ent[kInvDeadRing] = {};
+static DWORD g_inv_dead_at[kInvDeadRing] = {};
+static volatile LONG g_inv_dead_seq = 0;
+
+// 由销毁钩子调用（游戏逻辑线程），只做定长环形写入，不分配内存。
+void invincible_note_destroyed(uint32_t ent) {
+  if (!is_ptr(ent)) return;
+  const LONG n = InterlockedIncrement(&g_inv_dead_seq) - 1;
+  const int slot = static_cast<int>(static_cast<uint32_t>(n) % (uint32_t)kInvDeadRing);
+  g_inv_dead_ent[slot] = ent;
+  g_inv_dead_at[slot] = GetTickCount();
+}
+
+static bool inv_ent_recently_destroyed(uint32_t ent) {
+  const DWORD now = GetTickCount();
+  for (int i = 0; i < kInvDeadRing; ++i) {
+    if (g_inv_dead_ent[i] != ent) continue;
+    if (static_cast<int32_t>(now - g_inv_dead_at[i]) < 4000) return true;
+  }
+  return false;
+}
+
+static void inv_fp_capture(uint32_t ent, InvFingerprint* fp) {
+  if (!fp) return;
+  *fp = InvFingerprint{};
+  uint32_t ud = 0, hp = 0;
+  if (safe_read_u32(ent + 4, &ud) && is_ptr(ud)) fp->unit_data = ud;
+  if (safe_read_u32(ent + ent_off(kEntHp, kEntHpEp1), &hp) && is_ptr(hp)) {
+    fp->hp = hp;
+    float cap = 0.f;
+    if (safe_read_f32(hp + 0x10, &cap) && cap > 0.f) fp->hp_cap = cap;
+  }
+}
+
+// 目标还活着吗？——不是问引擎，而是问"这块内存还是当初那个单位吗"。
+static bool inv_fp_ok(uint32_t ent, const InvFingerprint& fp) {
+  if (!is_ptr(ent) || !fp.unit_data || !fp.hp) return false;
+  if (inv_ent_recently_destroyed(ent)) return false;
+  uint32_t ud = 0, hp = 0;
+  if (!safe_read_u32(ent + 4, &ud) || ud != fp.unit_data) return false;  // 已被复用
+  if (!safe_read_u32(ent + ent_off(kEntHp, kEntHpEp1), &hp) || hp != fp.hp) return false;
+  float cap = 0.f, cur = 0.f;
+  if (!safe_read_f32(fp.hp + 0x10, &cap) || !(cap > 0.f && cap <= kHpSaneMax)) return false;
+  if (fp.hp_cap > 0.f) {
+    const float tol = fp.hp_cap * 0.02f + 1.f;
+    if (std::fabs(cap - fp.hp_cap) > tol) return false;
+  }
+  if (!safe_read_f32(fp.hp + 4, &cur) || !(cur >= 0.f && cur <= kHpSaneMax)) return false;
+  return true;
+}
+
+// 补血前先过指纹；已经满到锁值就不重复写（写一次就少一次踩空的机会）。
+static bool inv_heal(uint32_t ent, const InvFingerprint& fp) {
+  if (!inv_fp_ok(ent, fp)) return false;
+  float cur = 0.f;
+  if (safe_read_f32(fp.hp + 4, &cur) && cur >= kHpLockValue) return true;
+  return safe_write_f32(fp.hp + 4, kHpLockValue) && safe_write_f32(fp.hp + 0xC, kHpLockValue);
+}
+
+// ---- 第二层：引擎自带的无敌 AttributeModifier ----
+// 锁血只挡"走伤害计算"的攻击。鬼王冲撞 / 碾压这类直接摧毁的路径根本不看血量，
+// 只有引擎自己的 AttributeModifier_InvulnerabilityCrate（100% 免伤、无外观）能挡。
+// 这里的施加/解除都走引擎函数（特征码定位，两个版本通用），施加时 frames = -1
+// 表示永久——就是引擎里所有长期修饰器的用法（反汇编里见到的调用都是 push -1）。
+// 解析不到修饰器 / API 时静默退回纯锁血，绝不因为这条通道失败就取消无敌。
+static std::map<uint32_t, bool> g_inv_mod_applied;  // ent -> 已成功施加
+static uint32_t g_inv_mod_true = 0;                 // 修饰器对象
+static bool g_inv_mod_resolved = false;
+static DWORD g_inv_mod_retry = 0;
+static char g_inv_mod_why[160] = {};
+
+static uint32_t inv_true_invuln_modifier() {
+  if (g_inv_mod_true) return g_inv_mod_true;
+  const DWORD now = GetTickCount();
+  if (g_inv_mod_resolved && static_cast<int32_t>(now - g_inv_mod_retry) < 20000) return 0;
+  g_inv_mod_resolved = true;
+  g_inv_mod_retry = now;
+  char why[128] = {};
+  const uint32_t mod = resolve_invuln_modifier(1, why, sizeof(why));  // 1 = InvulnerabilityCrate
+  std::snprintf(g_inv_mod_why, sizeof(g_inv_mod_why), "%s", why[0] ? why : "unknown");
+  if (!mod) {
+    log("invincible: true-invuln unavailable (%s)", g_inv_mod_why);
+    return 0;
+  }
+  g_inv_mod_true = mod;
+  log("invincible: true-invuln modifier=%08X (%s)", (unsigned)mod, g_inv_mod_why);
+  return mod;
+}
+
+static bool inv_true_invuln_apply(uint32_t ent) {
+  auto it = g_inv_mod_applied.find(ent);
+  if (it != g_inv_mod_applied.end() && it->second) return true;
+  const uint32_t mod = inv_true_invuln_modifier();
+  if (!mod || !is_ptr(ent)) return false;
+  const bool ok = modifier_invoke(ent, mod, -1, false, false);
+  g_inv_mod_applied[ent] = ok;
+  log("invincible: true-invuln apply ent=%08X -> %s", (unsigned)ent, ok ? "ok" : "failed");
+  return ok;
+}
+
+static void inv_true_invuln_remove(uint32_t ent) {
+  auto it = g_inv_mod_applied.find(ent);
+  if (it == g_inv_mod_applied.end()) return;
+  const bool applied = it->second;
+  g_inv_mod_applied.erase(it);
+  if (!applied || !g_inv_mod_true) return;
+  const bool ok = modifier_invoke(ent, g_inv_mod_true, 0, true, false);
+  log("invincible: true-invuln remove ent=%08X -> %s", (unsigned)ent, ok ? "ok" : "failed");
+}
+
 // 定义在文件后面（战局时钟），这里只需要判断「现在是不是在打」。
 static bool read_battle_clock(uint32_t* logic_out, float* seconds_out);
 
 static void invincible_clear_targets() {
   g_inv_targets.clear();
+  g_inv_fp.clear();
+  g_inv_mod_applied.clear();
   g_inv_active = false;
   g_inv_next_tick = 0;
   g_inv_last_hit = 0;
@@ -2032,6 +2190,7 @@ static int invincible_release_entities(const std::vector<uint32_t>& ents) {
   for (uint32_t e : ents) {
     g_inv_targets.erase(std::remove(g_inv_targets.begin(), g_inv_targets.end(), e),
                         g_inv_targets.end());
+    g_inv_fp.erase(e);
   }
   const int released = (int)(before - g_inv_targets.size());
   if (released <= 0) return 0;
@@ -2048,14 +2207,21 @@ bool invincible_apply_impl(bool on, float seconds, int flavor, std::string* out_
 
   if (!on) {
     // 解除：把名单里的单位恢复成正常血量，再清空（不碰其它单位）。
+    // 恢复同样要过指纹：已经死掉/被复用的地址一律跳过，别再写第二遍。
     int restored = 0;
+    int skipped = 0;
     for (uint32_t ent : g_inv_targets) {
-      if (!looks_like_entity(ent) || !entity_alive(ent)) continue;
+      auto it = g_inv_fp.find(ent);
+      if (it == g_inv_fp.end() || !inv_fp_ok(ent, it->second)) {
+        ++skipped;
+        continue;
+      }
       if (write_entity_hp(ent, "normal")) ++restored;
+      inv_true_invuln_remove(ent);  // 引擎无敌一起摘掉（已过指纹，地址还安全）
     }
     const int had = (int)g_inv_targets.size();
     invincible_clear_targets();
-    log("invincible: released %d units (restored %d)", had, restored);
+    log("invincible: released %d units (restored %d, skipped %d)", had, restored, skipped);
     if (out_msg) {
       char buf[160];
       std::snprintf(buf, sizeof(buf), u8"已解除无敌（%d 个单位）", had);
@@ -2071,6 +2237,11 @@ bool invincible_apply_impl(bool on, float seconds, int flavor, std::string* out_
   int maxed = 0;
   for (uint32_t ent : sel) {
     if (!looks_like_entity(ent) || !entity_alive(ent)) continue;
+    // 先记指纹再写：hp+0x10（血量上限）不会被这次写入改动，
+    // 但拿不到血量对象就别碰这个单位，免得之后照着野指针补血。
+    InvFingerprint fp;
+    inv_fp_capture(ent, &fp);
+    if (!fp.hp) continue;
     // 第一步：血量直接拉到最大。
     if (!write_entity_hp(ent, "max")) continue;
     ++maxed;
@@ -2078,6 +2249,9 @@ bool invincible_apply_impl(bool on, float seconds, int flavor, std::string* out_
       targets.push_back(ent);
       ++added;
     }
+    g_inv_fp[ent] = fp;
+    // 第二层：能解析到引擎的无敌修饰器就顺手施加（失败不影响锁血）。
+    inv_true_invuln_apply(ent);
   }
   if (targets.empty()) {
     if (out_msg) *out_msg = u8"无敌：请先在游戏里选中要保护的单位";
@@ -2126,11 +2300,15 @@ static bool invincible_toggle_impl(std::string* out_msg) {
   int restored = 0;
   int released = 0;
   for (uint32_t ent : sel) {
-    if (!looks_like_entity(ent) || !entity_alive(ent)) continue;
-    if (write_entity_hp(ent, "normal")) ++restored;
+    auto it = g_inv_fp.find(ent);
+    if (it != g_inv_fp.end() && inv_fp_ok(ent, it->second)) {
+      if (write_entity_hp(ent, "normal")) ++restored;
+      inv_true_invuln_remove(ent);
+    }
     const size_t before = g_inv_targets.size();
     g_inv_targets.erase(std::remove(g_inv_targets.begin(), g_inv_targets.end(), ent),
                         g_inv_targets.end());
+    g_inv_fp.erase(ent);
     if (g_inv_targets.size() != before) ++released;
   }
   if (g_inv_targets.empty()) invincible_clear_targets();
@@ -2168,15 +2346,44 @@ void invincible_tick_impl() {
   g_inv_next_tick = now + 50;
 
   int healed = 0;
+  int dropped = 0;
   std::vector<uint32_t> alive;
   alive.reserve(g_inv_targets.size());
   for (uint32_t ent : g_inv_targets) {
-    if (!looks_like_entity(ent) || !entity_alive(ent)) continue;   // 死了就剔除
+    auto it = g_inv_fp.find(ent);
+    // 死了 / 被摧毁 / 内存已被别的对象复用 → 立刻摘掉，这一轮绝不写。
+    if (it == g_inv_fp.end() || !inv_fp_ok(ent, it->second)) {
+      ++dropped;
+      continue;
+    }
     alive.push_back(ent);
-    if (write_entity_hp(ent, "max")) ++healed;   // 续回最大值，锁住不掉血
+    if (inv_heal(ent, it->second)) ++healed;   // 续回锁值，血量不掉
   }
-  if (alive.size() != g_inv_targets.size()) g_inv_targets.swap(alive);
+  if (alive.size() != g_inv_targets.size()) {
+    g_inv_targets.swap(alive);
+    for (auto it = g_inv_fp.begin(); it != g_inv_fp.end();) {
+      if (std::find(g_inv_targets.begin(), g_inv_targets.end(), it->first) ==
+          g_inv_targets.end()) {
+        it = g_inv_fp.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    // 死掉的目标不用再解除修饰器（对象都没了，指针也不能碰），只清记录。
+    for (auto it = g_inv_mod_applied.begin(); it != g_inv_mod_applied.end();) {
+      if (std::find(g_inv_targets.begin(), g_inv_targets.end(), it->first) ==
+          g_inv_targets.end()) {
+        it = g_inv_mod_applied.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
   g_inv_last_hit = healed;
+  if (dropped > 0) {
+    log("invincible: dropped %d dead/reused target(s), %d left", dropped,
+        (int)g_inv_targets.size());
+  }
   if (g_inv_targets.empty()) {
     log("invincible: all targets gone, stopping");
     invincible_clear_targets();
@@ -2190,8 +2397,13 @@ void invincible_tick_impl() {
 
 const char* invincible_status_impl() {
   static char buf[192];
-  std::snprintf(buf, sizeof(buf), u8"%s · 锁血 · 护住 %d 个单位",
+  int real = 0;
+  for (const auto& kv : g_inv_mod_applied) {
+    if (kv.second) ++real;
+  }
+  std::snprintf(buf, sizeof(buf), u8"%s · %s · 护住 %d 个单位",
                 g_inv_active ? u8"已开启" : u8"待命",
+                real > 0 ? u8"真无敌" : u8"锁血",
                 g_inv_active ? (int)g_inv_targets.size() : 0);
   return buf;
 }
@@ -3709,6 +3921,8 @@ static uint32_t __cdecl hk_spawn_object(void* req) {
 static void __cdecl forget_live_from_hook(uint32_t ent) {
   __try {
     if (ent) air_hold_forget(ent);
+    // 无敌名单也要立刻知道：对象一被销毁，锁血就绝不能再往这个地址写。
+    if (ent) invincible_note_destroyed(ent);
     queue_live_forget(ent);
   } __except (EXCEPTION_EXECUTE_HANDLER) {
   }
