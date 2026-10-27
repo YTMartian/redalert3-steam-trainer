@@ -191,6 +191,10 @@ cmake --build build --config Release --target ra3_injector
 依赖 `bin\ra3_overlay_v4.dll` 和 `bin\arm_mustcode.dll`（会被嵌进 exe，所以先跑 `build.bat` 和/或
 `build_injector.bat`；DLL 内容变了会触发重新嵌入）。
 
+注意：注入器每次启动都会把**内嵌的那份 DLL** 写回自己旁边。所以改过 DLL 之后一定要重跑
+`build_injector_native.bat`（它现在会先调 `build.bat` 再打包；加 `norebuild` 可跳过前一步），
+否则拿旧注入器去注入会把刚编好的新 DLL 覆盖回旧版——界面看着"改了没生效"多半就是这一条。
+
 第一步已对齐 Python 版的这些行为：找游戏进程（原版 1.12 / 起义时刻 1.0 / 版本不对）、战网进程拦截、
 卸掉上一次注入的覆盖层、`LoadLibraryW` 远程注入、打不开进程时提权重启、DLL 释出（内容相同就跳过）、
 exe 目录写不进去时退到 `%LOCALAPPDATA%\RA3Overlay\runtime`、`injector_startup.log` 里记令牌属性。

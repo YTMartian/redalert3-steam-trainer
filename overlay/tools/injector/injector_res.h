@@ -12,6 +12,9 @@
 #define IDR_PAYLOAD_OVERLAY 101  // ra3_overlay_v4.dll
 #define IDR_PAYLOAD_ARM 102      // arm_mustcode.dll (assembler helper, dll name on purpose)
 
+// Explorer / 任务栏 / 文件属性里显示的 exe 图标（overlay/assets/ra3_overlay_icon.ico）
+#define IDI_APP_ICON 100
+
 // Steam launch-option screenshots for the version-mismatch guide
 // (used by the guide window in step 2; embedded already so the layout can be
 // exercised without touching the build again).

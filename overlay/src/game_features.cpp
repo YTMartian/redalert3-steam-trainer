@@ -6886,7 +6886,7 @@ static const ProtocolRow kProtocolRows[] = {
     {"PlayerPower_EmperorRage2", u8"二级天皇之怒", u8"二级天皇之怒", u8"天皇之怒", 2, 2, false},
     {"PlayerPower_EmperorRage3", u8"三级天皇之怒", u8"三级天皇之怒", u8"天皇之怒", 2, 3, false},
     {"PlayerPower_EnhancedKamikaze", u8"光荣自爆", u8"光荣自爆", u8"光荣自爆", 2, 0, false},
-    {"PlayerPower_Ambush", u8"惊骨伏击", u8"惊骨伏击", u8"惊骨伏击", 2, 0, false},
+    {"PlayerPower_Ambush", u8"惊骇伏击", u8"惊骇伏击", u8"惊骇伏击", 2, 0, false},
     {"PlayerPower_RoboticAssembly", u8"机械化组装", u8"机械化组装", u8"机械化组装", 2, 0, false},
     {"PlayerPower_NavalPower", u8"强化舰队", u8"强化舰队", u8"强化舰队", 2, 0, false},
     {"PlayerPower_Nanoswarm", u8"纳米虫群巢穴", u8"纳米虫群协议", u8"纳米虫群协议", 2, 0, true},

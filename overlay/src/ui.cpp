@@ -97,6 +97,18 @@ static float ui_px(float v) {
   const float s = (g_ui_scale > 0.01f) ? g_ui_scale : 1.f;
   return v * s;
 }
+
+// 按钮宽度必须按文字算，不能写死像素：界面放大时字体和 FramePadding 会一起变大
+// （skin 里 ScaleAllSizes + FontScaleMain），写死的 52 / 72 就会把「执行」「召唤」
+// 这类中文标签裁掉，看起来像字偏右、显示不全。
+static float button_width(const char* label, float slack = 6.f) {
+  // ImGui 只画 "##" 之前的可见部分（"−##m" 这类），宽度也按那部分量。
+  std::string shown(label ? label : "");
+  const size_t hash = shown.find("##");
+  if (hash != std::string::npos) shown.resize(hash);
+  const float text = ImGui::CalcTextSize(shown.c_str()).x;
+  return text + ImGui::GetStyle().FramePadding.x * 2.f + ui_px(slack);
+}
 bool g_unit_inspect_open = true;
 bool g_show_debug_status = false;  // 顶部调试状态，默认关闭，避免长日志撑开窗口
 char g_ui_settings_path[MAX_PATH] = {};
@@ -2278,7 +2290,7 @@ static void draw_feature_gear(const char* feature) {
       char line[96] = {};
       std::snprintf(line, sizeof(line), "%s    %s", danger_slot_label(id),
                     combo[0] ? combo : u8"未设置");
-      if (ImGui::Button(line, ImVec2(180, 0))) {
+      if (ImGui::Button(line, ImVec2(button_width(line), 0))) {
         begin_hotkey_capture(slots[i]);
         ImGui::CloseCurrentPopup();
       }
@@ -2320,7 +2332,7 @@ static void draw_hotkey_row(const game_api::FeatureInfo* f, bool armed, bool as_
   const float gear = ImGui::GetFrameHeight();
   const float gap = 8.f;
   const float avail = ImGui::GetContentRegionAvail().x;
-  const float action_w = as_switch ? gear * 1.64f : 72.f;
+  const float action_w = as_switch ? gear * 1.64f : button_width(u8"执行");
   const float name_w = std::max(24.f, avail - gear - action_w - gap * 2.f);
   const ImVec2 origin = ImGui::GetCursorScreenPos();
   const float row_h = gear;
@@ -2383,8 +2395,13 @@ static void begin_grid_cell(int cols) {
   if (g_pair_col == 0) {
     const float avail = ImGui::GetContentRegionAvail().x;
     int use = cols < 1 ? 1 : cols;
-    if (use > 2 && avail < 460.f) use = 2;
-    if (avail < 260.f) use = 1;
+    // 一格至少要放得下：名字（4 个中文字）＋ 齿轮 ＋「执行」按钮，放不下就降列数。
+    // 这些宽度都跟着界面缩放走（字体 + FramePadding 都会放大），所以 1.5x / 2x 时
+    // 列数会自动减少，而不是把最后一列挤到窗口外、把按钮里的字裁掉。
+    const float min_name = ImGui::CalcTextSize(u8"伤害×5").x;
+    const float min_cell =
+        min_name + ImGui::GetFrameHeight() + button_width(u8"执行") + ui_px(18.f);
+    while (use > 1 && avail < min_cell * (float)use + gap * (float)(use - 1)) --use;
     g_pair_cols = use;
     g_pair_w = use <= 1 ? avail : (avail - gap * (float)(use - 1)) / (float)use;
   } else {
@@ -2409,7 +2426,7 @@ static void draw_compact_cell(const game_api::FeatureInfo* f, int cols) {
   const bool has_hk = game_api::hotkey_slots_for_feature(f->key, slots, 1) > 0;
   const float row_h = ImGui::GetFrameHeight();
   const float sw_h = row_h * 0.86f;
-  const float action_w = as_switch ? sw_h * 1.9f : 52.f;
+  const float action_w = as_switch ? sw_h * 1.9f : button_width(u8"执行");
   const float gear_w = has_hk ? row_h : 0.f;
   const float inner = 4.f;
   const float name_w =
@@ -2474,7 +2491,7 @@ static void draw_money_cell(const game_api::FeatureInfo* f, int cols) {
   int slots[1] = {};
   const bool has_hk = game_api::hotkey_slots_for_feature(f->key, slots, 1) > 0;
   const float row_h = ImGui::GetFrameHeight();
-  const float btn_w = 30.f;
+  const float btn_w = button_width("+");
   const float gear_w = has_hk ? row_h : 0.f;
   const float inner = 4.f;
   const float name_w =
@@ -3272,14 +3289,14 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
       mark_settings_dirty();
     }
     ImGui::SameLine();
-    if (ImGui::Button("+", ImVec2(36.f, 0))) {
+    if (ImGui::Button("+", ImVec2(button_width("+"), 0))) {
       std::string msg;
       const bool ok = game_api::adjust_selected_player_money(game_api::money_sel_step(), &msg);
       g_last_msg = msg;
       game_api::beep(ok ? "click" : "error");
     }
     ImGui::SameLine();
-    if (ImGui::Button("-", ImVec2(36.f, 0))) {
+    if (ImGui::Button("-", ImVec2(button_width("-"), 0))) {
       std::string msg;
       const bool ok = game_api::adjust_selected_player_money(-game_api::money_sel_step(), &msg);
       g_last_msg = msg;
@@ -3477,7 +3494,7 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
     const float summon_y = ImGui::GetFrameHeight();
     if (!action_ok) ImGui::BeginDisabled();
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (56.f - summon_y) * 0.5f);
-    if (ImGui::Button(u8"召唤", ImVec2(72.f, summon_y))) run_feature_action(f);
+    if (ImGui::Button(u8"召唤", ImVec2(button_width(u8"召唤"), summon_y))) run_feature_action(f);
     if (!action_ok) ImGui::EndDisabled();
     ImGui::PopID();
     return;
@@ -3536,7 +3553,7 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
     }
     ImGui::SameLine();
     if (!action_ok) ImGui::BeginDisabled();
-    if (ImGui::Button(u8"召唤", ImVec2(72.f, 0))) {
+    if (ImGui::Button(u8"召唤", ImVec2(button_width(u8"召唤"), 0))) {
       std::vector<const char*> ids;
       ids.reserve(g_summon_sel.size());
       for (const auto& s : g_summon_sel) ids.push_back(s.c_str());
@@ -3576,14 +3593,14 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
     const bool action_ok = (!(feature_needs_hooks(f->key) && !armed)) && !busy;
     ImGui::PushID(f->key);
     if (!action_ok) ImGui::BeginDisabled();
-    if (ImGui::Button(u8"无敌", ImVec2(110.f, 0))) {
+    if (ImGui::Button(u8"无敌", ImVec2(button_width(u8"无敌"), 0))) {
       std::string msg;
       const bool ok = game_api::invincible_apply(true, 0.f, 0, &msg);
       if (!msg.empty()) g_last_msg = msg;
       game_api::beep(ok ? "on" : "error");
     }
     ImGui::SameLine(0.f, 10.f);
-    if (ImGui::Button(u8"解除无敌", ImVec2(110.f, 0))) {
+    if (ImGui::Button(u8"解除无敌", ImVec2(button_width(u8"解除无敌"), 0))) {
       std::string msg;
       game_api::invincible_apply(false, 0.f, 0, &msg);
       if (!msg.empty()) g_last_msg = msg;
@@ -4115,12 +4132,12 @@ void draw_camera_panel() {
       if (ImGui::InputFloat("##camdist", &s_edit.dist, 0.f, 0.f, "%.1f")) push_edit();
 
       ImGui::Spacing();
-      if (ImGui::Button(u8"把当前值应用到游戏", ImVec2(160, 0))) {
+      if (ImGui::Button(u8"把当前值应用到游戏", ImVec2(button_width(u8"把当前值应用到游戏"), 0))) {
         push_edit();
         game_api::beep("click");
       }
       ImGui::SameLine();
-      if (ImGui::Button(u8"读取游戏当前", ImVec2(ui_px(120.f), 0))) {
+      if (ImGui::Button(u8"读取游戏当前", ImVec2(button_width(u8"读取游戏当前"), 0))) {
         if (have_live) {
           s_edit = live;
           s_follow = true;
@@ -4150,7 +4167,7 @@ void draw_camera_panel() {
         ImGui::PushID(id);
         ImGui::TextUnformatted(label);
         ImGui::SameLine();
-        if (ImGui::Button(u8"-##m", ImVec2(28, 0))) {
+        if (ImGui::Button(u8"-##m", ImVec2(button_width(u8"-##m"), 0))) {
           s_edit.x -= dx;
           s_edit.y -= dy;
           s_edit.z -= dz;
@@ -4162,7 +4179,7 @@ void draw_camera_panel() {
           push_edit();
         }
         ImGui::SameLine();
-        if (ImGui::Button(u8"+##p", ImVec2(28, 0))) {
+        if (ImGui::Button(u8"+##p", ImVec2(button_width(u8"+##p"), 0))) {
           s_edit.x += dx;
           s_edit.y += dy;
           s_edit.z += dz;
@@ -4228,7 +4245,7 @@ void draw_camera_panel() {
         }
       }
       ImGui::SameLine();
-      if (ImGui::Button(u8"停止", ImVec2(70, 0))) {
+      if (ImGui::Button(u8"停止", ImVec2(button_width(u8"停止"), 0))) {
         game_api::camera_play_stop();
         game_api::beep("off");
       }
@@ -4256,7 +4273,7 @@ void draw_camera_panel() {
       ImGui::SetNextItemWidth(120.f);
       ImGui::InputText(u8"新节点标签", s_new_label, sizeof(s_new_label));
       ImGui::SameLine();
-      if (ImGui::Button(u8"复制当前坐标并添加节点", ImVec2(190, 0))) {
+      if (ImGui::Button(u8"复制当前坐标并添加节点", ImVec2(button_width(u8"复制当前坐标并添加节点"), 0))) {
         const int idx = game_api::camera_key_add_from_current(s_new_label);
         if (idx < 0) {
           game_api::set_status(u8"添加节点失败：还没读到摄像机");
@@ -4419,14 +4436,14 @@ void draw_camera_panel() {
         game_api::camera_event_add(ev);
       }
       ImGui::SameLine();
-      if (ImGui::Button(u8"重置已触发", ImVec2(110, 0))) {
+      if (ImGui::Button(u8"重置已触发", ImVec2(button_width(u8"重置已触发"), 0))) {
         game_api::camera_events_reset();
         game_api::beep("click");
       }
       ImGui::SameLine();
       ImGui::TextColored(CV(SK().money), u8"%d / %d 个事件已触发", fired, ev_n);
       ImGui::SameLine();
-      if (ImGui::Button(u8"清空", ImVec2(70, 0))) game_api::camera_events_clear();
+      if (ImGui::Button(u8"清空", ImVec2(button_width(u8"清空"), 0))) game_api::camera_events_clear();
 
       const ImGuiTableFlags etf = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                                   ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit;
