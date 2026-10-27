@@ -19,6 +19,7 @@
 | 一键注入器 EXE | OK（`main.exe`，弹窗标题为「注入成功」或「注入失败」） |
 | 战况统计（资金/电力、图标数量、协议、本局折线） | OK |
 | 建造限制（按图标禁止单位/建筑，全玩家生效） | OK |
+| 协议限制（三方协议图标分栏，界面已就绪） | UI 已就绪，尚未接线 |
 | 摄像机（接管引擎相机、关键帧轨迹、定时事件、多配置存档；退局自动停接管） | OK（仅原版 1.12） |
 | 时间控制（1x–8x 加速，写入 logicFPS / updateFPS；退局恢复原值） | OK（仅原版 1.12，实验性；只加速） |
 | 动画 / Lua（动画变量跟踪 + 读写 Lua 全局） | OK（仅原版 1.12） |
@@ -50,7 +51,7 @@ overlay\bin\main.exe
 
 ### 菜单
 
-侧栏有资源、超武/地图、弹药/危险、单位操作，以及建造限制、战况统计、摄像机、时间控制、动画 / Lua、杂项操作、界面设置。没有单独的观战页。观战仍用「注入」旁的「观战模式」勾选。后五个面板（摄像机、时间控制、动画 / Lua、杂项操作，以及单位操作页底部的单位操作扩展）只适配原版 1.12，起义时刻下会显示未就绪并置灰。标题栏「调试」默认关；摄像机页只改镜头不改单位位置；改阴影 / 光照 / 接管相机后退出遭遇战会自动停写，避免 Present 卡死。
+侧栏有资源、超武/地图、弹药/危险、单位操作，以及建造限制、协议限制、战况统计、摄像机、时间控制、动画 / Lua、杂项操作、界面设置。没有单独的观战页。观战仍用「注入」旁的「观战模式」勾选。后五个面板（摄像机、时间控制、动画 / Lua、杂项操作，以及单位操作页底部的单位操作扩展）只适配原版 1.12，起义时刻下会显示未就绪并置灰。标题栏「调试」默认关；摄像机页只改镜头不改单位位置；改阴影 / 光照 / 接管相机后退出遭遇战会自动停写，避免 Present 卡死。
 
 - **己方资金**：加减自己的钱，默认每次 10 万。
 - **选中玩家资金**：列出已经进局的玩家，颜色方块加阵营名，点选后加减该玩家的钱，默认每次 1 万。
@@ -98,6 +99,12 @@ unit_images/
 - 不收录开局就有的建造工厂，以及磁暴坦克、雷达碟、斩首中队、气球炸弹、点防御无人机、盟军前哨站、苏联战斗碉堡。
 - 点某一座超级武器只限制这一座（纳米虫群核心会连同巢穴，超能波毁灭装置会连同它的核心）。开关「禁用超武」仍会把六座一起禁止：超时空传送仪、质子撞击炮、铁幕装置、真空内爆弹、纳米虫群核心、超能波毁灭装置。
 
+### 协议限制
+
+侧栏 **协议限制**，在建造限制下面。排版与建造限制同一套：上面是允许使用的协议，下面是禁止使用的协议，按盟军、苏联、帝国分栏；栏内不再按分支分组，图标从左往右平铺排开，同一协议的 1/2/3 级按等级紧挨着（换行时整族一起换行，不会把分级拆到两行）。悬停显示名称与等级，点图标即搬去另一栏。图标来自 `unit_images\<阵营>\协议\`。
+
+目前只搭了界面：点图标只会移动位置并写日志，**还没有写进引擎**，不影响对局里的协议使用。目录覆盖三个阵营共 54 项（伞兵空降、冷冻射击、轨道抛掷、毁灭空袭、气球炸弹、天皇之怒、各阵营超级武器协议等）。
+
 ### 单位中文名（跟游戏 CSF）
 
 游戏用 `Name:<TypeId>` 查语言包。从本机 RA3 导出官方表：
@@ -140,13 +147,15 @@ cd overlay
 build_injector.bat
 ```
 
-脚本会先自动跑一遍 `build.bat` 把 DLL 编出来再打包（否则 `main.exe` 里会包着一份旧 DLL，新加的面板在游戏里看不到）。已经单独编过 DLL、只想重打包用 `build_injector.bat norebuild`。
+脚本会先自动跑一遍 `build.bat` 把 DLL 编出来再打包（否则打包里会带着一份旧 DLL，新加的面板在游戏里看不到）。已经单独编过 DLL、只想重打包用 `build_injector.bat norebuild`。
 
 注入器会把 DLL、装配程序、名字表和图标打进同一个 exe。
 
+单文件 exe 的解包目录用 `--runtime-tmpdir` 钉在 `%LOCALAPPDATA%\RA3Overlay\pyi`，不再落在 `%TEMP%\_MEIxxxxxx`：PyInstaller 引导器会自己把那棵树建出来。这样就不会因为 `%TEMP%` 被清理软件删掉 / 被重定向 / 变只读而弹 `INTERNAL ERROR: cannot create temporary directory!`（那个弹窗出现在 Python 起来之前，脚本改不了它）。
+
 输出：
 
-- `overlay\bin\main.exe`（带自定义图标，管理员权限；对外只发这一个文件）
+- `overlay\bin\main.exe`（带自定义图标；对外只发这一个文件）
 - `overlay\bin\arm_mustcode.dll`（装配程序，扩展名是 dll，供上面的 exe 打包）
 
 若改过 `mustcode_body.asm` / `payload.py`，先在仓库根目录：
@@ -156,6 +165,43 @@ python gen_payload.py
 ```
 
 `payload.py` 里的起义时刻段（`EP1_CORE_HOOKS` + `ep1_asm_and_symbols`）是手写的，生成器会原样保留。别把它删了——`arm_mustcode.py` 顶部就 import 它。
+
+### 原生注入器 `ra3_injector.exe`（实验，第一步）
+
+PyInstaller 单文件版 `main.exe` 启动时要把 14 MB 解到 `_MEIxxxxxx`，临时目录不可写就弹
+`INTERNAL ERROR: cannot create temporary directory!`，而且那一层在 Python 起来之前，脚本兜不住。
+`ra3_injector.exe` 用 C++ 重写同一个注入器：载荷（DLL、装配程序、四张引导图）编进资源段，
+运行时只把两个 DLL 写到 exe 旁边，**不使用任何临时目录**，也不需要 Python。
+
+```bat
+cd overlay
+build_injector_native.bat
+```
+
+`main.exe` 的 manifest 里声明了 `requireAdministrator`：**双击就会弹 UAC，点「是」**。这台机器上普通权限
+启动的进程会被放进低完整性 / 受限令牌（进程列表被过滤，只剩几十个），看不到游戏进程，所以必须提权——
+这也是旧版 README 一直写「以管理员身份运行」的原因。
+
+或者单独编这个 target（`build.bat` 默认不编它，行为不变）：
+
+```bat
+cmake --build build --config Release --target ra3_injector
+```
+
+依赖 `bin\ra3_overlay_v4.dll` 和 `bin\arm_mustcode.dll`（会被嵌进 exe，所以先跑 `build.bat` 和/或
+`build_injector.bat`；DLL 内容变了会触发重新嵌入）。
+
+第一步已对齐 Python 版的这些行为：找游戏进程（原版 1.12 / 起义时刻 1.0 / 版本不对）、战网进程拦截、
+卸掉上一次注入的覆盖层、`LoadLibraryW` 远程注入、打不开进程时提权重启、DLL 释出（内容相同就跳过）、
+exe 目录写不进去时退到 `%LOCALAPPDATA%\RA3Overlay\runtime`、`injector_startup.log` 里记令牌属性。
+
+`injector_startup.log` 里还有两个字段能直接判断"为什么找不到游戏"：`integrity=`（0x2000 中 / 0x3000 高
+才算正常，0x1000 = 低完整性）和 `procs=`（这个进程能看到的进程数，正常是三位数）。如果 `procs` 只有几十、
+`restricted=1`，说明程序是在受限令牌 / 沙箱里被拉起来的，进程列表被过滤，看不到游戏——这种启动方式下
+注入器会直接把原因写进弹窗，请在资源管理器里直接双击运行。
+
+还没做（第二步）：版本不对时弹带两张 Steam 截图的引导窗口（现在先弹同样的文字），以及
+`unit_names.txt` 的旧文件迁移。这两项都只影响提示与文件搬家，不影响注入本身。
 
 ## 布局
 
@@ -177,7 +223,7 @@ overlay/
                 # camera(相机接管/轨迹/定时事件/配置), time_control(时间倍率/快进)
                 # lua_bridge(Lua 桥 + 动画跟踪), render_misc(血条剪影/阴影/光照)
                 # skin(皮肤语义槽位表), paint(自绘基元), skin_gallery(皮肤卡片)
-  tools/skin_preview/skin_preview.cpp   # 皮肤离线预览（独立 exe，产物在 bin/preview）
+  tools/skin_preview/skin_preview.cpp   # 皮肤离线预览（EXCLUDE_FROM_ALL，默认不编译）
   tools/inject.py
   tools/arm_mustcode.py
   tools/extract_csf_names.py
@@ -333,7 +379,14 @@ src/shell.cpp   ui::shell::Draw(dl, a, b, scale, opacity, interactive, hit)
 ### 配色自检
 
 换皮肤最容易翻车的不是难看，而是亮底白字、暗底描边和面底同色。这类问题到游戏里才发现太贵，
-所以有离线自检：
+所以有离线自检。这个预览工具用 `EXCLUDE_FROM_ALL`，**默认编译不产出**（发布目录里不会多
+一个开发工具），要先用的时候手动编一次：
+
+```
+cmake --build build --config Release --target ra3_skin_preview
+```
+
+编出来的 exe 落在 `bin\preview`。然后：
 
 ```
 overlay\bin\preview\ra3_skin_preview.exe --audit
