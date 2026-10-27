@@ -16,6 +16,7 @@ import io
 import os
 import shutil
 import struct
+import subprocess
 import sys
 import time
 from ctypes import wintypes
@@ -431,6 +432,11 @@ def extract_bundled_payload(dest_dir, include_dll=True, only_dll=False, bundle=N
             return
         ok, note = _copy_if_different(src, dst)
         if ok:
+            return
+        # 写不进去（游戏占着 / 目录只读 / 令牌被削）但旧文件还在：照样能用它注入。
+        if os.path.isfile(dst):
+            if dll_file:
+                errors.append(u'dll-locked: %s' % note)
             return
         if dll_file:
             errors.append(u'dll-locked: %s' % note)
@@ -1035,7 +1041,177 @@ def _msg(ok, detail):
         print(text)
 
 
+ELEVATED_FLAG = '--elevated'
+
+
+def _is_admin():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _token_facts():
+    """记下进程令牌的关键属性，专门用来查「SmartScreen 放行后权限被削弱」。
+
+    返回 (是否 AppContainer, 完整性级别名, 是否被限制 SID)。
+    """
+    advapi = ctypes.WinDLL('advapi32', use_last_error=True)
+    k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    k32.GetCurrentProcess.restype = ctypes.c_void_p
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    advapi.OpenProcessToken.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                        ctypes.POINTER(ctypes.c_void_p)]
+    advapi.GetTokenInformation.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                           ctypes.c_void_p, ctypes.c_uint32,
+                                           ctypes.POINTER(ctypes.c_uint32)]
+    advapi.GetTokenInformation.restype = ctypes.c_int
+
+    out = {'appcontainer': None, 'integrity': None, 'restricted': None}
+    tok = ctypes.c_void_p()
+    # TOKEN_QUERY = 0x0008
+    if not advapi.OpenProcessToken(k32.GetCurrentProcess(), 0x0008, ctypes.byref(tok)):
+        return out
+    try:
+        val = ctypes.c_uint32(0)
+        need = ctypes.c_uint32(0)
+        # TokenIsAppContainer = 29
+        if advapi.GetTokenInformation(tok, 29, ctypes.byref(val), 4,
+                                      ctypes.byref(need)):
+            out['appcontainer'] = bool(val.value)
+        # TokenHasRestrictions = 21
+        val = ctypes.c_uint32(0)
+        need = ctypes.c_uint32(0)
+        if advapi.GetTokenInformation(tok, 21, ctypes.byref(val), 4,
+                                      ctypes.byref(need)):
+            out['restricted'] = bool(val.value)
+        # TokenIntegrityLevel = 25
+        need = ctypes.c_uint32(0)
+        advapi.GetTokenInformation(tok, 25, None, 0, ctypes.byref(need))
+        if need.value:
+            buf = ctypes.create_string_buffer(need.value)
+            if advapi.GetTokenInformation(tok, 25, buf, need.value,
+                                          ctypes.byref(need)):
+                sid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+                raw = ctypes.cast(ctypes.c_void_p(sid),
+                                  ctypes.POINTER(ctypes.c_ubyte))
+                cnt = raw[1]
+                if 1 <= cnt <= 15:
+                    idx = 8 + 4 * (cnt - 1)
+                    sub = ctypes.cast(ctypes.c_void_p(sid + idx),
+                                      ctypes.POINTER(ctypes.c_uint32))[0]
+                    out['integrity'] = {0x1000: 'low', 0x2000: 'medium',
+                                        0x3000: 'high', 0x4000: 'system'}.get(
+                                            sub, hex(sub))
+    except Exception as exc:
+        out['integrity'] = 'err:%s' % exc
+    finally:
+        k32.CloseHandle(tok)
+    return out
+
+
+def _startup_log():
+    """在 exe 旁边留一份启动痕迹。引导器解包失败时这个文件不会出现，
+    有没有它就能分清「PyInstaller 没起来」还是「我们的代码报错」。"""
+    try:
+        here = (os.path.dirname(sys.executable) if getattr(sys, 'frozen', False)
+                else os.path.dirname(os.path.abspath(__file__)))
+        facts = _token_facts()
+        lines = [
+            '--- %s ---' % time.strftime('%Y-%m-%d %H:%M:%S'),
+            'frozen=%s meipass=%s' % (getattr(sys, 'frozen', False),
+                                      getattr(sys, '_MEIPASS', '')),
+            'exe=%s cwd=%s' % (here, os.getcwd()),
+            'TEMP=%s TMP=%s' % (os.environ.get('TEMP'), os.environ.get('TMP')),
+            'admin=%s argv=%s' % (_is_admin(), sys.argv[1:]),
+            'appcontainer=%s integrity=%s restricted=%s' % (
+                facts['appcontainer'], facts['integrity'], facts['restricted']),
+        ]
+        with open(os.path.join(here, 'injector_startup.log'), 'a') as f:
+            f.write('\n'.join(lines) + '\n')
+    except Exception:
+        pass
+
+
+def _dir_writable(path):
+    probe = os.path.join(path, '.wt_%d.tmp' % os.getpid())
+    try:
+        with open(probe, 'wb') as f:
+            f.write(b'ok')
+        os.remove(probe)
+        return True
+    except (IOError, OSError):
+        return False
+
+
+def _runtime_dir():
+    """一个确定能写的目录，放 DLL / arm_mustcode，兼作临时目录回退。"""
+    local = os.environ.get('LOCALAPPDATA') or os.environ.get('APPDATA')
+    if not local:
+        return None
+    d = os.path.join(local, 'RA3Overlay', 'runtime')
+    try:
+        if not os.path.isdir(d):
+            os.makedirs(d)
+    except (IOError, OSError):
+        return None
+    return d if _dir_writable(d) else None
+
+
+def _prepare_temp_env():
+    """确保 TEMP/TMP 真的可写，不行就换到 %LOCALAPPDATA%\\RA3Overlay\\tmp。
+
+    子进程（arm_mustcode）继承环境变量，所以这里修一次就够。
+    """
+    for key in ('TEMP', 'TMP'):
+        cur = os.environ.get(key)
+        if cur and os.path.isdir(cur) and _dir_writable(cur):
+            return cur
+    candidates = []
+    rt = _runtime_dir()
+    if rt:
+        candidates.append(rt)
+    local = os.environ.get('LOCALAPPDATA') or os.environ.get('APPDATA')
+    if local:
+        candidates.append(os.path.join(local, 'RA3Overlay', 'tmp'))
+    drive = os.environ.get('SystemDrive') or 'C:'
+    candidates.append(os.path.join(drive + os.sep, 'Windows', 'Temp'))
+    for cand in candidates:
+        try:
+            if not os.path.isdir(cand):
+                os.makedirs(cand)
+        except (IOError, OSError):
+            continue
+        if _dir_writable(cand):
+            os.environ['TEMP'] = cand
+            os.environ['TMP'] = cand
+            return cand
+    return None
+
+
+def _relaunch_elevated():
+    """用 UAC 重新拉起自己（带 ELEVATED_FLAG），返回是否成功发出请求。"""
+    params = [p for p in sys.argv[1:] if p != ELEVATED_FLAG]
+    exe = sys.executable
+    if not getattr(sys, 'frozen', False):
+        params = [os.path.abspath(__file__)] + params
+    params.append(ELEVATED_FLAG)
+    try:
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None, u'runas', exe, subprocess.list2cmdline(params), None, 1)
+    except Exception:
+        return False
+    # ShellExecute 返回值 > 32 才算成功；1223 表示用户取消了 UAC。
+    return int(rc) > 32
+
+
 def main():
+    _startup_log()
+    # 临时目录在这儿修一次：onefile 解包、arm_mustcode 子进程都靠它。
+    _prepare_temp_env()
+    # 不预先提权：同用户、同完整性级别的游戏进程普通权限就能注入，这样既不用
+    # 每次弹 UAC，也不会把 onefile 再解包一遍（多一次失败机会）。真被拒绝时
+    # 才在下面回退到 runas。
     here = os.path.dirname(os.path.abspath(__file__))
     # When frozen by PyInstaller, look next to the exe.
     if getattr(sys, 'frozen', False):
@@ -1047,6 +1223,17 @@ def main():
         if unpack_errors:
             _msg(False, u'无法释出修改器文件：\n' + u'\n'.join(unpack_errors))
             return 1
+        # exe 所在的文件夹写不进去（只读目录 / 令牌被削）：把 DLL 放进修得动的
+        # 本地目录，再从那里注入。arm_mustcode 也跟着搬，它得和 DLL 待一起。
+        if not os.path.isfile(os.path.join(here, 'ra3_overlay_v4.dll')):
+            alt = _runtime_dir()
+            if alt and alt != here:
+                alts = extract_bundled_payload(alt)
+                if os.path.isfile(os.path.join(alt, 'ra3_overlay_v4.dll')):
+                    here = alt
+                else:
+                    _msg(False, u'无法释出修改器文件：\n' + u'\n'.join(alts))
+                    return 1
         migrate_legacy_name_files(here)
     candidates = [
         os.path.normpath(os.path.join(here, 'ra3_overlay_v4.dll')),
@@ -1067,8 +1254,14 @@ def main():
             break
     if default_dll is None:
         default_dll = candidates[0]
-    dll = sys.argv[1] if len(sys.argv) > 1 else default_dll
+    args = [a for a in sys.argv[1:] if not a.startswith(u'--')]
+    dll = args[0] if args else default_dll
     ok, msg = inject(dll)
+    # 只有真的被系统挡回来（进程打不开）才提权重来一次。
+    if (not ok) and u'无法打开游戏进程' in msg and ELEVATED_FLAG not in sys.argv \
+            and not _is_admin():
+        if _relaunch_elevated():
+            return 0
     if (not ok) and msg.startswith(u'__WRONG_UPRISING__:'):
         running = msg.split(u':', 1)[1]
         print(u'注入失败\n' + _uprising_guide_text(running))

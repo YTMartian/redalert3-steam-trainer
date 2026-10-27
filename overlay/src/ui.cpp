@@ -37,6 +37,7 @@ HWND g_hwnd = nullptr;
 int g_group = 0;
 bool g_show_settings = false;
 bool g_show_build_lock = false;
+bool g_show_protocol_lock = false;
 bool g_show_camera = false;
 bool g_show_time = false;
 bool g_show_lua = false;
@@ -3836,6 +3837,158 @@ static void draw_build_lock_panel() {
   ImGui::PopStyleColor();
 }
 
+// ---------------------------------------------------------------------------
+// 协议限制：与「建造限制」同一套板子（上允许 / 下禁止，点图标来回搬）。
+// 图标来自 unit_images\<阵营>\协议\。一个阵营的协议平铺排开，不画分类标题，
+// 只保证同一协议的 1/2/3 级挨在一起（family 相同者算一族，整族一起换行）。
+// 目前只维护界面状态，还没有写进引擎（game_api::protocol_lock_set）。
+// ---------------------------------------------------------------------------
+static void draw_protocol_faction_icons(const game_api::ProtocolLockEntry* cat, int count,
+                                        bool want_banned) {
+  const float kIcon = ui_px(40.f);
+  const float kGap = ui_px(4.f);
+  const float inset = ui_px(2.f);
+  ImDrawList* draw = ImGui::GetWindowDrawList();
+
+  for (int fac = 0; fac < 3; ++fac) {
+    ImGui::TextDisabled("%s", build_faction_label(fac));
+    const float avail = ImGui::GetContentRegionAvail().x;
+    float used = 0.f;
+    bool started = false;
+    bool any = false;
+    for (int i = 0; i < count;) {
+      const auto& first = cat[i];
+      if (first.faction != fac || first.banned != want_banned) {
+        ++i;
+        continue;
+      }
+
+      // 同族 = 同一协议的 1/2/3 级：整族一起算宽度，先换行再画，
+      // 避免一个协议的分级被拆到两行。
+      int j = i;
+      int members = 0;
+      while (j < count && cat[j].faction == fac && cat[j].banned == want_banned &&
+             std::strcmp(cat[j].family, first.family) == 0) {
+        ++members;
+        ++j;
+      }
+      const float fam_w = members * kIcon + (members - 1) * kGap;
+      if (started && used + kGap + fam_w > avail) {
+        used = 0.f;
+        started = false;
+      }
+
+      for (int k = i; k < j; ++k) {
+        const auto& e = cat[k];
+        if (started) ImGui::SameLine(0.f, kGap);
+
+        ImGui::PushID(want_banned ? k + 10000 : k);
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton("##ico", ImVec2(kIcon, kIcon));
+        const bool hovered = ImGui::IsItemHovered();
+        const bool clicked = ImGui::IsItemClicked();
+        const float hvk = AnimTo(ImGui::GetItemID(), hovered, 18.f);
+        {
+          PlateSpec ps;
+          ps.top = skin::Mix(want_banned ? skin::Over(skin::Fade(SK().bad, 0.26f), SK().win1)
+                                         : PanelBg(),
+                             SK().money, 0.06f * hvk);
+          ps.bot = skin::Mix(want_banned ? skin::Over(skin::Fade(SK().bad, 0.16f), SK().win1)
+                                         : PanelBg(),
+                             SK().win1, 0.30f);
+          ps.edge = skin::Mix(want_banned ? skin::Fade(SK().bad, 0.92f)
+                                          : (e.ultimate ? skin::Fade(SK().accent2, 0.80f)
+                                                        : EdgeIdle()),
+                              SK().money, hvk);
+          ps.inner = skin::Fade(SK().cardInnerHi, 0.06f);
+          ps.th = hovered ? 1.8f : 1.f;
+          DrawPlate(draw, p0, ImVec2(p0.x + kIcon, p0.y + kIcon),
+                    ui_px(SK().cardRadius * 0.30f), ps);
+        }
+        IDirect3DTexture9* tex =
+            unit_icons::get(e.icon_id, e.icon_name, false);
+        if (tex) {
+          draw->AddImage((ImTextureID)tex, ImVec2(p0.x + inset, p0.y + inset),
+                         ImVec2(p0.x + kIcon - inset, p0.y + kIcon - inset));
+        } else {
+          const char* mark = u8"协";
+          const ImVec2 ts = ImGui::CalcTextSize(mark);
+          draw->AddText(ImVec2(p0.x + (kIcon - ts.x) * 0.5f, p0.y + (kIcon - ts.y) * 0.5f),
+                        skin::Fade(SK().text, 0.92f), mark);
+        }
+        if (hovered) {
+          TipBegin();
+          ImGui::TextUnformatted(e.name[0] ? e.name : e.type_id);
+          if (e.tier > 0) ImGui::TextDisabled(u8"第 %d 级协议", e.tier);
+          if (e.ultimate) ImGui::TextDisabled(u8"超级武器协议");
+          ImGui::TextDisabled(want_banned ? u8"点击恢复使用"
+                                          : u8"点击禁止使用");
+          TipEnd();
+        }
+        if (clicked) {
+          std::string msg;
+          if (game_api::protocol_lock_set(e.type_id, !want_banned, &msg)) {
+            g_last_msg = msg;
+            game_api::beep("click");
+          } else {
+            g_last_msg = msg;
+            game_api::beep("error");
+          }
+        }
+        ImGui::PopID();
+        used += kIcon + kGap;
+        started = true;
+        any = true;
+      }
+      i = j;
+    }
+    if (!any) ImGui::TextDisabled(u8"—");
+    ImGui::Spacing();
+  }
+}
+
+static void draw_protocol_lock_panel() {
+  ImGui::TextColored(CV(HeadingCol()), u8"协议限制");
+  ImGui::SameLine();
+  ImGui::TextDisabled(u8"限制本局三方协议的使用");
+
+  int count = 0;
+  const game_api::ProtocolLockEntry* cat = game_api::protocol_lock_catalog(&count);
+  int banned = 0;
+  for (int i = 0; i < count; ++i) {
+    if (cat[i].banned) ++banned;
+  }
+  ImGui::TextDisabled(u8"已禁止 %d / %d · 界面已就绪，接线前不影响游戏", banned, count);
+
+  const float pane = ImGui::GetContentRegionAvail().y * 0.5f - 4.f;
+
+  ImGui::PushStyleColor(ImGuiCol_ChildBg, CVA(SK().good, 0.10f));
+  ImGui::BeginChild("##proto_allow", ImVec2(0, pane), ImGuiChildFlags_Borders);
+  ImGui::TextColored(CV(SK().good), u8"允许");
+  ImGui::SameLine();
+  ImGui::TextDisabled(u8"点击图标后移到下方");
+  if (count <= 0) {
+    ImGui::TextDisabled(u8"—");
+  } else {
+    draw_protocol_faction_icons(cat, count, false);
+  }
+  ImGui::EndChild();
+  ImGui::PopStyleColor();
+
+  ImGui::PushStyleColor(ImGuiCol_ChildBg, CVA(SK().bad, 0.10f));
+  ImGui::BeginChild("##proto_deny", ImVec2(0, 0), ImGuiChildFlags_Borders);
+  ImGui::TextColored(CV(SK().bad), u8"禁止");
+  ImGui::SameLine();
+  ImGui::TextDisabled(u8"点击图标后恢复使用");
+  if (count <= 0) {
+    ImGui::TextDisabled(u8"—");
+  } else {
+    draw_protocol_faction_icons(cat, count, true);
+  }
+  ImGui::EndChild();
+  ImGui::PopStyleColor();
+}
+
 constexpr float kRad2Deg = 57.2957795f;
 constexpr float kDeg2Rad = 0.0174532925f;
 
@@ -5584,13 +5737,15 @@ void draw() {
 
     ImGui::BeginChild("##side", ImVec2(side_w, -inspect_reserve), true);
     for (int i = 0; i < group_count; ++i) {
-      const bool sel = (!g_show_settings && !g_show_build_lock && !g_show_camera &&
-                        !g_show_time && !g_show_lua && !g_show_misc && g_group == i);
+      const bool sel = (!g_show_settings && !g_show_build_lock && !g_show_protocol_lock &&
+                        !g_show_camera && !g_show_time && !g_show_lua && !g_show_misc &&
+                        g_group == i);
       ImGui::PushID(i);
       if (draw_nav_item(groups[i].name, groups[i].name, sel)) {
         g_group = i;
         g_show_settings = false;
         g_show_build_lock = false;
+        g_show_protocol_lock = false;
         g_show_camera = false;
         g_show_time = false;
         g_show_lua = false;
@@ -5609,6 +5764,7 @@ void draw() {
       }
       g_show_settings = false;
       g_show_build_lock = false;
+      g_show_protocol_lock = false;
       g_show_camera = false;
       g_show_time = false;
       g_show_lua = false;
@@ -5617,6 +5773,16 @@ void draw() {
     if (draw_nav_item("lock", u8"建造限制", g_show_build_lock)) {
       g_show_build_lock = true;
       g_show_settings = false;
+      g_show_protocol_lock = false;
+      g_show_camera = false;
+      g_show_time = false;
+      g_show_lua = false;
+      g_show_misc = false;
+    }
+    if (draw_nav_item("proto", u8"协议限制", g_show_protocol_lock)) {
+      g_show_protocol_lock = true;
+      g_show_settings = false;
+      g_show_build_lock = false;
       g_show_camera = false;
       g_show_time = false;
       g_show_lua = false;
@@ -5626,6 +5792,7 @@ void draw() {
       g_show_camera = true;
       g_show_settings = false;
       g_show_build_lock = false;
+      g_show_protocol_lock = false;
       g_show_time = false;
       g_show_lua = false;
       g_show_misc = false;
@@ -5634,6 +5801,7 @@ void draw() {
       g_show_time = true;
       g_show_settings = false;
       g_show_build_lock = false;
+      g_show_protocol_lock = false;
       g_show_camera = false;
       g_show_lua = false;
       g_show_misc = false;
@@ -5642,13 +5810,16 @@ void draw() {
       g_show_lua = true;
       g_show_settings = false;
       g_show_build_lock = false;
+      g_show_protocol_lock = false;
       g_show_camera = false;
       g_show_time = false;
+      g_show_misc = false;
     }
     if (draw_nav_item("misc", u8"杂项操作", g_show_misc)) {
       g_show_misc = true;
       g_show_settings = false;
       g_show_build_lock = false;
+      g_show_protocol_lock = false;
       g_show_camera = false;
       g_show_time = false;
       g_show_lua = false;
@@ -5656,6 +5827,7 @@ void draw() {
     if (draw_nav_item("ui", u8"界面设置", g_show_settings)) {
       g_show_settings = true;
       g_show_build_lock = false;
+      g_show_protocol_lock = false;
       g_show_camera = false;
       g_show_time = false;
       g_show_lua = false;
@@ -5669,6 +5841,8 @@ void draw() {
       draw_settings_panel();
     } else if (g_show_build_lock) {
       draw_build_lock_panel();
+    } else if (g_show_protocol_lock) {
+      draw_protocol_lock_panel();
     } else if (g_show_camera) {
       draw_camera_panel();
     } else if (g_show_time) {

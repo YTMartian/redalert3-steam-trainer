@@ -61,6 +61,7 @@ ra3_image.json
 overlay_ui.ini
 ra3_overlay.log
 ra3_camera.ini
+injector_startup.log
 
 # 编辑器 / 系统
 .vscode/

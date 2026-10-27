@@ -6815,6 +6815,151 @@ static const BuildLockEntry* build_lock_catalog_impl(int* count) {
   return view.empty() ? nullptr : view.data();
 }
 
+// ---------------------------------------------------------------------------
+// 协议限制（第一步：只搭界面和状态，尚未写进引擎）
+// 界面平铺：一个阵营的协议从左往右直接排开，不再有分支标题。family 只用于
+// 排版——同一协议的 1/2/3 级算一族，换行时整族一起走，别把分级拆到两行。
+// icon_name 对应 unit_images\<阵营>\协议\<icon_name>.png|webp。
+// ---------------------------------------------------------------------------
+struct ProtocolRow {
+  const char* id;
+  const char* name;
+  const char* icon_name;
+  const char* family;
+  int faction;
+  int tier;
+  bool ultimate;
+};
+
+static const ProtocolRow kProtocolRows[] = {
+    // ---------------- 盟军 ----------------
+    {"PlayerPower_CryoSatellite1", u8"一级冷冻射击", u8"一级冷冻射击", u8"冷冻射击", 0, 1, false},
+    {"PlayerPower_CryoSatellite2", u8"二级冷冻射击", u8"二级冷冻射击", u8"冷冻射击", 0, 2, false},
+    {"PlayerPower_CryoSatellite3", u8"三级冷冻射击", u8"三级冷冻射击", u8"冷冻射击", 0, 3, false},
+    {"PlayerPower_Paradrop1", u8"一级伞兵空降", u8"一级伞兵空降", u8"伞兵空降", 0, 1, false},
+    {"PlayerPower_Paradrop2", u8"二级伞兵空降", u8"二级伞兵空降", u8"伞兵空降", 0, 2, false},
+    {"PlayerPower_Paradrop3", u8"三级伞兵空降", u8"三级伞兵空降", u8"伞兵空降", 0, 3, false},
+    {"PlayerPower_AirPower", u8"先进航空学", u8"先进航空学", u8"先进航空学", 0, 0, false},
+    {"PlayerPower_PrecisionStrike", u8"精准轰炸", u8"精准轰炸", u8"精准轰炸", 0, 0, false},
+    {"PlayerPower_SatelliteSweep", u8"侦查扫描", u8"侦查扫描", u8"侦查扫描", 0, 0, false},
+    {"PlayerPower_TimeBomb1", u8"一级超时空炸弹", u8"一级超时空炸弹", u8"超时空炸弹", 0, 1, false},
+    {"PlayerPower_TimeBomb2", u8"二级超时空炸弹", u8"二级超时空炸弹", u8"超时空炸弹", 0, 2, false},
+    {"PlayerPower_TimeBomb3", u8"三级超时空炸弹", u8"三级超时空炸弹", u8"超时空炸弹", 0, 3, false},
+    {"PlayerPower_ChronoRift1", u8"一级时空裂缝", u8"一级时空裂缝", u8"时空裂缝", 0, 1, false},
+    {"PlayerPower_ChronoRift2", u8"二级时空裂缝", u8"二级时空裂缝", u8"时空裂缝", 0, 2, false},
+    {"PlayerPower_ChronoRift3", u8"三级时空裂缝", u8"三级时空裂缝", u8"时空裂缝", 0, 3, false},
+    {"PlayerPower_ChronoSwap", u8"超时空互换", u8"超时空互换", u8"超时空互换", 0, 0, false},
+    {"PlayerPower_HighTechnology", u8"高科技", u8"高科技", u8"高科技", 0, 0, false},
+    {"PlayerPower_FreeTrade", u8"自由贸易", u8"自由贸易", u8"自由贸易", 0, 0, false},
+    {"PlayerPower_ParticleCannon", u8"质子撞击炮", u8"质子撞击炮协议", u8"质子撞击炮", 0, 0, true},
+    {"PlayerPower_Chronosphere", u8"超时空传送仪", u8"超时空传送仪协议", u8"超时空传送仪", 0, 0, true},
+
+    // ---------------- 苏联 ----------------
+    {"PlayerPower_OrbitalRefuse1", u8"一级轨道抛掷", u8"一级轨道抛掷", u8"轨道抛掷", 1, 1, false},
+    {"PlayerPower_OrbitalRefuse2", u8"二级轨道抛掷", u8"二级轨道抛掷", u8"轨道抛掷", 1, 2, false},
+    {"PlayerPower_OrbitalRefuse3", u8"三级轨道抛掷", u8"三级轨道抛掷", u8"轨道抛掷", 1, 3, false},
+    {"PlayerPower_MagneticSingularity", u8"磁力奇点", u8"磁力奇点", u8"磁力奇点", 1, 0, false},
+    {"PlayerPower_CrushPuppies", u8"重机碾压", u8"重机碾压", u8"重机碾压", 1, 0, false},
+    {"PlayerPower_MagneticSatellite1", u8"一级磁力卫星", u8"一级磁力卫星", u8"磁力卫星", 1, 1, false},
+    {"PlayerPower_MagneticSatellite2", u8"二级磁力卫星", u8"二级磁力卫星", u8"磁力卫星", 1, 2, false},
+    {"PlayerPower_MagneticSatellite3", u8"三级磁力卫星", u8"三级磁力卫星", u8"磁力卫星", 1, 3, false},
+    {"PlayerPower_DesolatorBomb1", u8"一级毁灭空袭", u8"一级毁灭空袭", u8"毁灭空袭", 1, 1, false},
+    {"PlayerPower_DesolatorBomb2", u8"二级毁灭空袭", u8"二级毁灭空袭", u8"毁灭空袭", 1, 2, false},
+    {"PlayerPower_DesolatorBomb3", u8"三级毁灭空袭", u8"三级毁灭空袭", u8"毁灭空袭", 1, 3, false},
+    {"PlayerPower_TerrorDroneEggs", u8"恐怖机器人奇袭", u8"恐怖机器人奇袭", u8"恐怖机器人奇袭", 1, 0, false},
+    {"PlayerPower_MassProduction", u8"大生产", u8"大生产", u8"大生产", 1, 0, false},
+    {"PlayerPower_IrradiateTarget", u8"毒质腐蚀", u8"毒质腐蚀", u8"毒质腐蚀", 1, 0, false},
+    {"PlayerPower_ProductionKickback", u8"现金奖励", u8"现金奖励", u8"现金奖励", 1, 0, false},
+    {"PlayerPower_VacuumBomb", u8"真空内爆弹", u8"真空内爆弹协议", u8"真空内爆弹", 1, 0, true},
+    {"PlayerPower_IronCurtain", u8"铁幕装置", u8"铁幕协议", u8"铁幕装置", 1, 0, true},
+
+    // ---------------- 帝国 ----------------
+    {"PlayerPower_BalloonAttack1", u8"一级气球炸弹", u8"一级气球炸弹", u8"气球炸弹", 2, 1, false},
+    {"PlayerPower_BalloonAttack2", u8"二级气球炸弹", u8"二级气球炸弹", u8"气球炸弹", 2, 2, false},
+    {"PlayerPower_BalloonAttack3", u8"三级气球炸弹", u8"三级气球炸弹", u8"气球炸弹", 2, 3, false},
+    {"PlayerPower_FinalSquadron1", u8"一级决胜中队", u8"一级决胜中队", u8"决胜中队", 2, 1, false},
+    {"PlayerPower_FinalSquadron2", u8"二级决胜中队", u8"二级决胜中队", u8"决胜中队", 2, 2, false},
+    {"PlayerPower_FinalSquadron3", u8"三级决胜中队", u8"三级决胜中队", u8"决胜中队", 2, 3, false},
+    {"PlayerPower_AdvMissilePacks", u8"先进导弹匣", u8"先进导弹匣", u8"先进导弹匣", 2, 0, false},
+    {"PlayerPower_PointDefenseDrones", u8"点防御无人机", u8"点防御无人机", u8"点防御无人机", 2, 0, false},
+    {"PlayerPower_EmperorRage1", u8"一级天皇之怒", u8"一级天皇之怒", u8"天皇之怒", 2, 1, false},
+    {"PlayerPower_EmperorRage2", u8"二级天皇之怒", u8"二级天皇之怒", u8"天皇之怒", 2, 2, false},
+    {"PlayerPower_EmperorRage3", u8"三级天皇之怒", u8"三级天皇之怒", u8"天皇之怒", 2, 3, false},
+    {"PlayerPower_EnhancedKamikaze", u8"光荣自爆", u8"光荣自爆", u8"光荣自爆", 2, 0, false},
+    {"PlayerPower_Ambush", u8"惊骨伏击", u8"惊骨伏击", u8"惊骨伏击", 2, 0, false},
+    {"PlayerPower_RoboticAssembly", u8"机械化组装", u8"机械化组装", u8"机械化组装", 2, 0, false},
+    {"PlayerPower_NavalPower", u8"强化舰队", u8"强化舰队", u8"强化舰队", 2, 0, false},
+    {"PlayerPower_Nanoswarm", u8"纳米虫群巢穴", u8"纳米虫群协议", u8"纳米虫群协议", 2, 0, true},
+    {"PlayerPower_TelekineticProjectorDevice", u8"超能波毁灭装置", u8"超能波毁灭装置协议",
+     u8"超能波毁灭装置协议", 2, 0, true},
+};
+
+static std::unordered_set<std::string> g_protocol_bans;
+
+static const char* protocol_faction_key(int faction) {
+  if (faction == 0) return "Allied";
+  if (faction == 1) return "Soviet";
+  return "Japan";
+}
+
+static bool protocol_banned(const char* id) {
+  return id && id[0] && g_protocol_bans.find(id) != g_protocol_bans.end();
+}
+
+static const ProtocolLockEntry* protocol_lock_catalog_impl(int* count) {
+  static std::vector<ProtocolLockEntry> view;
+  view.clear();
+  view.reserve(sizeof(kProtocolRows) / sizeof(kProtocolRows[0]));
+  for (const ProtocolRow& row : kProtocolRows) {
+    ProtocolLockEntry e{};
+    std::snprintf(e.type_id, sizeof(e.type_id), "%s", row.id);
+    std::snprintf(e.name, sizeof(e.name), "%s", row.name);
+    std::snprintf(e.family, sizeof(e.family), "%s", row.family);
+    std::snprintf(e.icon_name, sizeof(e.icon_name), "%s", row.icon_name);
+    // 阵营前缀让 unit_icons 只在这家的「协议」目录里找图。
+    std::snprintf(e.icon_id, sizeof(e.icon_id), "%sProtocolZ_%s",
+                  protocol_faction_key(row.faction), row.id);
+    e.faction = row.faction;
+    e.tier = row.tier;
+    e.ultimate = row.ultimate;
+    e.banned = protocol_banned(row.id);
+    view.push_back(e);
+  }
+  if (count) *count = (int)view.size();
+  return view.empty() ? nullptr : view.data();
+}
+
+static bool protocol_lock_set_impl(const char* type_id, bool locked, std::string* out_msg) {
+  if (!type_id || !type_id[0]) {
+    if (out_msg) *out_msg = u8"缺少协议代号";
+    return false;
+  }
+  const ProtocolRow* hit = nullptr;
+  for (const ProtocolRow& row : kProtocolRows) {
+    if (std::strcmp(row.id, type_id) == 0) {
+      hit = &row;
+      break;
+    }
+  }
+  if (!hit) {
+    if (out_msg) *out_msg = u8"这个协议不在限制表里";
+    return false;
+  }
+  if (locked) {
+    g_protocol_bans.insert(type_id);
+  } else {
+    g_protocol_bans.erase(type_id);
+  }
+  log("protocol lock %s: %s (界面状态，尚未接线)", type_id, locked ? "ban" : "allow");
+  if (out_msg) {
+    *out_msg = std::string(locked ? u8"已限制「" : u8"已放开「") + hit->name +
+               u8"」（界面已就绪，功能待接线）";
+  }
+  return true;
+}
+
+static void protocol_lock_reset_impl() { g_protocol_bans.clear(); }
+
 static bool template_has_exact_id(uint32_t tmpl, const char* want) {
   if (!is_ptr(tmpl) || !want || !want[0]) return false;
   const size_t n = std::strlen(want);
@@ -9026,6 +9171,16 @@ bool build_lock_selected(bool locked, std::string* out_msg) {
 }
 
 void build_lock_tick() { build_lock_tick_impl(); }
+
+const ProtocolLockEntry* protocol_lock_catalog(int* count) {
+  return protocol_lock_catalog_impl(count);
+}
+
+bool protocol_lock_set(const char* type_id, bool locked, std::string* out_msg) {
+  return protocol_lock_set_impl(type_id, locked, out_msg);
+}
+
+void protocol_lock_reset() { protocol_lock_reset_impl(); }
 
 void roster_set_active(bool on) {
   const bool rising = on && !g_roster_active;

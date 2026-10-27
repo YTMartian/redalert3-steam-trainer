@@ -160,6 +160,25 @@ const BuildLockEntry* build_lock_catalog(int* count);
 bool build_lock_set(const char* type_id, bool locked, std::string* out_msg);
 bool build_lock_selected(bool locked, std::string* out_msg);
 void build_lock_tick();
+
+// 协议限制：三方协议（伞兵空降 / 冷冻射击 / 铁幕 …）的禁用表。
+// 第一步只做界面与状态，banned 仅存在本进程内，尚未写进引擎。
+// 界面不分组：一个阵营的协议平铺排开，只保证同一协议的 1/2/3 级贴在一起。
+// family 就是用来做这件事的（同一族一起换行），不是用来画分类标题的。
+struct ProtocolLockEntry {
+  char type_id[96] = {};    // science id，例如 PlayerPower_Paradrop1
+  char name[64] = {};       // 显示名
+  char family[32] = {};     // 同一协议的分级同族，例如「冷冻射击」
+  char icon_id[96] = {};    // 带阵营前缀，供 unit_icons 选对协议图标
+  char icon_name[64] = {};  // unit_images\<阵营>\协议\<icon_name>
+  int faction = 0;          // 0 盟军 / 1 苏联 / 2 帝国
+  int tier = 0;             // 1..3；0 表示不分级
+  bool ultimate = false;    // 超级武器协议
+  bool banned = false;
+};
+const ProtocolLockEntry* protocol_lock_catalog(int* count);
+bool protocol_lock_set(const char* type_id, bool locked, std::string* out_msg);
+void protocol_lock_reset();
 // Drain Create/Destroy / seed-enqueue queues a little each Present frame
 // (~12 catalog resolves while seeding). Keeps open-panel seed off the UI poll.
 void roster_tick();
