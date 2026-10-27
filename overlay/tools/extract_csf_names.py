@@ -2,7 +2,9 @@
 """Extract RA3 CSF Name:* labels -> TypeId=中文 for the overlay.
 
 Reads Lang-Chinese*.big (RefPack-compressed gamestrings.csf) from a RA3 install,
-writes unit_names_csf.txt next to unit_names.txt. Runtime loads this as the
+writes unit_names_csf.txt to the repo root next to unit_names.txt. Both are build
+inputs: overlay\build.bat packs them into ra3_overlay_v4.dll, so the release folder
+only ever holds main.exe plus the DLLs. Runtime loads the packed CSF table as the
 base catalog; unit_names.txt overrides win.
 
 Usage:
@@ -458,10 +460,11 @@ def main() -> int:
 
     here = Path(__file__).resolve()
     repo = here.parents[2]  # overlay/tools -> repo
-    # Packaged layout: files sit beside the DLL in overlay/bin/
-    out_csf = args.out or (repo / "overlay" / "bin" / "unit_names_csf.txt")
-    user_path = repo / "overlay" / "bin" / "unit_names.txt"
-    # Keep a copy at repo root for editing convenience when --merge
+    # Build input lives at the repo root; build.bat packs it into the DLL and
+    # never leaves a loose copy in overlay\bin.
+    out_csf = args.out or (repo / "unit_names_csf.txt")
+    user_path = repo / "unit_names.txt"
+    # Kept for the old layout where tables sat beside the DLL.
     user_path_root = repo / "unit_names.txt"
 
     ra3 = args.ra3 or guess_ra3_root()
@@ -499,9 +502,9 @@ def main() -> int:
         out_csf,
         names,
         [
-            "# RA3 Overlay — CSF Name:* export (auto-generated)",
+            "# RA3 Overlay — CSF Name:* export (build input, packed into the DLL)",
             f"# Source: {big}",
-            "# Place beside ra3_overlay_v4.dll (overlay\\bin\\)",
+            "# Do not ship this file: overlay\\build.bat packs it into ra3_overlay_v4.dll",
             "# Do not hand-edit; re-run: python overlay/tools/extract_csf_names.py",
             "# Runtime loads this first; unit_names.txt overrides win.",
         ],
@@ -532,9 +535,9 @@ def main() -> int:
             added += 1
         header = [
             "# RA3 Overlay 单位种类名（UTF-8）",
-            "# 与 DLL 同目录：overlay\\bin\\unit_names.txt",
+            "# 构建输入：overlay\\build.bat 会把它打包进 ra3_overlay_v4.dll，不随发布目录外放",
             "# 格式: TypeId=显示名 / sig_* / tpl_*",
-            "# CSF 基底: unit_names_csf.txt（同目录）；本文件覆盖优先",
+            "# CSF 基底: unit_names_csf.txt（仓库根目录，同样打包进 DLL）；本文件覆盖优先",
             "# 可在游戏内点「修改」保存，也可手动编辑本文件。",
         ]
         write_map(user_path, user, header)

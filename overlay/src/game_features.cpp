@@ -303,6 +303,13 @@ void ensure_unit_names_cs() {
   }
 }
 
+// User name overrides live outside the release folder: the CSF base catalog and
+// the default override table are packed into this DLL (RCDATA id 2, filled by
+// overlay/tools/pack_name_tables.py), so a shipped folder holds only main.exe
+// and the two DLLs. Saves go to %LOCALAPPDATA%\RA3Overlay\unit_names.txt.
+//
+// A unit_names.txt that already sits beside the DLL (portable install or a
+// hand-edited table) still wins, so nothing moves under those users.
 bool resolve_unit_names_path(char* out, size_t out_len) {
   if (!out || out_len < 8) return false;
   HMODULE self = nullptr;
@@ -316,37 +323,104 @@ bool resolve_unit_names_path(char* out, size_t out_len) {
   wchar_t wpath[MAX_PATH] = {};
   if (!GetModuleFileNameW(self, wpath, MAX_PATH)) return false;
 
-  // Prefer beside the DLL (packaged release layout: overlay\bin\*.dll + name files).
+  wchar_t wdir[MAX_PATH] = {};
+  std::wcsncpy(wdir, wpath, MAX_PATH - 1);
+  if (wchar_t* slash = wcsrchr(wdir, L'\\')) *slash = 0;
+  else wdir[0] = 0;
+
+  auto to_utf8 = [&](const wchar_t* wfile) {
+    return WideCharToMultiByte(CP_UTF8, 0, wfile, -1, out, (int)out_len, nullptr,
+                               nullptr) > 0;
+  };
+  auto exists = [](const wchar_t* wfile) {
+    return GetFileAttributesW(wfile) != INVALID_FILE_ATTRIBUTES;
+  };
+
+  // 1) Beside the DLL.
+  if (wdir[0]) {
+    wchar_t wfile[MAX_PATH] = {};
+    _snwprintf_s(wfile, _TRUNCATE, L"%s\\unit_names.txt", wdir);
+    if (exists(wfile)) return to_utf8(wfile);
+  }
+
+  // 2) Dev fallback: <repo>/overlay/bin/<dll> → <repo>/unit_names.txt
   {
-    wchar_t wdir[MAX_PATH] = {};
-    std::wcsncpy(wdir, wpath, MAX_PATH - 1);
-    wchar_t* slash = wcsrchr(wdir, L'\\');
-    if (slash) {
-      *slash = 0;
-      wchar_t wfile[MAX_PATH] = {};
-      _snwprintf_s(wfile, _TRUNCATE, L"%s\\unit_names.txt", wdir);
-      if (WideCharToMultiByte(CP_UTF8, 0, wfile, -1, out, (int)out_len, nullptr,
-                              nullptr) > 0) {
-        return true;
+    wchar_t wdev[MAX_PATH] = {};
+    std::wcsncpy(wdev, wdir, MAX_PATH - 1);
+    bool ok = wdev[0] != 0;
+    for (int i = 0; ok && i < 3; ++i) {
+      wchar_t* slash = wcsrchr(wdev, L'\\');
+      if (!slash) {
+        ok = false;
+        break;
       }
+      *slash = 0;
+    }
+    if (ok) {
+      wchar_t wfile[MAX_PATH] = {};
+      _snwprintf_s(wfile, _TRUNCATE, L"%s\\unit_names.txt", wdev);
+      if (exists(wfile)) return to_utf8(wfile);
     }
   }
 
-  // Dev fallback: <repo>/overlay/bin/<dll> → <repo>/unit_names.txt
-  {
-    wchar_t wdir[MAX_PATH] = {};
-    std::wcsncpy(wdir, wpath, MAX_PATH - 1);
-    for (int i = 0; i < 3; ++i) {
-      wchar_t* slash = wcsrchr(wdir, L'\\');
-      if (!slash) break;
-      *slash = 0;
-    }
-    wchar_t wfile[MAX_PATH] = {};
-    _snwprintf_s(wfile, _TRUNCATE, L"%s\\unit_names.txt", wdir);
-    if (WideCharToMultiByte(CP_UTF8, 0, wfile, -1, out, (int)out_len, nullptr,
-                            nullptr) > 0) {
+  // 3) Per-user store.
+  wchar_t appdata[MAX_PATH] = {};
+  const DWORD len = GetEnvironmentVariableW(L"LOCALAPPDATA", appdata, MAX_PATH);
+  if (len == 0 || len >= MAX_PATH) return false;
+  wchar_t wstore[MAX_PATH] = {};
+  _snwprintf_s(wstore, _TRUNCATE, L"%s\\RA3Overlay", appdata);
+  CreateDirectoryW(wstore, nullptr);
+  _snwprintf_s(wstore, _TRUNCATE, L"%s\\RA3Overlay\\unit_names.txt", appdata);
+  return to_utf8(wstore);
+}
+
+// Locate one entry of the packed name-table blob inside this DLL.
+// Blob layout: u32 magic 'UNAM', u32 version, u32 count,
+//              then per entry: u16 name_len, name, u32 data_len, data.
+bool embedded_name_table(const char* entry, const char** data, size_t* len) {
+  if (!entry || !data || !len) return false;
+  HMODULE self = nullptr;
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          reinterpret_cast<LPCWSTR>(&embedded_name_table),
+                          &self) ||
+      !self) {
+    return false;
+  }
+  HRSRC res = FindResourceW(self, MAKEINTRESOURCEW(2), MAKEINTRESOURCEW(10));
+  if (!res) return false;
+  HGLOBAL glob = LoadResource(self, res);
+  if (!glob) return false;
+  const DWORD nbytes = SizeofResource(self, res);
+  const char* base = static_cast<const char*>(LockResource(glob));
+  if (!base || nbytes < 12) return false;
+
+  unsigned magic = 0, version = 0, count = 0;
+  std::memcpy(&magic, base, 4);
+  std::memcpy(&version, base + 4, 4);
+  std::memcpy(&count, base + 8, 4);
+  if (magic != 0x4D414E55u || version != 1u) return false;
+
+  const size_t key_len = std::strlen(entry);
+  size_t off = 12;
+  for (unsigned i = 0; i < count; ++i) {
+    if (off + 2 > nbytes) return false;
+    unsigned short klen = 0;
+    std::memcpy(&klen, base + off, 2);
+    off += 2;
+    if (off + klen + 4 > nbytes) return false;
+    const bool hit = klen == key_len && std::memcmp(base + off, entry, klen) == 0;
+    off += klen;
+    unsigned dlen = 0;
+    std::memcpy(&dlen, base + off, 4);
+    off += 4;
+    if (off + dlen > nbytes) return false;
+    if (hit) {
+      *data = base + off;
+      *len = dlen;
       return true;
     }
+    off += dlen;
   }
   return false;
 }
@@ -394,21 +468,42 @@ bool parse_name_line(const std::string& line, std::string* id, std::string* zh) 
   return !id->empty() && !zh->empty();
 }
 
+void load_names_text_into(NameMap* m, const char* data, size_t len,
+                          bool overwrite) {
+  if (!m || !data || !len) return;
+  size_t i = 0;
+  if (len >= 3 && static_cast<unsigned char>(data[0]) == 0xEF &&
+      static_cast<unsigned char>(data[1]) == 0xBB &&
+      static_cast<unsigned char>(data[2]) == 0xBF) {
+    i = 3;  // UTF-8 BOM
+  }
+  std::string line;
+  for (; i <= len; ++i) {
+    const bool eol = (i == len) || data[i] == '\n';
+    if (!eol) {
+      line.push_back(data[i]);
+      continue;
+    }
+    std::string id, zh;
+    if (parse_name_line(line, &id, &zh) &&
+        (overwrite || m->find(id) == m->end())) {
+      (*m)[id] = zh;
+    }
+    line.clear();
+  }
+}
+
 bool load_names_file_into(NameMap* m, const char* path, bool overwrite) {
   if (!m || !path || !path[0]) return false;
   std::ifstream f(path, std::ios::binary);
   if (!f) return false;
+  std::string text;
   std::string line;
-  char bom[3] = {};
-  f.read(bom, 3);
-  if (!(bom[0] == (char)0xEF && bom[1] == (char)0xBB && bom[2] == (char)0xBF)) {
-    f.seekg(0);
-  }
   while (std::getline(f, line)) {
-    std::string id, zh;
-    if (!parse_name_line(line, &id, &zh)) continue;
-    if (overwrite || m->find(id) == m->end()) (*m)[id] = zh;
+    text += line;
+    text.push_back('\n');
   }
+  load_names_text_into(m, text.data(), text.size(), overwrite);
   return true;
 }
 
@@ -420,11 +515,12 @@ bool write_unit_names_file(const NameMap& m, const char* path) {
   const unsigned char bom[] = {0xEF, 0xBB, 0xBF};
   f.write(reinterpret_cast<const char*>(bom), 3);
   f << u8"# RA3 Overlay 单位种类名（UTF-8）\r\n";
-  f << u8"# 与 DLL 同目录（overlay\\bin\\unit_names.txt）\r\n";
+  f << u8"# 保存位置: %LOCALAPPDATA%\\RA3Overlay\\unit_names.txt\r\n";
+  f << u8"# （若 DLL 同目录存在 unit_names.txt，则沿用该文件）\r\n";
   f << u8"# 格式: TypeId=显示名\r\n";
   f << u8"#       sig_XXXXXXXX=显示名（模板字符串指纹，跨局可用）\r\n";
   f << u8"#       tpl_XXXXXXXX=显示名（旧版内存地址键，重启后失效，可删）\r\n";
-  f << u8"# CSF 基底: 同目录 unit_names_csf.txt；本文件覆盖优先\r\n";
+  f << u8"# CSF 基底: 已打包进 DLL；本文件覆盖优先\r\n";
   f << u8"# 可在游戏内点「修改」保存，也可手动编辑本文件。\r\n";
   for (const auto& kv : m) {
     f << kv.first << '=' << kv.second << "\r\n";
@@ -440,35 +536,44 @@ void load_unit_names_unlocked() {
     resolve_unit_names_path(g_unit_names_path, sizeof(g_unit_names_path));
   }
 
-  // 1) Official CSF export (Name:<TypeId>).
-  char csf_path[MAX_PATH] = {};
-  if (g_unit_names_path[0] &&
-      sibling_names_path(g_unit_names_path, "unit_names_csf.txt", csf_path,
-                         sizeof(csf_path))) {
-    if (load_names_file_into(&g_unit_names, csf_path, true)) {
-      log("unit names CSF loaded: %s (%d entries)", csf_path,
-          (int)g_unit_names.size());
+  // 1) Official CSF export (Name:<TypeId>) — packed inside the DLL. A loose
+  //    unit_names_csf.txt next to the DLL is only a fallback for older layouts.
+  const char* blob = nullptr;
+  size_t blob_len = 0;
+  if (embedded_name_table("csf", &blob, &blob_len)) {
+    load_names_text_into(&g_unit_names, blob, blob_len, true);
+    log("unit names CSF loaded from DLL (%d entries)", (int)g_unit_names.size());
+  } else {
+    char csf_path[MAX_PATH] = {};
+    if (g_unit_names_path[0] &&
+        sibling_names_path(g_unit_names_path, "unit_names_csf.txt", csf_path,
+                           sizeof(csf_path))) {
+      if (load_names_file_into(&g_unit_names, csf_path, true)) {
+        log("unit names CSF loaded: %s (%d entries)", csf_path,
+            (int)g_unit_names.size());
+      }
     }
   }
 
   // 2) Builtins fill gaps only.
   seed_builtins(&g_unit_names);
 
-  // 3) User file overrides (persisted separately so saves don't dump CSF).
-  bool file_ok = false;
-  if (g_unit_names_path[0]) {
-    if (load_names_file_into(&g_user_names, g_unit_names_path, true)) {
-      file_ok = true;
-      for (const auto& kv : g_user_names) {
-        g_unit_names[kv.first] = kv.second;
-      }
-    }
+  // 3) Default override table, also packed inside the DLL. Disk overrides are
+  //    persisted separately so saves never dump the whole CSF catalog.
+  if (embedded_name_table("user", &blob, &blob_len)) {
+    load_names_text_into(&g_user_names, blob, blob_len, true);
+    for (const auto& kv : g_user_names) g_unit_names[kv.first] = kv.second;
+    log("unit names overrides loaded from DLL (%d entries)",
+        (int)g_user_names.size());
   }
 
-  // First run: create an empty-ish user file with comment header only if missing.
-  if (!file_ok && g_unit_names_path[0]) {
-    write_unit_names_file(g_user_names, g_unit_names_path);
-    log("unit names store created: %s", g_unit_names_path);
+  // 4) User edits: portable file beside the DLL, or %LOCALAPPDATA%\RA3Overlay.
+  //    Nothing is created here on first run, so the folder stays clean.
+  if (g_unit_names_path[0] &&
+      load_names_file_into(&g_user_names, g_unit_names_path, true)) {
+    for (const auto& kv : g_user_names) g_unit_names[kv.first] = kv.second;
+    log("unit names store loaded: %s (%d entries)", g_unit_names_path,
+        (int)g_user_names.size());
   }
   g_unit_names_loaded = true;
 }

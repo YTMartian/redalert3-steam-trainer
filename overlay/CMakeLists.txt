@@ -16,6 +16,10 @@ set(UNIT_RC ${CMAKE_CURRENT_BINARY_DIR}/unit_images.rc)
 if(NOT EXISTS "${UNIT_RC}")
   message(FATAL_ERROR "Missing ${UNIT_RC}. build.bat packs unit_images into the DLL first.")
 endif()
+set(NAME_RC ${CMAKE_CURRENT_BINARY_DIR}/name_tables.rc)
+if(NOT EXISTS "${NAME_RC}")
+  message(FATAL_ERROR "Missing ${NAME_RC}. build.bat packs the unit name tables into the DLL first.")
+endif()
 
 add_library(ra3_overlay SHARED
   src/dllmain.cpp
@@ -46,6 +50,7 @@ add_library(ra3_overlay SHARED
   ${MINHOOK_DIR}/src/trampoline.c
   ${MINHOOK_DIR}/src/hde/hde32.c
   ${UNIT_RC}
+  ${NAME_RC}
 )
 
 target_include_directories(ra3_overlay PRIVATE

@@ -5,6 +5,10 @@
 
 每个 hook: (名称, 原始RVA偏移, 原始指令(AOB), Steam新VA, 状态)
 状态: ok=已唯一定位 / guess=候选待验证 / todo=未定位
+
+注意：本表是早期的定位记录。实际装机地址以 core_hooks.py 为准——
+Power / SCPoint 因为原站点把函数内部 jmp 的落点包进了补丁（会 eip=1 崩溃），
+已经从 0xA64DAD / 0xA64F0C 前移到分支头 0xA64DA7 / 0xA64EF6，见 README。
 """
 
 # 原始模块基址 0x400000，所有偏移均为 RVA

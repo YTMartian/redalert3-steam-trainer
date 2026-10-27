@@ -54,16 +54,21 @@ if exist "build\CMakeCache.txt" (
 
 python "%~dp0tools\pack_unit_images.py" "%~dp0..\unit_images" "%~dp0build"
 if errorlevel 1 exit /b 1
+
+rem Name tables are packed into the DLL too, so a release folder has no loose
+rem data files. Pack straight from the repo root, then drop any copy that a
+rem previous build (or a checkout) left in overlay\bin.
+python "%~dp0tools\pack_name_tables.py" "%~dp0.." "%~dp0build"
+if errorlevel 1 exit /b 1
+if exist "%~dp0bin\unit_names.txt" del /q "%~dp0bin\unit_names.txt"
+if exist "%~dp0bin\unit_names_csf.txt" del /q "%~dp0bin\unit_names_csf.txt"
+
 "%CMAKE%" -S . -B build -A Win32
 if errorlevel 1 exit /b 1
 "%CMAKE%" --build build --config Release
 if errorlevel 1 exit /b 1
-rem Keep name tables beside the DLL for portable installs.
-if exist "%~dp0..\unit_names_csf.txt" copy /Y "%~dp0..\unit_names_csf.txt" "%~dp0bin\unit_names_csf.txt" >nul
-if exist "%~dp0..\unit_names.txt" copy /Y "%~dp0..\unit_names.txt" "%~dp0bin\unit_names.txt" >nul
-if exist "%~dp0bin\unit_names_csf.txt" if not exist "%~dp0..\unit_names_csf.txt" copy /Y "%~dp0bin\unit_names_csf.txt" "%~dp0..\unit_names_csf.txt" >nul
 echo.
 echo Built: %~dp0bin\ra3_overlay_v4.dll
-echo Name tables: %~dp0bin\unit_names*.txt
+echo Name tables: packed into the DLL from ..\unit_names*.txt (no loose files)
 echo Icons: packed into the DLL from ..\unit_images
 endlocal

@@ -26,7 +26,7 @@
 
 日志在注入器同目录：`overlay\bin\ra3_overlay.log`。每次重新注入会把上一份改名为 `ra3_overlay.log.prev`（不再直接删掉，崩溃现场往往就在上一份里），新记录写新文件。崩溃堆栈另写 `ra3_overlay.log.crash`，这个文件**从不删除**，跨会话累加。DLL 路径解析失败时才会退到系统临时目录。
 
-发给别的玩家时，只拷贝 `overlay\bin\main.exe` 即可。第一次运行会在这个 exe 旁边释出 `ra3_overlay_v4.dll`、`arm_mustcode.dll` 和 `unit_names_csf.txt`。`arm_mustcode.dll` 仍是装配程序，只是扩展名改成 dll，避免和 `main.exe` 点错。已有的 `unit_names.txt` 不会被盖掉。单位图标在 DLL 内部，不再写出 `unit_images` 文件夹。界面、热键和日志写在 exe 旁边（`overlay_ui.ini`、`ra3_overlay.log`），摄像机配置写在 `ra3_camera.ini`（同一个目录）。原版和起义时刻的版本引导图都留在注入器内部。本机如果还留着仓库根目录的旧界面文件，下次注入会把它复制到 DLL 旁边。
+发给别的玩家时，只拷贝 `overlay\bin\main.exe` 即可。第一次运行会在这个 exe 旁边释出 `ra3_overlay_v4.dll` 和 `arm_mustcode.dll`。`arm_mustcode.dll` 仍是装配程序，只是扩展名改成 dll，避免和 `main.exe` 点错。单位图标和两份种类名表（`unit_names_csf.txt`、`unit_names.txt`）都编进 DLL 内部，不再写出任何数据文件；游戏内改的单位名保存在 `%LOCALAPPDATA%\RA3Overlay\unit_names.txt`。旧版遗留在 exe 旁边的 `unit_names*.txt` 会被自动迁移并删除（手改名不会丢）。界面、热键和日志写在 exe 旁边（`overlay_ui.ini`、`ra3_overlay.log`），摄像机配置写在 `ra3_camera.ini`（同一个目录）。原版和起义时刻的版本引导图都留在注入器内部。本机如果还留着仓库根目录的旧界面文件，下次注入会把它复制到 DLL 旁边。
 
 ### 界面约定
 
@@ -300,7 +300,7 @@ unit_images/
 python overlay\tools\extract_csf_names.py --ra3 "你的RA3安装目录"
 ```
 
-生成 `overlay\bin\unit_names_csf.txt`。注入器会把它和图标一起释到 exe 旁边。手动覆盖写在同目录 `unit_names.txt`，优先于 CSF，重新运行注入器不会盖掉这份手改文件。
+生成仓库根目录的 `unit_names_csf.txt`（旁边还有手写的 `unit_names.txt` 覆盖表）。`build.bat` 直接把这两份编进 `ra3_overlay_v4.dll`，`overlay\bin` 里不留任何散文件，所以发布目录只有一个 `main.exe`。发布后想手改名字，写 `%LOCALAPPDATA%\RA3Overlay\unit_names.txt`（优先于 CSF，重新注入不会盖掉）；若 DLL 同目录放着 `unit_names.txt`，则沿用那一份。
 
 ---
 
@@ -333,8 +333,8 @@ python overlay\tools\extract_csf_names.py --ra3 "你的RA3安装目录"
 |------|-----|------|
 | PlayerID | `0x54119B` | 玩家 ID |
 | Money | `0xA64E9E` | 金钱 |
-| Power | `0xA64DAD` | 电力 |
-| SCPoint | `0xA64F0C` | 科技点 |
+| Power | `0xA64DA7` | 电力（从 `je` 分支头挂，见下） |
+| SCPoint | `0xA64EF6` | 科技点（从 `test eax,eax` 分支头挂） |
 | HaveAllSC | `0xA64F55` | 全科技 |
 | FastBuild1 | `0x74D81E` | 快速建造 |
 | FastBuild2 | `0x74D77C` | 快速建造 |
@@ -350,6 +350,8 @@ python overlay\tools\extract_csf_names.py --ra3 "你的RA3安装目录"
 | EnemyCantBuild | `0x74D920` | 敌人无法建造 |
 
 写入前逐条核对原始字节：对不上就跳过这条并在日志里写明「hook X not armed (site bytes differ)」，其余照常装。PlayerID 是注入口的硬门槛——它要是对不上，整次注入会停在 probe failed：多半不是 1.12，或别的修改器已经改过那个位置。
+
+**补丁区间不能包含函数内部跳转的落点。** 5 字节 `E9` 会把整段被偷的字节一起覆盖，如果同一函数里还有一条 `jmp`/`jcc` 落在被偷区间内部（尤其是两条分支合并到同一条指令的地方），那条路就会跳进 `E9` 的位移字节里，把被偷的指令（常见的是 `mov ecx,[esi+…]` 这种寄存器重载）整条跳过去，随后 `call [错误 this + 0xC]` 直接崩。Power 和 SCPoint 就是这样：原站点 `0xA64DAD` / `0xA64F0C` 把「空表」与「非空」两条分支的合并点 `0xA64DB0` / `0xA64F0F` 包进了补丁，电力对象里那张表一旦非空（正常局里绝大多数时候是空的，所以能撑很久）就会 `eip=00000001` 崩在 `call edx` 上。现在两条都改成**从分支头开始挂**（`0xA64DA7` / `0xA64EF6`，偷 15 / 25 字节），stub 里自己重做分支判断，再统一跳回合并点之后。给 hook 选址时按这个规则反汇编站点前后 ±0x40 字节检查一遍，落点在 `[站点, 站点+长度)` 内就往前挪到分支头。
 
 ### 另一层：MinHook
 
@@ -672,8 +674,8 @@ Windows 安全中心有时会把注入器隔离。这是附加进程、写内存
 |------|-----|------|
 | PlayerID | `0x54915B` | 玩家 ID |
 | Money | `0xA7C7FA` | 金钱 |
-| Power | `0xA7C6F8` | 电力（读 `[esi+0x3E0]`） |
-| SCPoint | `0xA7C868` | 科技点 |
+| Power | `0xA7C6F2` | 电力（读 `[esi+0x3E0]`，从分支头挂） |
+| SCPoint | `0xA7C852` | 科技点（从分支头挂） |
 | HaveAllSC | `0xA7C8B1` | 全科技 |
 | FastBuild1 | `0x76090E` | 快速建造 |
 | FastBuild2 | `0x76086C` | 快速建造 |

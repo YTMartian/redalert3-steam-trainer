@@ -12,6 +12,7 @@ from __future__ import print_function
 
 import ctypes
 import hashlib
+import io
 import os
 import shutil
 import struct
@@ -331,10 +332,88 @@ def _copy_if_different(src, dst):
     return False, last_err or u'copy failed'
 
 
-def extract_bundled_payload(dest_dir, include_dll=True, only_dll=False, bundle=None):
-    """Unpack DLL, arm helper and name tables next to the injector exe.
+def _overlay_store_dir():
+    base = os.environ.get('LOCALAPPDATA')
+    if not base:
+        base = os.environ.get('APPDATA') or os.path.expanduser('~')
+    return os.path.join(base, 'RA3Overlay')
 
-    unit_names.txt is created only when missing, so a hand-edited override stays.
+
+def _read_name_lines(path):
+    """Parse TypeId=显示名 lines. Returns None when the file is unreadable."""
+    try:
+        with io.open(path, 'r', encoding='utf-8-sig', errors='replace') as handle:
+            text = handle.read()
+    except (OSError, IOError):
+        return None
+    entries = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line[0] in u'#;' or u'=' not in line:
+            continue
+        key, value = line.split(u'=', 1)
+        key = key.strip()
+        value = value.strip()
+        if key and value:
+            entries[key] = value
+    return entries
+
+
+def migrate_legacy_name_files(dest_dir):
+    """Older builds wrote unit_names_csf.txt / unit_names.txt next to the exe.
+
+    Both tables are inside ra3_overlay_v4.dll now, so drop the stale CSF export
+    and move hand-edited overrides into %LOCALAPPDATA%\\RA3Overlay. The release
+    folder then holds only main.exe plus the two DLLs. If the copy cannot be
+    written the loose file stays; the DLL still honours it.
+    """
+    stale = os.path.join(dest_dir, 'unit_names_csf.txt')
+    if os.path.isfile(stale):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+
+    legacy = os.path.join(dest_dir, 'unit_names.txt')
+    if not os.path.isfile(legacy):
+        return
+    entries = _read_name_lines(legacy)
+    if entries is None:
+        return
+    if not entries:
+        try:
+            os.remove(legacy)
+        except OSError:
+            pass
+        return
+
+    store_dir = _overlay_store_dir()
+    store = os.path.join(store_dir, 'unit_names.txt')
+    merged = _read_name_lines(store) if os.path.isfile(store) else {}
+    if merged is None:
+        return
+    merged.update(entries)  # the old beside-exe table was the active one
+    try:
+        if not os.path.isdir(store_dir):
+            os.makedirs(store_dir)
+        with io.open(store, 'w', encoding='utf-8-sig', newline='') as handle:
+            handle.write(u'# RA3 Overlay 单位种类名（自旧版 unit_names.txt 迁移）\r\n')
+            handle.write(u'# 格式: TypeId=显示名\r\n')
+            for key in sorted(merged):
+                handle.write(u'%s=%s\r\n' % (key, merged[key]))
+    except (OSError, IOError):
+        return
+    try:
+        os.remove(legacy)
+    except OSError:
+        pass
+
+
+def extract_bundled_payload(dest_dir, include_dll=True, only_dll=False, bundle=None):
+    """Unpack the DLL and arm helper next to the injector exe.
+
+    The unit name tables (unit_names_csf.txt / unit_names.txt) are compiled into
+    ra3_overlay_v4.dll, so nothing else is written to the folder.
     Returns a list of error strings. A DLL still locked by the game is reported
     as 'dll-locked: ...'.
     """
@@ -364,11 +443,6 @@ def extract_bundled_payload(dest_dir, include_dll=True, only_dll=False, bundle=N
         return errors
 
     take('arm_mustcode.dll', True)
-    take('unit_names_csf.txt', True)
-    names_dst = os.path.join(dest_dir, 'unit_names.txt')
-    names_src = os.path.join(root, 'unit_names.txt')
-    if os.path.isfile(names_src) and not os.path.isfile(names_dst):
-        take('unit_names.txt', False)
     return errors
 
 
@@ -973,6 +1047,7 @@ def main():
         if unpack_errors:
             _msg(False, u'无法释出修改器文件：\n' + u'\n'.join(unpack_errors))
             return 1
+        migrate_legacy_name_files(here)
     candidates = [
         os.path.normpath(os.path.join(here, 'ra3_overlay_v4.dll')),
         os.path.normpath(os.path.join(here, 'ra3_overlay.dll')),

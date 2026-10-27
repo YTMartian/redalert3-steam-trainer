@@ -106,7 +106,7 @@ unit_images/
 python overlay\tools\extract_csf_names.py --ra3 "你的RA3安装目录"
 ```
 
-生成 `overlay\bin\unit_names_csf.txt`（与 DLL 同目录，换机拷贝 bin 即可）。手动覆盖写在同目录 `unit_names.txt`（优先于 CSF）。
+生成仓库根目录的 `unit_names_csf.txt`（同目录还有手写的 `unit_names.txt` 覆盖表）。`build.bat` 直接把这两份编进 `ra3_overlay_v4.dll`，`overlay\bin` 里不会留下散文件，发布时只有一个 `main.exe`。手改覆盖写在 `%LOCALAPPDATA%\RA3Overlay\unit_names.txt`（优先于 CSF）；DLL 同目录若存在 `unit_names.txt` 则优先沿用该文件。
 
 ## 编译
 
@@ -167,13 +167,12 @@ overlay/
   build_injector.bat
   assets/ra3_overlay_icon.ico
   bin/
-    ra3_overlay_v4.dll
-    unit_names_csf.txt       # CSF 官方名称表（与 DLL 同目录）
-    unit_names.txt           # 手动覆盖（与 DLL 同目录）
-                             # 图标编进 DLL，源图在仓库根 unit_images/
+    ra3_overlay_v4.dll       # 名称表/图标都编在这一个 DLL 里
+                             # 图标源图在仓库根 unit_images/
     ra3_camera.ini           # 摄像机配置（运行期生成，不入库）
     main.exe   # 由 build_injector.bat 生成，*.exe 默认不入库
     arm_mustcode.dll         # 装配程序，扩展名做成 dll
+                             # 名称表源文件在仓库根 unit_names*.txt，打包后 bin 里不留散文件
   src/          # dllmain, d3d9_hook, ui, input, game_api, game_features
                 # camera(相机接管/轨迹/定时事件/配置), time_control(时间倍率/快进)
                 # lua_bridge(Lua 桥 + 动画跟踪), render_misc(血条剪影/阴影/光照)

@@ -47,27 +47,19 @@ if not exist "%REPO%\overlay\bin\ra3_overlay_v4.dll" (
   echo Missing overlay\bin\ra3_overlay_v4.dll. Run overlay\build.bat first.
   goto :err
 )
-if exist "%REPO%\unit_names_csf.txt" copy /Y "%REPO%\unit_names_csf.txt" "%REPO%\overlay\bin\unit_names_csf.txt" >nul
-if exist "%REPO%\unit_names.txt" copy /Y "%REPO%\unit_names.txt" "%REPO%\overlay\bin\unit_names.txt" >nul
-if not exist "%REPO%\overlay\bin\unit_names_csf.txt" (
-  echo Missing overlay\bin\unit_names_csf.txt. Run overlay\build.bat first.
-  goto :err
-)
 
 echo [3/4] packaging main.exe ...
-set ADD_NAMES=
-if exist "%REPO%\overlay\bin\unit_names.txt" set ADD_NAMES=--add-data "%REPO%\overlay\bin\unit_names.txt;."
-"%PY%" -m PyInstaller --noconfirm --onefile --noconsole --uac-admin --name main --icon "%ICON%" --distpath "%REPO%\overlay\bin" --workpath "%REPO%\overlay\build\pyi_inject" --specpath "%REPO%\overlay\build" --add-binary "%REPO%\overlay\bin\ra3_overlay_v4.dll;." --add-binary "%REPO%\overlay\bin\arm_mustcode.dll;." --add-data "%REPO%\overlay\bin\unit_names_csf.txt;." %ADD_NAMES% --add-data "%REPO%\v1.12_change_method;v1.12_change_method" --add-data "%REPO%\uprising_v1.0_change_method;uprising_v1.0_change_method" "%REPO%\overlay\tools\inject.py"
+"%PY%" -m PyInstaller --noconfirm --onefile --noconsole --uac-admin --name main --icon "%ICON%" --distpath "%REPO%\overlay\bin" --workpath "%REPO%\overlay\build\pyi_inject" --specpath "%REPO%\overlay\build" --add-binary "%REPO%\overlay\bin\ra3_overlay_v4.dll;." --add-binary "%REPO%\overlay\bin\arm_mustcode.dll;." --add-data "%REPO%\v1.12_change_method;v1.12_change_method" --add-data "%REPO%\uprising_v1.0_change_method;uprising_v1.0_change_method" "%REPO%\overlay\tools\inject.py"
 if errorlevel 1 goto :err
 
 echo [4/4] done
 echo.
 echo Done:
 echo   overlay\bin\main.exe
-echo Ship that exe alone. On launch it unpacks the DLL, arm_mustcode.dll
-echo and unit_names*.txt next to itself. arm_mustcode.dll is the helper
-echo program with a dll name so it is not the file to double-click.
-echo Unit icons stay inside the DLL.
+echo Ship that exe alone. On launch it unpacks the DLL and arm_mustcode.dll
+echo next to itself. arm_mustcode.dll is the helper program with a dll name
+echo so it is not the file to double-click.
+echo Unit icons and the unit name tables stay inside the DLL.
 exit /b 0
 
 :err

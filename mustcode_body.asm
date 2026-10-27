@@ -69,39 +69,27 @@ mov dword ptr [eax+0x04], 0x000186A0
 mov dword ptr [eax+0x08], 0x00000000
 Popad
 Popfd
+cmp dword ptr [ecx],ecx
+.byte 0x75,0x05
 mov eax,[eax+0x04]
+.byte 0xeb,0x02
+xor eax,eax
 mov ecx,[esi+0x000003B0]
 jmp _BackPlayerPower
 nop
 nop
-nop
-nop
-nop
-nop
-nop
-nop
-nop
-nop
 MC+0x9F:
-pushfd
-pushad
+xor edi,edi
+test eax,eax
+.byte 0x74,0x1d
+mov eax,[eax+0x00001320]
+test eax,eax
+.byte 0x74,0x13
 cmp byte ptr [FLAGS+0xA],0x01
 .byte 0x75,0x07
 mov dword ptr [eax+0x34], 0x0000000f
-popad
-popfd
 mov edi,[eax+0x34]
-mov ecx,[esi+0x3c]
 jmp _BackPlayerSCPoint
-nop
-nop
-nop
-nop
-nop
-nop
-nop
-nop
-nop
 nop
 MC+0xc8:
 pushfd

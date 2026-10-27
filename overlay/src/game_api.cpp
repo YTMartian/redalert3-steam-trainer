@@ -256,7 +256,7 @@ bool g_auto_spec = true;
 struct InstalledHook {
   const char* name;
   uint32_t va;
-  uint8_t aob[16];
+  uint8_t aob[32];
   uint8_t aob_len;
 };
 std::vector<InstalledHook> g_installed;

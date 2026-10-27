@@ -5,6 +5,9 @@ bin/*.dll
 bin/*.exp
 bin/*.lib
 bin/*.pdb
+# 名称表是仓库根目录的构建输入，由 build.bat 打包进 DLL；发布目录不放散文件
+bin/unit_names.txt
+bin/unit_names_csf.txt
 
 # Duplicate vendor checkouts
 third_party/imgui-master/

@@ -118,7 +118,7 @@ def main():
     parts.append('  uint32_t hook_va;   // absolute VA including 0x400000')
     parts.append('  uint32_t mc_label;  // offset into MustCode')
     parts.append('  uint8_t aob_len;')
-    parts.append('  uint8_t aob[16];')
+    parts.append('  uint8_t aob[32];')
     parts.append('};')
     parts.append('')
     parts.append(c_bytes(mc_a, 'kEmbeddedMc'))

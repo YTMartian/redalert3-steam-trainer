@@ -10,13 +10,75 @@
 import pefile
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32
 
+_md = Cs(CS_ARCH_X86, CS_MODE_32)
+
+
+def _is_insn_start(code, addr, text_va):
+    """地址是否落在一条指令的起点（用向后 1..15 字节反解判断）。"""
+    base_off = addr - text_va
+    for back in range(1, 16):
+        off = base_off - back
+        if off < 0:
+            break
+        insns = list(_md.disasm(bytes(code[off:off + back + 1]), addr - back))
+        if insns and insns[0].address == addr - back and insns[0].size == back:
+            return True
+    return False
+
+
+def scan_hazards(module_path='ra3_1.12.game', hooks=None):
+    """找落在某个 hook 补丁区间内部的 jmp/jcc/call。
+
+    5 字节 E9 会把整段被偷的字节一起盖掉。如果同一函数里还有分支落在
+    [站点, 站点+长度) 里面，那条路会跳进 E9 的位移字节，把 stub 本该重放的
+    指令整条跳过去 —— 典型后果就是 eip=1 的 use-after-free 式崩溃。
+    Power / SCPoint 原来就是这样，所以现在都从分支头开始挂。
+    """
+    import struct
+    hooks = hooks or CORE_HOOKS
+    pe = pefile.PE(module_path, fast_load=True)
+    data = open(module_path, 'rb').read()
+    base = pe.OPTIONAL_HEADER.ImageBase
+    text_va, code = None, None
+    for sec in pe.sections:
+        if sec.Name.startswith(b'.text'):
+            text_va = base + sec.VirtualAddress
+            code = data[sec.PointerToRawData:sec.PointerToRawData + sec.SizeOfRawData]
+            break
+    if code is None:
+        return []
+    ranges = [(va, va + len(aob) // 2, name) for name, va, aob, _ in hooks]
+    hits = []
+    for i in range(len(code) - 5):
+        b = code[i]
+        tgt = None
+        if b in (0xE8, 0xE9):
+            tgt = text_va + i + 5 + struct.unpack_from('<i', code, i + 1)[0]
+        elif b == 0x0F and 0x80 <= code[i + 1] <= 0x8F:
+            tgt = text_va + i + 6 + struct.unpack_from('<i', code, i + 2)[0]
+        elif b == 0xEB:
+            tgt = text_va + i + 2 + struct.unpack_from('<b', code, i + 1)[0]
+        elif 0x70 <= b <= 0x7F:
+            tgt = text_va + i + 2 + struct.unpack_from('<b', code, i + 1)[0]
+        if tgt is None:
+            continue
+        src = text_va + i
+        for lo, hi, name in ranges:
+            if lo < tgt < hi and not (lo <= src < hi) and _is_insn_start(code, src, text_va):
+                hits.append((name, src, tgt))
+    return hits
+
+
 # 17 个已定位 hook（名称, Steam VA, AOB, jmp目标偏移）
 # jmp 目标偏移 = MustCode 块内偏移（十六进制）
 CORE_HOOKS = [
     ('PlayerID',       0x54119B, '8b50288b4220',          0x1200),
     ('Money',          0xA64E9E, '0378048b11',            0x29),
-    ('Power',          0xA64DAD, '8b40048b8eb0030000',    0x6c),
-    ('SCPoint',        0xA64F0C, '8b78348b4e3c',          0x9f),
+    # Power/SCPoint 从分支头开始挂：原来的站点把函数内部 jmp 的落点
+    # （0xA64DB0 / 0xA64F0F）包进了 E9 补丁，非空分支跳进补丁中间会跳过
+    # 寄存器重载，进而 call 到错误对象。详见 README。
+    ('Power',          0xA64DA7, '740433c0eb038b40048b8eb0030000', 0x6c),
+    ('SCPoint',        0xA64EF6, '85c0750433ffeb118b802013000085c0750433ffeb038b7834', 0x9f),
     ('HaveAllSC',      0xA64F55, 'f30f10472c',            0xc8),
     ('FastBuild1',     0x74D81E, 'f30f2c461c',            0xf0),
     ('FastBuild2',     0x74D77C, 'd9461c89465c',          0x118),
@@ -47,3 +109,17 @@ if __name__ == '__main__':
         print('%-15s va=0x%08X len=%d jmp=MustCode+0x%X' % (name, va, len(aob)//2, target))
     print()
     print('total %d hooks' % len(CORE_HOOKS))
+    import os
+    if os.path.exists('ra3_1.12.game'):
+        hits = scan_hazards()
+        if hits:
+            print()
+            print('[警告] 这些分支会落进补丁区间，该 hook 应往前挪到分支头：')
+            for name, src, tgt in hits:
+                print('  %-13s 分支 %08X -> %08X' % (name, src, tgt))
+        else:
+            print()
+            print('补丁区间内没有内部分支落点：OK')
+    else:
+        print()
+        print('（当前目录没有 ra3_1.12.game，跳过分支落点检查）')
