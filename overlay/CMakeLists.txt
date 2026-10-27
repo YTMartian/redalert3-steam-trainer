@@ -78,6 +78,8 @@ target_link_libraries(ra3_overlay PRIVATE
   imm32
   ole32
   windowscodecs
+  advapi32
+  shell32
 )
 
 # Primary output uses a distinct name so builds succeed while the game still
@@ -219,8 +221,9 @@ if(INJECTOR_PAYLOADS_OK)
   set_property(SOURCE ${CMAKE_CURRENT_BINARY_DIR}/injector_payload.rc APPEND
     PROPERTY OBJECT_DEPENDS "${INJECTOR_PAYLOAD_OVERLAY};${INJECTOR_PAYLOAD_ARM};${INJECTOR_ICON}")
 
+  # 输出就叫 main.exe：原生注入器已经取代 PyInstaller 版，玩家的路径/快捷方式不用改。
   set_target_properties(ra3_injector PROPERTIES
-    OUTPUT_NAME "ra3_injector"
+    OUTPUT_NAME "main"
     RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_SOURCE_DIR}/bin
     RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_CURRENT_SOURCE_DIR}/bin
   )

@@ -1,5 +1,5 @@
 @echo off
-rem Build the native injector: overlay\bin\ra3_injector.exe (Win32 / x86).
+rem Build the native injector: overlay\bin\main.exe (Win32 / x86).
 rem
 rem Native replacement for the PyInstaller main.exe, step 1: find the game
 rem process, unload an older overlay, inject the DLL with LoadLibraryW, then
@@ -64,7 +64,7 @@ if errorlevel 1 exit /b 1
 if errorlevel 1 exit /b 1
 
 echo.
-echo Built: %~dp0bin\ra3_injector.exe
+echo Built: %~dp0bin\main.exe
 echo It writes ra3_overlay_v4.dll and arm_mustcode.dll beside itself on first run.
 echo No temp directory is used.
 endlocal

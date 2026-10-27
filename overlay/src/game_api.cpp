@@ -4,6 +4,7 @@
 
 #include <Windows.h>
 #include <TlHelp32.h>
+#include <shellapi.h>
 
 #include <cstdarg>
 #include <cstdio>
@@ -882,6 +883,117 @@ static bool find_tool_path(char* out, size_t out_len, const wchar_t* leaf_name) 
   return false;
 }
 
+// arm_mustcode 是 PyInstaller 单文件程序：启动时要把自己解到 %TEMP%\_MEIxxxxxx，
+// 建不出目录就弹 "INTERNAL ERROR: cannot create temporary directory!"（游戏里
+// 玩家只会看到"装配失败"）。这里给它一个"确定可写"的目录：DLL 自己就在往同一
+// 个文件夹写 ra3_overlay_arm_result.txt，说明游戏进程能写；结果文件也落到那里，
+// 两边用同一个路径，不再依赖 %TEMP%。
+// 当前进程的完整性级别（0x2000=中，0x3000=高，0x1000=低）。只用来写日志。
+static int current_integrity_level() {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return -1;
+  BYTE buf[64] = {};
+  DWORD need = 0;
+  int il = -1;
+  if (GetTokenInformation(token, TokenIntegrityLevel, buf, sizeof(buf), &need)) {
+    const PSID sid = reinterpret_cast<PTOKEN_MANDATORY_LABEL>(buf)->Label.Sid;
+    const DWORD n = *GetSidSubAuthorityCount(sid);
+    il = (int)*GetSidSubAuthority(sid, n - 1);
+  }
+  CloseHandle(token);
+  return il;
+}
+
+static bool arm_temp_dir(char* out, size_t out_len) {  if (!out || out_len < 8) return false;
+  wchar_t dll_path[MAX_PATH] = {};
+  HMODULE self = nullptr;
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          reinterpret_cast<LPCWSTR>(&arm_temp_dir), &self) ||
+      !self || !GetModuleFileNameW(self, dll_path, MAX_PATH)) {
+    return false;
+  }
+  wchar_t* slash = wcsrchr(dll_path, L'\\');
+  if (!slash) return false;
+  *slash = 0;
+  wchar_t dir[MAX_PATH] = {};
+  _snwprintf_s(dir, _TRUNCATE, L"%s\\arm_tmp", dll_path);
+  CreateDirectoryW(dir, nullptr);
+  char narrow[MAX_PATH] = {};
+  if (!WideCharToMultiByte(CP_ACP, 0, dir, -1, narrow, MAX_PATH, nullptr, nullptr)) return false;
+
+  // 探针：写一个字节确认真的能写，不行就退回系统临时目录。
+  char probe[MAX_PATH] = {};
+  _snprintf_s(probe, _TRUNCATE, "%s\\write_probe.tmp", narrow);
+  HANDLE h = CreateFileA(probe, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                         FILE_ATTRIBUTE_TEMPORARY, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  DWORD written = 0;
+  WriteFile(h, "k", 1, &written, nullptr);
+  CloseHandle(h);
+  DeleteFileA(probe);
+
+  _snprintf_s(out, out_len, _TRUNCATE, "%s", narrow);
+  return true;
+}
+
+// 目标进程/子进程的完整性级别（0x2000=中，0x3000=高，0x1000=低）。
+static int process_integrity_level(HANDLE process) {
+  HANDLE token = nullptr;
+  if (!process || !OpenProcessToken(process, TOKEN_QUERY, &token)) return -1;
+  BYTE buf[64] = {};
+  DWORD need = 0;
+  int il = -1;
+  if (GetTokenInformation(token, TokenIntegrityLevel, buf, sizeof(buf), &need)) {
+    const PSID sid = reinterpret_cast<PTOKEN_MANDATORY_LABEL>(buf)->Label.Sid;
+    const DWORD n = *GetSidSubAuthorityCount(sid);
+    il = (int)*GetSidSubAuthority(sid, n - 1);
+  }
+  CloseHandle(token);
+  return il;
+}
+
+// 提权启动（UAC）。这台机器上未签名 exe 以普通权限启动会被降成低完整性，
+// 低完整性打不开游戏进程（OpenProcess err=5）；提权可以绕开——注入器本身
+// 就是这么用的。
+static bool start_elevated(const char* file, const char* params, const char* launch_dir,
+                           PROCESS_INFORMATION* pi) {
+  // ShellExecute 按扩展名找关联：arm_mustcode.dll 会被拒绝（"该文件没有与之关联的
+  // 应用来执行该操作"）。所以提权前先复制成 .exe 再启动；CreateProcess 不看扩展名，
+  // 普通路径仍然直接用 .dll。
+  char exe_path[MAX_PATH] = {};
+  const char* target = file;
+  const size_t len = std::strlen(file);
+  if (len > 4 && _stricmp(file + len - 4, ".dll") == 0 && launch_dir && launch_dir[0]) {
+    _snprintf_s(exe_path, _TRUNCATE, "%s\\arm_mustcode_run.exe", launch_dir);
+    if (CopyFileA(file, exe_path, FALSE)) {
+      target = exe_path;
+      log("arm elevate: copied to %s", exe_path);
+    } else {
+      log("arm elevate: copy failed err=%lu", GetLastError());
+    }
+  }
+  wchar_t file_w[MAX_PATH] = {};
+  wchar_t params_w[1024] = {};
+  if (!MultiByteToWideChar(CP_ACP, 0, target, -1, file_w, MAX_PATH)) return false;
+  if (!MultiByteToWideChar(CP_ACP, 0, params, -1, params_w, 1024)) return false;
+  SHELLEXECUTEINFOW sei{};
+  sei.cbSize = sizeof(sei);
+  sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+  sei.lpVerb = L"runas";
+  sei.lpFile = file_w;
+  sei.lpParameters = params_w;
+  sei.nShow = SW_HIDE;
+  if (!ShellExecuteExW(&sei) || !sei.hProcess) {
+    log("arm elevated launch failed err=%lu", GetLastError());
+    return false;
+  }
+  pi->hProcess = sei.hProcess;
+  pi->hThread = nullptr;
+  pi->dwProcessId = GetProcessId(sei.hProcess);
+  return true;
+}
+
 static bool run_arm_python(std::string* err_out) {
   char tool[MAX_PATH] = {};
   const bool is_exe = find_tool_path(tool, sizeof(tool), L"arm_mustcode.dll") ||
@@ -891,34 +1003,50 @@ static bool run_arm_python(std::string* err_out) {
     return false;
   }
 
+  // 结果文件和子进程的 TEMP/TMP 用同一个目录：arm_mustcode 会按 %TEMP% 写结果，
+  // 它在里面还要建 _MEIxxxxxx，所以这个目录必须两边都认、而且确定可写。
+  char temp_dir[MAX_PATH] = {};
+  const bool have_temp = arm_temp_dir(temp_dir, sizeof(temp_dir));
   char result_path[MAX_PATH] = {};
-  GetTempPathA(MAX_PATH, result_path);
-  std::strncat(result_path, "ra3_overlay_arm_result.txt",
-               sizeof(result_path) - std::strlen(result_path) - 1);
-  DeleteFileA(result_path);
-
-  char cmd[1280];
-  if (is_exe) {
-    std::snprintf(cmd, sizeof(cmd),
-                  "\"%s\" %lu 0x%lX 0x%lX 0x%lX 0x%lX %d", tool,
-                  GetCurrentProcessId(),
-                  (unsigned long)reinterpret_cast<uintptr_t>(g_mc),
-                  (unsigned long)reinterpret_cast<uintptr_t>(g_mc2),
-                  (unsigned long)reinterpret_cast<uintptr_t>(g_flags),
-                  (unsigned long)reinterpret_cast<uintptr_t>(g_idb),
-                  g_spectate_mode ? 1 : 0);
+  if (have_temp) {
+    _snprintf_s(result_path, _TRUNCATE, "%s\\ra3_overlay_arm_result.txt", temp_dir);
   } else {
-    std::snprintf(cmd, sizeof(cmd),
-                  "py -3 \"%s\" %lu 0x%lX 0x%lX 0x%lX 0x%lX %d", tool,
-                  GetCurrentProcessId(),
-                  (unsigned long)reinterpret_cast<uintptr_t>(g_mc),
-                  (unsigned long)reinterpret_cast<uintptr_t>(g_mc2),
-                  (unsigned long)reinterpret_cast<uintptr_t>(g_flags),
-                  (unsigned long)reinterpret_cast<uintptr_t>(g_idb),
-                  g_spectate_mode ? 1 : 0);
+    GetTempPathA(MAX_PATH, result_path);
+    std::strncat(result_path, "ra3_overlay_arm_result.txt",
+                 sizeof(result_path) - std::strlen(result_path) - 1);
   }
+  DeleteFileA(result_path);
+  if (have_temp) log("arm temp dir: %s", temp_dir);
 
+  // 参数：pid mc mc2 flags idb spectate + 结果文件路径。结果路径显式传，因为
+  // 提权启动时 %TEMP% 不是我们改过的那个目录（那边由 AppInfo 起进程）。
+  char params[1024] = {};
+  std::snprintf(params, sizeof(params), "%lu 0x%lX 0x%lX 0x%lX 0x%lX %d \"%s\"",
+                GetCurrentProcessId(),
+                (unsigned long)reinterpret_cast<uintptr_t>(g_mc),
+                (unsigned long)reinterpret_cast<uintptr_t>(g_mc2),
+                (unsigned long)reinterpret_cast<uintptr_t>(g_flags),
+                (unsigned long)reinterpret_cast<uintptr_t>(g_idb),
+                g_spectate_mode ? 1 : 0, result_path);
+
+  char cmd[1280] = {};
+  if (is_exe) {
+    std::snprintf(cmd, sizeof(cmd), "\"%s\" %s", tool, params);
+  } else {
+    std::snprintf(cmd, sizeof(cmd), "py -3 \"%s\" %s", tool, params);
+  }
   log("running: %s", cmd);
+
+  // 把子进程的 TEMP/TMP 指到上面那个可写目录；CreateProcess 会复制当前环境，
+  // 所以创建完立刻还原，避免影响游戏进程自己的后续调用。
+  char saved_tmp[MAX_PATH] = {};
+  char saved_temp[MAX_PATH] = {};
+  const bool had_tmp = GetEnvironmentVariableA("TMP", saved_tmp, MAX_PATH) > 0;
+  const bool had_temp = GetEnvironmentVariableA("TEMP", saved_temp, MAX_PATH) > 0;
+  if (have_temp) {
+    SetEnvironmentVariableA("TMP", temp_dir);
+    SetEnvironmentVariableA("TEMP", temp_dir);
+  }
 
   STARTUPINFOA si{};
   si.cb = sizeof(si);
@@ -926,20 +1054,60 @@ static bool run_arm_python(std::string* err_out) {
   BOOL created = CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE,
                                 CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
   if (!created && !is_exe) {
-    std::snprintf(cmd, sizeof(cmd),
-                  "python \"%s\" %lu 0x%lX 0x%lX 0x%lX 0x%lX %d", tool,
-                  GetCurrentProcessId(),
-                  (unsigned long)reinterpret_cast<uintptr_t>(g_mc),
-                  (unsigned long)reinterpret_cast<uintptr_t>(g_mc2),
-                  (unsigned long)reinterpret_cast<uintptr_t>(g_flags),
-                  (unsigned long)reinterpret_cast<uintptr_t>(g_idb),
-                  g_spectate_mode ? 1 : 0);
+    std::snprintf(cmd, sizeof(cmd), "python \"%s\" %s", tool, params);
     created = CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE,
                              CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
   }
+  if (have_temp) {
+    SetEnvironmentVariableA("TMP", had_tmp ? saved_tmp : nullptr);
+    SetEnvironmentVariableA("TEMP", had_temp ? saved_temp : nullptr);
+  }
+
+  if (created) {
+    // 先看它有没有被降权：低完整性/受限令牌打不开游戏（err=5），
+    // 这种情况杀掉重来，改提权启动。
+    HANDLE token = nullptr;
+    int il = -1;
+    DWORD restricted = 0;
+    if (OpenProcessToken(pi.hProcess, TOKEN_QUERY, &token)) {
+      BYTE buf[64] = {};
+      DWORD need = 0;
+      if (GetTokenInformation(token, TokenIntegrityLevel, buf, sizeof(buf), &need)) {
+        const PSID sid = reinterpret_cast<PTOKEN_MANDATORY_LABEL>(buf)->Label.Sid;
+        const DWORD n = *GetSidSubAuthorityCount(sid);
+        il = (int)*GetSidSubAuthority(sid, n - 1);
+      }
+      GetTokenInformation(token, TokenHasRestrictions, &restricted, sizeof(restricted), &need);
+      CloseHandle(token);
+    }
+    log("arm child token: integrity=0x%X restricted=%lu (this game=0x%X)", il, restricted,
+        current_integrity_level());
+    if (il >= 0 && il < 0x2000) {
+      TerminateProcess(pi.hProcess, 1);
+      WaitForSingleObject(pi.hProcess, 3000);
+      CloseHandle(pi.hThread);
+      CloseHandle(pi.hProcess);
+      pi = PROCESS_INFORMATION{};
+      created = FALSE;
+      log("arm child lowered to 0x%X - relaunching elevated", il);
+    }
+  }
+
   if (!created) {
-    if (err_out) *err_out = "CreateProcess arm_mustcode failed";
-    return false;
+    char launch_dir[MAX_PATH] = {};
+  if (have_temp) {
+    _snprintf_s(launch_dir, _TRUNCATE, "%s", temp_dir);
+  } else {
+    GetTempPathA(MAX_PATH, launch_dir);
+    const size_t n = std::strlen(launch_dir);
+    if (n && (launch_dir[n - 1] == '\\' || launch_dir[n - 1] == '/')) launch_dir[n - 1] = 0;
+  }
+  if (!start_elevated(tool, params, launch_dir, &pi)) {
+      if (err_out) *err_out = "CreateProcess arm_mustcode failed";
+      return false;
+    }
+    log("arm launched elevated (pid=%lu) - accept the UAC prompt if it appears",
+        pi.dwProcessId);
   }
   WaitForSingleObject(pi.hProcess, 90000);
   DWORD code = 1;

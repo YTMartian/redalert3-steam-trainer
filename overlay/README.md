@@ -166,12 +166,13 @@ python gen_payload.py
 
 `payload.py` 里的起义时刻段（`EP1_CORE_HOOKS` + `ep1_asm_and_symbols`）是手写的，生成器会原样保留。别把它删了——`arm_mustcode.py` 顶部就 import 它。
 
-### 原生注入器 `ra3_injector.exe`（实验，第一步）
+### 原生注入器 `main.exe`
 
-PyInstaller 单文件版 `main.exe` 启动时要把 14 MB 解到 `_MEIxxxxxx`，临时目录不可写就弹
+PyInstaller 单文件版启动时要把 14 MB 解到 `_MEIxxxxxx`，临时目录不可写就弹
 `INTERNAL ERROR: cannot create temporary directory!`，而且那一层在 Python 起来之前，脚本兜不住。
-`ra3_injector.exe` 用 C++ 重写同一个注入器：载荷（DLL、装配程序、四张引导图）编进资源段，
-运行时只把两个 DLL 写到 exe 旁边，**不使用任何临时目录**，也不需要 Python。
+现在 `main.exe` 是 C++ 原生实现（CMake target `ra3_injector`，输出名 `main`）：载荷（DLL、装配程序、
+四张引导图）编进资源段，运行时只把两个 DLL 写到 exe 旁边，**不使用任何临时目录**，也不需要 Python。
+`build_injector.bat` 的最后一步现在就是转调它；`main.exe` 里已经不再有 PyInstaller 引导器。
 
 ```bat
 cd overlay

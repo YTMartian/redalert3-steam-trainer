@@ -5530,10 +5530,31 @@ static bool sp_module_owned_by_local(void* self) {
 // Uprising 0x75BB90: SpecialPowerModule::isReady(). Both of its branches agree
 // once [module + 0x20] is in the past, so report ready outright for the local
 // player's modules while a ready toggle (0x18/0x19/0x1A -> 0x0D) is on.
+// 协议限制优先：「禁止」的协议即使开了「协议无冷却」也不许就绪。
+// protocol_from_object 会扫模块内存找协议名，只在真有禁止项时做一次并缓存
+// （模块指针 → 协议面），避免每帧每个技能都扫一遍。
+static bool protocol_banned(const char* id);   // defined below
+static bool protocol_ban_active();             // defined below
+
+static bool module_protocol_banned(void* self) {
+  if (!protocol_ban_active() || !self) return false;
+  static void* cached_self = nullptr;
+  static const ProtocolFace* cached_face = nullptr;
+  if (self != cached_self) {
+    cached_self = self;
+    cached_face = protocol_from_object(reinterpret_cast<uint32_t>(self));
+  }
+  return cached_face && protocol_banned(cached_face->id);
+}
+
+// Uprising 0x75BB90: SpecialPowerModule::isReady(). Both of its branches agree
+// once [module + 0x20] is in the past, so report ready outright for the local
+// player's modules while a ready toggle (0x18/0x19/0x1A -> 0x0D) is on.
 typedef unsigned char(__fastcall* fn_sp_ready_bool)(void* self, void* edx);
 static fn_sp_ready_bool g_orig_sp_ready_bool = nullptr;
 static unsigned char __fastcall hk_sp_ready_bool(void* self, void* edx) {
   __try {
+    if (module_protocol_banned(self)) return 0;
     if (get_flag(0x0D) != 0 && sp_module_owned_by_local(self)) {
       ++g_ready_bool_hits;
       return 1;
@@ -5551,6 +5572,7 @@ typedef float(__fastcall* fn_sp_ready_ratio)(void* self, void* edx);
 static fn_sp_ready_ratio g_orig_sp_ready_ratio = nullptr;
 static float __fastcall hk_sp_ready_ratio(void* self, void* edx) {
   __try {
+    if (module_protocol_banned(self)) return 0.f;
     if (get_flag(0x0D) != 0 && sp_module_owned_by_local(self)) {
       ++g_ready_ratio_hits;
       return 1.0f;
@@ -6906,6 +6928,9 @@ static bool protocol_banned(const char* id) {
   return id && id[0] && g_protocol_bans.find(id) != g_protocol_bans.end();
 }
 
+// 给就绪钩子用的快速判断：一条禁止都没有时不做任何名字解析。
+static bool protocol_ban_active() { return !g_protocol_bans.empty(); }
+
 static const ProtocolLockEntry* protocol_lock_catalog_impl(int* count) {
   static std::vector<ProtocolLockEntry> view;
   view.clear();
@@ -6950,15 +6975,77 @@ static bool protocol_lock_set_impl(const char* type_id, bool locked, std::string
   } else {
     g_protocol_bans.erase(type_id);
   }
-  log("protocol lock %s: %s (界面状态，尚未接线)", type_id, locked ? "ban" : "allow");
+  log("protocol lock %s: %s (%d banned)", type_id, locked ? "ban" : "allow",
+      (int)g_protocol_bans.size());
   if (out_msg) {
-    *out_msg = std::string(locked ? u8"已限制「" : u8"已放开「") + hit->name +
-               u8"」（界面已就绪，功能待接线）";
+    *out_msg = std::string(locked ? u8"已限制「" : u8"已放开「") + hit->name + u8"」";
   }
   return true;
 }
 
 static void protocol_lock_reset_impl() { g_protocol_bans.clear(); }
+
+// ---------------------------------------------------------------------------
+// 协议限制（真正生效的那一半）
+//
+// 引擎在 玩家+0x218 挂一条循环冷却链：节点 +0 = next、+8 = 协议键、
+// +0x0C = 绝对就绪时间（15Hz 逻辑帧）、+0x10 = 时长。「协议无冷却」是把
+// +0x0C 写 0（立刻可用），这里反过来：被禁止的协议每帧把 +0x0C 顶到
+// now + 4 秒，于是它永远"差 4 秒才好"——引擎判定不可用，本地玩家和 AI 都放不出来。
+//
+// 用"滚动的 4 秒"而不是一个天文数字：解除禁止后最多 4 秒自然恢复，不用记原值；
+// 面板上的倒计时也会停在 4 秒附近，一眼能看出这条被限制了。
+// 只碰"有时长"的条目（和 clear_local_superweapon_cooldowns 同一个判据），
+// 避免把链上别的节点写坏。
+static void protocol_ban_tick() {
+  if (g_protocol_bans.empty() || !loaded_module()) return;
+  uint32_t logic = 0, now = 0;
+  if (safe_read_u32(loaded_module() + battle_logic_rva(), &logic) && is_ptr(logic)) {
+    safe_read_u32(logic + 0x50, &now);
+  }
+  // 读不到逻辑帧就不要写：否则会把 ready 写成一个小常数，反而变成"立刻可用"。
+  if (now == 0) return;
+  uint32_t list = 0;
+  if (!safe_read_u32(loaded_module() + player_list_rva(), &list) || !is_ptr(list)) return;
+
+  const uint32_t hold = 15u * 4u;  // 4 秒（逻辑帧 15Hz）
+  int held = 0;
+  for (uint32_t slot = 0; slot < kPlayerListSlots; ++slot) {
+    uint32_t player = 0;
+    if (!safe_read_u32(list + kPlayerListArrayOff + slot * 4u, &player) || !is_ptr(player)) {
+      continue;
+    }
+    const uint32_t head = player + 0x218;
+    uint32_t node = 0;
+    if (!safe_read_u32(head, &node)) continue;
+    for (int n = 0; n < 24 && is_ptr(node) && node != head; ++n) {
+      uint32_t key = 0, ready = 0, dur = 0, next = 0;
+      safe_read_u32(node + 8, &key);
+      safe_read_u32(node + 0x0C, &ready);
+      safe_read_u32(node + 0x10, &dur);
+      if (dur != 0 && dur < 0x100000u) {
+        const ProtocolFace* face = face_from_ptr(key);
+        if (!face) face = face_from_proto_key(key);
+        if (face && protocol_banned(face->id)) {
+          // ready <= now + hold 才写，正常情况每 4 秒才落一次内存。
+          if ((int32_t)(now + hold - ready) >= 0) {
+            safe_write_u32(node + 0x0C, now + hold);
+            ++held;
+          }
+        }
+      }
+      if (!safe_read_u32(node, &next) || next == node) break;
+      node = next;
+    }
+  }
+
+  static uint32_t next_log = 0;
+  const uint32_t tick = GetTickCount();
+  if (held > 0 && (int32_t)(tick - next_log) >= 0) {
+    next_log = tick + 10000;
+    log("protocol ban: holding %d cooldown(s)", held);
+  }
+}
 
 static bool template_has_exact_id(uint32_t tmpl, const char* want) {
   if (!is_ptr(tmpl) || !want || !want[0]) return false;
@@ -9283,7 +9370,11 @@ void roster_tick() {
   drain_live_queues(2, 16);
 }
 
-void refresh_power_cooldowns() { clear_local_superweapon_cooldowns(); }
+void refresh_power_cooldowns() {
+  clear_local_superweapon_cooldowns();
+  // 协议限制：每帧把被禁止协议的就绪时间顶住（面板关着也要跑，否则关菜单就失效）。
+  protocol_ban_tick();
+}
 
 bool disable_superweapon_held() { return g_sw_flag_held; }
 

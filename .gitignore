@@ -63,6 +63,7 @@ ra3_overlay.log
 ra3_overlay.log.prev
 ra3_camera.ini
 injector_startup.log
+overlay/bin/arm_tmp/
 
 # 编辑器 / 系统
 .vscode/

@@ -60,6 +60,44 @@ PAGE_EXECUTE_READWRITE = 0x40
 RESULT = os.path.join(os.environ.get('TEMP', '.'), 'ra3_overlay_arm_result.txt')
 
 
+def token_note():
+    """本进程的权限画像，写进 FAIL 行方便判断是不是被降权启动的。"""
+    try:
+        advapi = ctypes.WinDLL('advapi32', use_last_error=True)
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        advapi.OpenProcessToken.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                            ctypes.POINTER(ctypes.c_void_p)]
+        advapi.GetTokenInformation.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                               ctypes.c_void_p, ctypes.c_uint32,
+                                               ctypes.POINTER(ctypes.c_uint32)]
+        tok = ctypes.c_void_p()
+        if not advapi.OpenProcessToken(k32.GetCurrentProcess(), 0x0008, ctypes.byref(tok)):
+            return 'token=?'
+        parts = []
+        need = ctypes.c_uint32(0)
+        buf = ctypes.create_string_buffer(64)
+        if advapi.GetTokenInformation(tok, 25, buf, 64, ctypes.byref(need)):
+            sid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+            raw = ctypes.cast(ctypes.c_void_p(sid), ctypes.POINTER(ctypes.c_ubyte))
+            cnt = raw[1]
+            if 1 <= cnt <= 15:
+                idx = 8 + 4 * (cnt - 1)
+                sub = ctypes.cast(ctypes.c_void_p(sid + idx),
+                                  ctypes.POINTER(ctypes.c_uint32))[0]
+                parts.append('il=0x%X' % sub)
+        val = ctypes.c_uint32(0)
+        if advapi.GetTokenInformation(tok, 21, ctypes.byref(val), 4, ctypes.byref(need)):
+            parts.append('restricted=%d' % (1 if val.value else 0))
+        val = ctypes.c_uint32(0)
+        if advapi.GetTokenInformation(tok, 29, ctypes.byref(val), 4, ctypes.byref(need)):
+            parts.append('appcontainer=%d' % (1 if val.value else 0))
+        k32.CloseHandle(tok)
+        return ' '.join(parts) if parts else 'token=?'
+    except Exception as exc:
+        return 'token-err=%s' % exc
+
+
 def result(ok, msg):
     with open(RESULT, 'w', encoding='utf-8') as f:
         f.write(('OK: ' if ok else 'FAIL: ') + msg + '\n')
@@ -155,13 +193,27 @@ def main():
     idb = int(sys.argv[5], 0)
     spectate = int(sys.argv[6], 0) if len(sys.argv) > 6 else 0
 
+    # 结果文件路径由调用方给（提权启动时 %TEMP% 不是它改过的目录）。
+    global RESULT
+    if len(sys.argv) > 7 and sys.argv[7]:
+        RESULT = sys.argv[7]
     # Both ra3_1.12.game and ra3ep1_1.0.game load at 0x400000 with ASLR off and
     # zero base relocations, so the PE's own image base is the runtime base.
     module_base = MOD_BASE
 
     h = kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, pid)
     if not h:
-        return result(False, 'OpenProcess failed err=%d' % ctypes.get_last_error())
+        # err=5 时把本进程的令牌画像写进结果行：比游戏低（低完整性/受限令牌）就是
+        # 启动时被降权挡住了；如果窄权限能打开，则只是权限申请过大。
+        err = ctypes.get_last_error()
+        narrow = 0x0008 | 0x0010 | 0x0020 | 0x0400
+        h2 = kernel32.OpenProcess(narrow, False, pid)
+        if h2:
+            kernel32.CloseHandle(h2)
+            narrow_note = 'narrow-ok'
+        else:
+            narrow_note = 'narrow-err=%d' % ctypes.get_last_error()
+        return result(False, 'OpenProcess failed err=%d %s self=%s' % (err, narrow_note, token_note()))
 
     profile = select_profile(pid)
     if profile is None:

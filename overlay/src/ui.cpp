@@ -3975,7 +3975,8 @@ static void draw_protocol_lock_panel() {
   for (int i = 0; i < count; ++i) {
     if (cat[i].banned) ++banned;
   }
-  ImGui::TextDisabled(u8"已禁止 %d / %d · 界面已就绪，接线前不影响游戏", banned, count);
+  ImGui::TextDisabled(u8"已禁止 %d / %d · 禁止的协议在局内永远差 4 秒就绪，放不出来（对所有玩家生效）",
+                      banned, count);
 
   const float pane = ImGui::GetContentRegionAvail().y * 0.5f - 4.f;
 
