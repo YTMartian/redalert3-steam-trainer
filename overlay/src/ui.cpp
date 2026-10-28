@@ -3858,7 +3858,8 @@ static void draw_build_lock_panel() {
 // 协议限制：与「建造限制」同一套板子（上允许 / 下禁止，点图标来回搬）。
 // 图标来自 unit_images\<阵营>\协议\。一个阵营的协议平铺排开，不画分类标题，
 // 只保证同一协议的 1/2/3 级挨在一起（family 相同者算一族，整族一起换行）。
-// 目前只维护界面状态，还没有写进引擎（game_api::protocol_lock_set）。
+// 点图标只改这里的禁止表；真正生效在 game_features.cpp 的 protocol_ban_tick
+// （把敌方 Player+0x218 里对应协议的就绪帧顶住）。
 // ---------------------------------------------------------------------------
 static void draw_protocol_faction_icons(const game_api::ProtocolLockEntry* cat, int count,
                                         bool want_banned) {
@@ -3975,8 +3976,9 @@ static void draw_protocol_lock_panel() {
   for (int i = 0; i < count; ++i) {
     if (cat[i].banned) ++banned;
   }
-  ImGui::TextDisabled(u8"已禁止 %d / %d · 禁止的协议在局内永远差 4 秒就绪，放不出来（对所有玩家生效）",
+    ImGui::TextDisabled(u8"已禁止 %d / %d · 对本局所有玩家生效（含自己）：被禁协议不会再就绪，图标点不了",
                       banned, count);
+  ImGui::TextDisabled(u8"命令栏按钮已变灰；顶部协议面板的锁图仍在处理中");
 
   const float pane = ImGui::GetContentRegionAvail().y * 0.5f - 4.f;
 

@@ -296,9 +296,75 @@ unit_images/
 
 侧栏 **协议限制**（建造限制下面）。排版和建造限制同一套：上面允许、下面禁止，按盟军 / 苏联 / 帝国分栏；栏内不再按分支分组，协议图标从左往右平铺排开，只保证同一协议的 1/2/3 级挨在一起、换行时整族一起走。悬停显示协议名和等级，点图标就搬到另一栏。图标取自 `unit_images\<阵营>\协议\`。
 
-**已接进引擎**：被禁止的协议在局内永远"差 4 秒才好"，按钮放不出来（本地玩家和 AI 都生效）。
+**当前状态**：已接进引擎，但只做到一半。
 
-做法沿用引擎自己的冷却链：`玩家+0x218` 是一条循环链表，节点 `+8` 是协议键、`+0x0C` 是绝对就绪时间（15Hz 逻辑帧）、`+0x10` 是时长。「协议无冷却」把 `+0x0C` 写 0（立刻可用），协议限制反过来每帧把被禁止那条的 `+0x0C` 顶到 `now + 4 秒`。用滚动 4 秒而不是天文数字有两个好处：解除禁止后最多 4 秒自然恢复，不需要记原值；面板上的倒计时会停在那里，一眼能看出被限制了。只改"有时长"的节点（和清冷却同一判据），链上别的节点不碰。
+- **已生效**：被禁止的协议在局内挂不上号——左侧命令栏里的协议按钮变灰、按不出来。
+- **未完成**：顶部协议面板（`igm_PlayerTechStoreDialog`）里那一格**还不出锁图、也还能点**。这是下一步要补的部分，下面「面板（进行中）」记录了目前逆向到哪一步。
+
+之所以停在半路：面板每格是可点击的 Flash 按钮，它的外观由引擎自己的「可用性」字段决定，而面板那套格子**不按协议名枚举**，因此「哪一格对应哪条协议」这一步还没对上号（日志里 `cell KEYHIT=0`）。
+
+### 引擎链路
+
+全部在 `ra3_1.12.game` 上逐条反汇编核对过：
+
+| 地址 | 函数 | 说明 |
+|----|----|----|
+| `0x0087CE90` | `Player::hasTech(const uint32_t* key)` | 遍历「玩家+0x20C」禁用表，表里找不到才算有这项科技 |
+| `0x00883B10` | `Player::lockTech(const uint32_t* key)` | 把 `*key` 插进「玩家+0x20C」 |
+| `0x0087FFC0` | `Player::unlockTech` | `add ecx,0x20C; jmp 0x87E4F0`，从表里删掉 |
+| `0x00A6A610` | 协议按钮刷新 | `0xA6A685` 调 `hasTech`，`sete bl` 后 `0xA69800` 把按钮设成锁住的样子 |
+
+`hasTech` 在整份映像里**只有一个调用者**，就在协议按钮刷新里，所以往 `+0x20C` 写 key 就能让左下角那排协议按钮自己变灰。
+
+名字链：`NameDesc = [[template+8]]`，`name = [NameDesc+0]`（cstr），`key = [NameDesc+4]`（NameKey dword）。
+旧代码把 `[NameDesc+4]` 当字符串指针读，所以名字永远解析不出来（日志里 `hits=0`）。协议按钮那条路同理：
+`tech = [button+0x48]+0x14`，`NameDesc = [tech]`，`name = [NameDesc+0]`。
+
+### 现在按住的三道闸门
+
+1. **写引擎禁用表**：学到 key 后调 `lockTech` 写进每个座位的 `+0x20C`。实测写进去了（日志里 `pdp pn 20C` 能看到那个 key）。
+2. **`hasTech` 钩子**：读调用者的科技对象，命中禁止表就返回 0，不必依赖表写入是否成功。
+3. **`isReady` / `getReadyPercent` 钩子**：直接掐就绪判定，这是左侧按钮变灰真正生效的那一道（日志 `readyHits` 一直在涨）。
+
+早先还试过「把 `Player+0x218` 冷却链表节点的就绪帧每 400ms 顶到 now+4 秒」这条线，但本局实测 `nodes=0`——链上根本没匹配到节点，这条路是空的，现在只作为兜底保留。
+
+解禁：不再拦截 → 钩子放行；同时调 `unlockTech` 从 `+0x20C` 删掉，灰掉的按钮随之恢复。
+
+### 面板（进行中）
+
+顶部协议面板的逆向记录，留着给下一步用。面板是 5 列 × 3 行（`idx = a1 + 5*a2`）：
+
+| 地址 | 作用 |
+|----|----|
+| `0x00A71BB0` | 行槽取址：`dialog + 0x108 + idx * 0xBC`，按钮在 `slot + 8` |
+| `0x00A44AB0` | 格子按钮刷新虚函数（vtable `0x00C7F8D0`）：`+0x5C` 是 Image 指针，`+0x60` 是可用性（`0` 可用 / `1` 锁定 / `2` 已有），`+0x70`/`+0x71` 依赖前一行，`+0x72` 选中 |
+| `0x00A1B470` | 格子锁字节谓词：`impl = [this+4]`，`obj = [impl+0x20+idx*4]`，返回 `byte [obj+0x18]`（`1` = 锁定） |
+| `0x00A22480` | 面板网格 lookup：`(a1,a2) -> tech` |
+| `0x00953F60` | Flash 属性分发器，`SetAvailability` 从这里下发 |
+
+原版被科技锁住的格子共用同一个通用锁图（`ref` 形如 `122F4C90`），所以只要把目标的 `+0x5C` 换成那个指针、`+0x60` 写成 `1`，再调一次刷新，锁图就会画上去——**前提是先把格子和协议对上号**，这正是卡住的地方。
+
+> 性能坑：`protocol_key_banned()` 是扫描循环里的热路径，早先它每次调用都跑一遍 `rebuild_ban_keys()`（构造 512 字节签名 + 逐项字符串拷贝），一次开面板要重建上万次，面板因此明显卡顿。现在只查现成的表。
+
+### 名字匹配
+
+模板名 → 界面 id 的对照表在 `kProtocolEngineNames`；名字匹配先精确查表，再退到「去掉
+`SpecialPower` / `PlayerPower_` / `Button` 前缀、抹掉 `lvl/level/rank/_` 且删掉 "L+数字" 里的 L，
+忽略大小写」的尾巴匹配，所以 `SpecialPowerCryoSatelliteLvl1`、`PlayerPower_CryoSatellite1`、
+`ButtonPlayerPowerCryoSatelliteLvl1`、`FinalSquadron_L1`、`OrbitalRefuse_Rank1` 都能落到同一行。
+
+### 日志
+
+`overlay\bin\ra3_overlay.log` 每 4 秒一条：
+
+```
+protocol ban tick: seats= nodes= keys= matched= held= frame= local= first=
+                   readyHits= readyCalls= techHits= techCalls= fillCalls= fillHits=
+```
+
+`keys` 是已经学到的 NameKey 数；`techCalls` 是协议面板刷新次数（开面板才涨）；`readyHits`/`techHits` 非零说明钩子正在拦。`nodes`/`matched`/`held` 归属那条冷却链表兜底，本局为 0 属正常。另有一条 `protocol tech-lock: engine lock/unlock <协议名> key=...`。
+
+排查面板时还有这些一次性诊断行：`idhunt ...`（在 dialog / 行槽 / 状态对象里搜被禁 key）、`cell KEYHIT`、`avail LOCKED`、`visual PADLOCK`。
 
 54 项覆盖三个阵营的全部协议（伞兵空降、冷冻射击、时空裂缝、轨道抛掷、毁灭空袭、磁力卫星、气球炸弹、决胜中队、天皇之怒，以及六座超级武器对应的协议）。
 

@@ -56,6 +56,16 @@ _find_create*.py
 overlay/_*.py
 _*.txt
 ra3_image.json
+# 协议面板排查用的探针脚本（根目录，本地用）
+disas_va.py
+dump_vtable.py
+find_state_writer.py
+find_xref.py
+read_str.py
+scan_060.py
+scan_5c.py
+# 崩溃时留下的日志副本
+*.log.crash
 
 # 运行期生成的界面配置与日志
 overlay_ui.ini
