@@ -1,5 +1,6 @@
 #include "game_api.h"
 #include "game_api_internal.h"
+#include "fps_unlock.h"
 #include "embedded_payload.h"
 
 #include <Windows.h>
@@ -602,11 +603,13 @@ void init() {
   install_roster_hooks();
   camera_install_hook();
   time_control_install();
+  fps_unlock::init();
   lua_bridge_install();
   misc_install();
 }
 
 void shutdown() {
+  fps_unlock::restore_all();
   detach();
   log("DLL detaching");
   if (g_cs_ready) {

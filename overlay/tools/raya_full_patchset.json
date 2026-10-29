@@ -1,0 +1,411 @@
+{
+  "base": 4194304,
+  "patches": [
+    {
+      "region": "text+gap",
+      "rva": "00001457",
+      "length": 5,
+      "disk": "e824fdffff",
+      "live": "e9a4ebaf17"
+    },
+    {
+      "region": "text+gap",
+      "rva": "000D54D0",
+      "length": 6,
+      "disk": "f30f104c2408",
+      "live": "e92baba41790"
+    },
+    {
+      "region": "text+gap",
+      "rva": "00128DF3",
+      "length": 9,
+      "disk": "84db750cb802000000",
+      "live": "e90872f90090909090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "0012F950",
+      "length": 7,
+      "disk": "5355568b742410",
+      "live": "e9ab06a6179090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "0014119B",
+      "length": 6,
+      "disk": "8b50288b4220",
+      "live": "e960eeeb0090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "00169D85",
+      "length": 5,
+      "disk": "8b0cba85c9",
+      "live": "e976620a01"
+    },
+    {
+      "region": "text+gap",
+      "rva": "001705DF",
+      "length": 5,
+      "disk": "8b503c8bce",
+      "live": "e91cfa0d01"
+    },
+    {
+      "region": "text+gap",
+      "rva": "0017FF0A",
+      "length": 3,
+      "disk": "9c40cb",
+      "live": "4864bc"
+    },
+    {
+      "region": "text+gap",
+      "rva": "00187C8D",
+      "length": 5,
+      "disk": "e89ec9f9ff",
+      "live": "e96e83f900"
+    },
+    {
+      "region": "text+gap",
+      "rva": "0018AC10",
+      "length": 8,
+      "disk": "83ec08578b7c2410",
+      "live": "e9eb530601909090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "0022A756",
+      "length": 9,
+      "disk": "9c40cb00db059c40cb",
+      "live": "4864bc00db054864bc"
+    },
+    {
+      "region": "text+gap",
+      "rva": "0022B82D",
+      "length": 5,
+      "disk": "f30f114644",
+      "live": "e9ce47fd00"
+    },
+    {
+      "region": "text+gap",
+      "rva": "0023DC21",
+      "length": 1,
+      "disk": "1d",
+      "live": "10"
+    },
+    {
+      "region": "text+gap",
+      "rva": "0023DC33",
+      "length": 1,
+      "disk": "1d",
+      "live": "10"
+    },
+    {
+      "region": "text+gap",
+      "rva": "0023EA21",
+      "length": 3,
+      "disk": "9c40cb",
+      "live": "4864bc"
+    },
+    {
+      "region": "text+gap",
+      "rva": "00255167",
+      "length": 3,
+      "disk": "9c40cb",
+      "live": "4864bc"
+    },
+    {
+      "region": "text+gap",
+      "rva": "00265555",
+      "length": 19,
+      "disk": "e8e63ae7ff8b0dbc08ce008b018b900c010000",
+      "live": "e9a6aa8d178b0dbc08ce00e99baad800909090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "002686F9",
+      "length": 3,
+      "disk": "9c40cb",
+      "live": "4864bc"
+    },
+    {
+      "region": "text+gap",
+      "rva": "00268783",
+      "length": 1,
+      "disk": "73",
+      "live": "eb"
+    },
+    {
+      "region": "text+gap",
+      "rva": "002FFDAC",
+      "length": 3,
+      "disk": "fc0dce",
+      "live": "4c64bc"
+    },
+    {
+      "region": "text+gap",
+      "rva": "00312EB3",
+      "length": 6,
+      "disk": "8b40082b4114",
+      "live": "e948d1f10090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "0031F457",
+      "length": 8,
+      "disk": "f30f108af0000000",
+      "live": "e9c46f4a00909090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "00320963",
+      "length": 6,
+      "disk": "8b893c030000",
+      "live": "e998f6b81690"
+    },
+    {
+      "region": "text+gap",
+      "rva": "00329F19",
+      "length": 6,
+      "disk": "8b9818040000",
+      "live": "e9e260d50090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "0033511F",
+      "length": 6,
+      "disk": "d986bc010000",
+      "live": "e9dcaed30090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "003373F0",
+      "length": 11,
+      "disk": "83ec08f30f1005d061be00",
+      "live": "e90b8c7d17909090909090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "00348990",
+      "length": 4,
+      "disk": "a184decd",
+      "live": "e96b76d6"
+    },
+    {
+      "region": "text+gap",
+      "rva": "00348ADD",
+      "length": 5,
+      "disk": "8d54241452",
+      "live": "e91e75d800"
+    },
+    {
+      "region": "text+gap",
+      "rva": "0034D77C",
+      "length": 6,
+      "disk": "d9461c89465c",
+      "live": "e97f28d10090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "0034D81E",
+      "length": 26,
+      "disk": "f30f2c461c5e59c3cccccccccccccccccccc83ec08558b6c2410",
+      "live": "e9dd27d0005e59c3cccccccccccccccccccce9cb27cf00909090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "0034D920",
+      "length": 5,
+      "disk": "0350043bd7",
+      "live": "e9db26ef00"
+    },
+    {
+      "region": "text+gap",
+      "rva": "00351BC0",
+      "length": 11,
+      "disk": "83ec08f30f1015b08cbe00",
+      "live": "e93be47d17909090909090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "003A366E",
+      "length": 5,
+      "disk": "f30f114604",
+      "live": "e98dc9eb00"
+    },
+    {
+      "region": "text+gap",
+      "rva": "003CC693",
+      "length": 7,
+      "disk": "f6867104000001",
+      "live": "e96839af169090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "003CC700",
+      "length": 5,
+      "disk": "5355578bf9",
+      "live": "e9fb38b016"
+    },
+    {
+      "region": "text+gap",
+      "rva": "003CC8B1",
+      "length": 5,
+      "disk": "e87a7dd5ff",
+      "live": "e94a37d600"
+    },
+    {
+      "region": "text+gap",
+      "rva": "003F8C47",
+      "length": 5,
+      "disk": "e8e4b9d2ff",
+      "live": "e9b473cf00"
+    },
+    {
+      "region": "text+gap",
+      "rva": "003F8C85",
+      "length": 5,
+      "disk": "e8a6b9d2ff",
+      "live": "e97673d000"
+    },
+    {
+      "region": "text+gap",
+      "rva": "0041DA90",
+      "length": 10,
+      "disk": "51568bf18b0d84decd00",
+      "live": "e96b25cc009090909090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "00430B44",
+      "length": 6,
+      "disk": "8b8698000000",
+      "live": "e9b7f4731790"
+    },
+    {
+      "region": "text+gap",
+      "rva": "0043C964",
+      "length": 6,
+      "disk": "8b8e3c030000",
+      "live": "e99736a61690"
+    },
+    {
+      "region": "text+gap",
+      "rva": "0044C129",
+      "length": 6,
+      "disk": "0f86db000000",
+      "live": "e9d23e731790"
+    },
+    {
+      "region": "text+gap",
+      "rva": "00474F8B",
+      "length": 7,
+      "disk": "8d8c249c000000",
+      "live": "e970b06e179090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "0047503B",
+      "length": 5,
+      "disk": "d944240c57",
+      "live": "e9c0af6d17"
+    },
+    {
+      "region": "text+gap",
+      "rva": "00477070",
+      "length": 6,
+      "disk": "8b8178120000",
+      "live": "e98b8fda0090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "0047CB89",
+      "length": 5,
+      "disk": "8b70508b01",
+      "live": "e97234c100"
+    },
+    {
+      "region": "text+gap",
+      "rva": "0047CBE0",
+      "length": 7,
+      "disk": "8b4424048b5008",
+      "live": "e91b34c2009090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "00483260",
+      "length": 6,
+      "disk": "51568b74240c",
+      "live": "e99bcdd40090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "004832C0",
+      "length": 5,
+      "disk": "568b742408",
+      "live": "e93bcdd500"
+    },
+    {
+      "region": "text+gap",
+      "rva": "00650085",
+      "length": 5,
+      "disk": "e8a645adff",
+      "live": "e976ffab00"
+    },
+    {
+      "region": "text+gap",
+      "rva": "00664DAD",
+      "length": 9,
+      "disk": "8b40048b8eb0030000",
+      "live": "e94eb29a0090909090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "00664F0C",
+      "length": 6,
+      "disk": "8b78348b4e3c",
+      "live": "e9efb09b0090"
+    },
+    {
+      "region": "text+gap",
+      "rva": "00664F55",
+      "length": 5,
+      "disk": "f30f10472c",
+      "live": "e9a6b09c00"
+    },
+    {
+      "region": "text+gap",
+      "rva": "007B40A8",
+      "length": 3,
+      "disk": "9c40cb",
+      "live": "4864bc"
+    },
+    {
+      "region": "text+gap",
+      "rva": "007B40D8",
+      "length": 3,
+      "disk": "9c40cb",
+      "live": "4864bc"
+    },
+    {
+      "region": "text+gap",
+      "rva": "007B4108",
+      "length": 3,
+      "disk": "9c40cb",
+      "live": "4864bc"
+    },
+    {
+      "region": "text+gap",
+      "rva": "007B4C29",
+      "length": 3,
+      "disk": "9c40cb",
+      "live": "4864bc"
+    },
+    {
+      "region": "text+gap",
+      "rva": "007C6420",
+      "length": 48,
+      "disk": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "live": "f30f108af0000000f30f590d4064bc00e92a90b5ff00000000000000000000000000803e000000003c0000008fc2f53c"
+    }
+  ]
+}

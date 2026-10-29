@@ -1,6 +1,7 @@
 #include "ui.h"
 #include "input.h"
 #include "game_api.h"
+#include "fps_unlock.h"
 #include "paint.h"
 #include "shell.h"
 #include "skin.h"
@@ -111,6 +112,10 @@ static float button_width(const char* label, float slack = 6.f) {
 }
 bool g_unit_inspect_open = true;
 bool g_show_debug_status = false;  // 顶部调试状态，默认关闭，避免长日志撑开窗口
+// 「禁用键盘快捷键」：默认关闭。开启后功能热键一律不响应，只能点菜单里的按钮。
+bool g_disable_hotkeys = false;
+// 「解锁 60 帧」：默认关闭。持久化到 overlay_ui.ini 的 unlock_60fps。
+bool g_unlock_60fps = false;
 char g_ui_settings_path[MAX_PATH] = {};
 bool g_settings_dirty = false;
 float g_settings_save_timer = 0.f;
@@ -423,6 +428,8 @@ static std::wstring utf8_to_wide(const char* s) {
   return w;
 }
 
+void mark_settings_dirty();  // 定义在下方；load_ui_settings 里纠错时要用
+
 void load_ui_settings() {
   if (!g_ui_settings_path[0]) {
     resolve_ui_settings_path(g_ui_settings_path, sizeof(g_ui_settings_path));
@@ -451,6 +458,10 @@ void load_ui_settings() {
       if (idx >= 0) skin::SetCurrent(idx);
     } else if (key == "unit_inspect_open") {
       g_unit_inspect_open = (val == "1" || val == "true" || val == "yes");
+    } else if (key == "disable_hotkeys") {
+      g_disable_hotkeys = (val == "1" || val == "true" || val == "yes");
+    } else if (key == "unlock_60fps") {
+      g_unlock_60fps = (val == "1" || val == "true" || val == "yes");
     } else if (key == "stats_pinned") {
       // 固定是可选项，启动时一律不固定。
       g_stats_pinned = false;
@@ -499,6 +510,15 @@ void load_ui_settings() {
   }
   // 皮肤可能比保存时的更亮，恢复时把透明度抬到该皮肤的可读下限。
   g_ui_opacity = clampf(g_ui_opacity, skin::MinOpacity(skin::Current()), 1.00f);
+
+  // ini 里没有这一项、或按了「恢复默认」，都会落到默认值 false。
+  input::set_hotkeys_disabled(g_disable_hotkeys);
+
+  // 60 帧解锁是静态补丁，读盘时若配置为开就先试打一次。打不上不丢弃意图：
+  // 那几个常量在 .data 的 BSS 段里，要等引擎进对局时才写入，tick 会自动重试。
+  if (g_unlock_60fps) {
+    fps_unlock::set_enabled(true);
+  }
 }
 
 void save_ui_settings() {
@@ -520,6 +540,8 @@ void save_ui_settings() {
   f << "stats_icon_scale=" << g_stats_icon_scale << "\n";
   f << "theme=" << skin::KeyAt(skin::Current()) << "\n";
   f << "unit_inspect_open=" << (g_unit_inspect_open ? 1 : 0) << "\n";
+  f << "disable_hotkeys=" << (g_disable_hotkeys ? 1 : 0) << "\n";
+  f << "unlock_60fps=" << (g_unlock_60fps ? 1 : 0) << "\n";
   f << "stats_pinned=" << (g_stats_pinned ? 1 : 0) << "\n";
   f << "stats_compact=" << (g_stats_compact ? 1 : 0) << "\n";
   f << "stats_minimal=" << (g_stats_minimal ? 1 : 0) << "\n";
@@ -673,12 +695,25 @@ void draw_settings_panel() {
   ImGui::TextDisabled(u8"兵种 / 建筑图标的放大倍数（默认 %.2fx）", kStatsIconScaleDefault);
 
   ImGui::Spacing();
+  section_header("HOTKEYS", u8"快捷键");
+  if (ImGui::Checkbox(u8"禁用键盘快捷键##disable_hotkeys", &g_disable_hotkeys)) {
+    input::set_hotkeys_disabled(g_disable_hotkeys);
+    mark_settings_dirty();
+    g_last_msg = g_disable_hotkeys ? std::string(u8"已禁用功能快捷键，只能用鼠标点菜单")
+                                   : std::string(u8"已恢复功能快捷键");
+  }
+  ImGui::TextDisabled(u8"开启后只在菜单里点按钮，功能热键一律不响应（默认关闭）");
+  ImGui::TextDisabled(u8"菜单显隐键（Home / Insert / F8）不受影响，否则关掉就再也打不开菜单");
+
+  ImGui::Spacing();
   section_header("RESET", u8"重置");
   if (ImGui::Button(u8"恢复默认", ImVec2(ui_px(140.f), 0))) {
     g_ui_scale = 1.00f;
     g_ui_opacity = kUiOpacityDefault;
     g_stats_icon_scale = kStatsIconScaleDefault;
     g_unit_inspect_open = true;
+    g_disable_hotkeys = false;
+    input::set_hotkeys_disabled(false);
     skin::Select(0);
     mark_settings_dirty();
     save_ui_settings();
@@ -2536,7 +2571,7 @@ static void draw_money_cell(const game_api::FeatureInfo* f, int cols) {
   dl->PopClipRect();
   if (ImGui::BeginPopup("##step")) {
     ImGui::TextUnformatted(u8"每次金额");
-    ImGui::SetNextItemWidth(150.f);
+    ImGui::SetNextItemWidth(ui_px(150.f));
     if (ImGui::InputInt("##amt", &step, 10000, 100000)) {
       if (sel) game_api::set_money_sel_step(step);
       else game_api::set_money_self_step(step);
@@ -3283,7 +3318,7 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
     const uint32_t who = draw_player_picker("money", &g_money_player_ui);
     game_api::set_money_player(who);
     int step = game_api::money_sel_step();
-    ImGui::SetNextItemWidth(160.f);
+    ImGui::SetNextItemWidth(ui_px(160.f));
     if (ImGui::InputInt(u8"每次##step", &step, 10000, 100000)) {
       game_api::set_money_sel_step(step);
       mark_settings_dirty();
@@ -3319,7 +3354,7 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
         draw_feature_gear(f->key);
       }
     }
-    ImGui::SetNextItemWidth(160.f);
+    ImGui::SetNextItemWidth(ui_px(160.f));
     if (ImGui::InputInt(u8"每次##step", &step, 10000, 100000)) {
       if (sel) game_api::set_money_sel_step(step);
       else game_api::set_money_self_step(step);
@@ -3512,7 +3547,7 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
     ImGui::PopStyleColor();
     const uint32_t who = draw_player_picker("summon", &g_summon_player_ui);
     int count = g_summon_count;
-    ImGui::SetNextItemWidth(120.f);
+    ImGui::SetNextItemWidth(ui_px(120.f));
     if (ImGui::InputInt(u8"每种数量", &count, 1, 5)) {
       if (count < 1) count = 1;
       if (count > 20) count = 20;
@@ -3520,7 +3555,7 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
     }
     ImGui::SameLine();
     float lift = game_api::summon_extra_lift();
-    ImGui::SetNextItemWidth(140.f);
+    ImGui::SetNextItemWidth(ui_px(140.f));
     if (ImGui::InputFloat(u8"高度##summon_lift", &lift, 100.f, 500.f, "%.0f")) {
       game_api::set_summon_extra_lift(lift);
     }
@@ -3630,12 +3665,13 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
 
     // 紧凑布局：一行放完「种类 / 数量 / 空投」。
     // 面板太窄时（< 300px）自动拆成两行，避免控件被挤出面板外看不见。
-    const float avail = std::max(140.f, ImGui::GetContentRegionAvail().x);
-    const float drop_w = 62.f;
-    const float cnt_w = 96.f;
-    const float gap = 8.f;
-    const bool one_row = avail >= 300.f;
-    const float kind_w = one_row ? std::max(90.f, avail - drop_w - cnt_w - gap * 2.f) : avail;
+    // 这里的常量都要跟着界面缩放走；avail 本身已经是屏幕像素，不能再乘。
+    const float avail = std::max(ui_px(140.f), ImGui::GetContentRegionAvail().x);
+    const float drop_w = ui_px(62.f);
+    const float cnt_w = ui_px(96.f);
+    const float gap = ui_px(8.f);
+    const bool one_row = avail >= ui_px(300.f);
+    const float kind_w = one_row ? std::max(ui_px(90.f), avail - drop_w - cnt_w - gap * 2.f) : avail;
 
     ImGui::SetNextItemWidth(kind_w);
     if (ImGui::BeginCombo(u8"##crate_kind",
@@ -3656,7 +3692,7 @@ static void draw_feature_row(const game_api::FeatureInfo* f) {
     }
     if (one_row) ImGui::SameLine(0.f, gap);   // 窄面板时不并排，自动换行
 
-    ImGui::SetNextItemWidth(one_row ? cnt_w : std::max(80.f, avail - drop_w - gap));
+    ImGui::SetNextItemWidth(one_row ? cnt_w : std::max(ui_px(80.f), avail - drop_w - gap));
     if (ImGui::SliderInt(u8"##crate_count", &count, 1, 20, "%d")) {
       g_crate_count_persist = count;
       mark_settings_dirty();
@@ -4099,39 +4135,39 @@ void draw_camera_panel() {
 
       ImGui::Separator();
       ImGui::TextUnformatted(u8"坐标");
-      ImGui::SetNextItemWidth(110.f);
+      ImGui::SetNextItemWidth(ui_px(110.f));
       if (ImGui::InputFloat("X##camx", &s_edit.x, 0.f, 0.f, "%.2f")) push_edit();
       ImGui::SameLine();
-      ImGui::SetNextItemWidth(110.f);
+      ImGui::SetNextItemWidth(ui_px(110.f));
       if (ImGui::InputFloat("Y##camy", &s_edit.y, 0.f, 0.f, "%.2f")) push_edit();
       ImGui::SameLine();
-      ImGui::SetNextItemWidth(110.f);
+      ImGui::SetNextItemWidth(ui_px(110.f));
       if (ImGui::InputFloat("Z##camz", &s_edit.z, 0.f, 0.f, "%.2f")) push_edit();
 
       ImGui::TextUnformatted(u8"旋转");
       float yaw_d = deg_of_rad(s_edit.yaw);
       float pitch_d = s_edit.pitch * kRad2Deg;
       float roll_d = s_edit.roll * kRad2Deg;
-      ImGui::SetNextItemWidth(110.f);
+      ImGui::SetNextItemWidth(ui_px(110.f));
       if (ImGui::InputFloat(u8"偏航##camyaw", &yaw_d, 0.f, 0.f, "%.2f")) {
         s_edit.yaw = yaw_d * kDeg2Rad;
         push_edit();
       }
       ImGui::SameLine();
-      ImGui::SetNextItemWidth(110.f);
+      ImGui::SetNextItemWidth(ui_px(110.f));
       if (ImGui::InputFloat(u8"俯仰##campitch", &pitch_d, 0.f, 0.f, "%.2f")) {
         s_edit.pitch = pitch_d * kDeg2Rad;
         push_edit();
       }
       ImGui::SameLine();
-      ImGui::SetNextItemWidth(110.f);
+      ImGui::SetNextItemWidth(ui_px(110.f));
       if (ImGui::InputFloat(u8"滚转##camroll", &roll_d, 0.f, 0.f, "%.2f")) {
         s_edit.roll = roll_d * kDeg2Rad;
         push_edit();
       }
 
       ImGui::TextUnformatted(u8"距离（缩放）");
-      ImGui::SetNextItemWidth(110.f);
+      ImGui::SetNextItemWidth(ui_px(110.f));
       if (ImGui::InputFloat("##camdist", &s_edit.dist, 0.f, 0.f, "%.1f")) push_edit();
 
       ImGui::Spacing();
@@ -4156,13 +4192,13 @@ void draw_camera_panel() {
       ImGui::Spacing();
       ImGui::Separator();
       ImGui::TextDisabled(u8"微调（步长可调，点一下立即生效）");
-      ImGui::SetNextItemWidth(90.f);
+      ImGui::SetNextItemWidth(ui_px(90.f));
       ImGui::InputFloat(u8"位置步长", &s_step_pos, 0.f, 0.f, "%.0f");
       ImGui::SameLine();
-      ImGui::SetNextItemWidth(90.f);
+      ImGui::SetNextItemWidth(ui_px(90.f));
       ImGui::InputFloat(u8"角度步长", &s_step_ang, 0.f, 0.f, "%.1f");
       ImGui::SameLine();
-      ImGui::SetNextItemWidth(90.f);
+      ImGui::SetNextItemWidth(ui_px(90.f));
       ImGui::InputFloat(u8"距离步长", &s_step_dist, 0.f, 0.f, "%.0f");
 
       auto nudge = [&](const char* id, const char* label, float dx, float dy, float dz,
@@ -4217,7 +4253,7 @@ void draw_camera_panel() {
       const int interp = game_api::camera_interp();
       ImGui::TextUnformatted(u8"插值");
       ImGui::SameLine();
-      ImGui::SetNextItemWidth(140.f);
+      ImGui::SetNextItemWidth(ui_px(140.f));
       int mode = interp;
       if (ImGui::Combo("##cam_interp", &mode, u8"线性插值\0贝塞尔曲线\0平滑样条\0")) {
         game_api::camera_set_interp(mode);
@@ -4257,13 +4293,13 @@ void draw_camera_panel() {
       if (ImGui::Checkbox(u8"循环", &loop)) game_api::camera_set_loop(loop);
       ImGui::SameLine();
       float rate = game_api::camera_play_rate();
-      ImGui::SetNextItemWidth(140.f);
+      ImGui::SetNextItemWidth(ui_px(140.f));
       if (ImGui::SliderFloat(u8"速度", &rate, 0.1f, 4.f, "%.2fx")) {
         game_api::camera_set_play_rate(rate);
       }
 
       float t = head;
-      ImGui::SetNextItemWidth(-60.f);
+      ImGui::SetNextItemWidth(ui_px(-60.f));
       if (ImGui::SliderFloat("##cam_head", &t, 0.f, total > 0.1f ? total : 1.f, "%.2f s")) {
         game_api::camera_set_playhead(t);
       }
@@ -4273,7 +4309,7 @@ void draw_camera_panel() {
       ImGui::TextDisabled(u8"节点 %d", key_n);
 
       ImGui::Separator();
-      ImGui::SetNextItemWidth(120.f);
+      ImGui::SetNextItemWidth(ui_px(120.f));
       ImGui::InputText(u8"新节点标签", s_new_label, sizeof(s_new_label));
       ImGui::SameLine();
       if (ImGui::Button(u8"复制当前坐标并添加节点", ImVec2(button_width(u8"复制当前坐标并添加节点"), 0))) {
@@ -4314,7 +4350,7 @@ void draw_camera_panel() {
           ImGui::Text("%d", i + 1);
 
           ImGui::TableSetColumnIndex(1);
-          ImGui::SetNextItemWidth(80.f);
+          ImGui::SetNextItemWidth(ui_px(80.f));
           char lab[32];
           std::memcpy(lab, e.label, sizeof(lab));
           if (ImGui::InputText("##lab", lab, sizeof(lab))) {
@@ -4323,7 +4359,7 @@ void draw_camera_panel() {
           }
 
           ImGui::TableSetColumnIndex(2);
-          ImGui::SetNextItemWidth(60.f);
+          ImGui::SetNextItemWidth(ui_px(60.f));
           ImGui::InputFloat("##t", &e.t, 0.f, 0.f, "%.2f");
           if (ImGui::IsItemDeactivatedAfterEdit()) commit = true;
 
@@ -4333,7 +4369,7 @@ void draw_camera_panel() {
           const char* ids[7] = {"x", "y", "z", "yaw", "pitch", "roll", "dist"};
           for (int c = 0; c < 7; ++c) {
             ImGui::TableSetColumnIndex(3 + c);
-            ImGui::SetNextItemWidth(c == 6 ? 60.f : 62.f);
+            ImGui::SetNextItemWidth(ui_px(c == 6 ? 60.f : 62.f));
             ImGui::InputFloat(ids[c], &out[c], 0.f, 0.f, c >= 3 && c <= 5 ? "%.2f" : "%.1f");
             if (ImGui::IsItemDeactivatedAfterEdit()) commit = true;
           }
@@ -4469,23 +4505,23 @@ void draw_camera_panel() {
           ImGui::TableNextRow();
 
           ImGui::TableSetColumnIndex(0);
-          ImGui::SetNextItemWidth(70.f);
+          ImGui::SetNextItemWidth(ui_px(70.f));
           ImGui::InputFloat("##et", &e.t, 0.f, 0.f, "%.2f");
           if (ImGui::IsItemDeactivatedAfterEdit()) commit = true;
 
           ImGui::TableSetColumnIndex(1);
-          ImGui::SetNextItemWidth(120.f);
+          ImGui::SetNextItemWidth(ui_px(120.f));
           if (ImGui::Combo("##eb", &e.base, u8"动画开始后\0进入对局后\0")) commit = true;
 
           ImGui::TableSetColumnIndex(2);
-          ImGui::SetNextItemWidth(150.f);
+          ImGui::SetNextItemWidth(ui_px(150.f));
           if (ImGui::Combo("##ea", &e.action,
                            u8"开始播放动画\0停止播放动画\0暂停/继续动画\0跳到指定节点\0使用节点坐标\0切换功能开关\0")) {
             commit = true;
           }
 
           ImGui::TableSetColumnIndex(3);
-          ImGui::SetNextItemWidth(150.f);
+          ImGui::SetNextItemWidth(ui_px(150.f));
           if (e.action == 3 || e.action == 4) {
             const int kn = game_api::camera_key_count();
             char items[1024] = {};
@@ -4556,7 +4592,7 @@ void draw_camera_panel() {
 
       ImGui::TextDisabled(u8"一个配置就是一条轨迹 + 它的定时事件，自动保存在 DLL 同目录的 ra3_camera.ini");
       ImGui::Spacing();
-      ImGui::SetNextItemWidth(180.f);
+      ImGui::SetNextItemWidth(ui_px(180.f));
       if (ImGui::BeginCombo("##cfg", game_api::camera_config_name(active))) {
         for (int i = 0; i < n; ++i) {
           const bool sel = i == active;
@@ -4585,7 +4621,7 @@ void draw_camera_panel() {
 
       ImGui::Spacing();
       ImGui::TextUnformatted(u8"名称");
-      ImGui::SetNextItemWidth(220.f);
+      ImGui::SetNextItemWidth(ui_px(220.f));
       if (ImGui::InputText("##cfgname", s_cfg_name, sizeof(s_cfg_name))) {
         game_api::camera_config_rename(active, s_cfg_name);
       }
@@ -4620,260 +4656,57 @@ void draw_camera_panel() {
 }
 
 // ---------------------------------------------------------------------------
-// 时间控制面板（RA3TimePausePlugin 对应）
+// 帧率（原独立「时间控制」实验页，现并入「杂项操作」的末尾）
 // ---------------------------------------------------------------------------
-static std::string fmt_clock(float seconds) {
-  if (!(seconds > 0.f)) seconds = 0.f;
-  const int total = (int)(seconds + 0.5f);
-  char buf[32];
-  std::snprintf(buf, sizeof(buf), "%02d:%02d", total / 60, total % 60);
-  return buf;
-}
-
-void draw_time_panel() {
-  static float s_scale = 1.0f;
-  static bool s_enabled = false;
-  static bool s_inited = false;
-
-  game_api::TimeProbe probe;
-  game_api::time_control_probe_snapshot(&probe);
-  if (!s_inited) {
-    s_scale = game_api::time_control_scale();
-    s_enabled = game_api::time_control_enabled();
-    s_inited = true;
-  }
-
-  ImGui::TextColored(CV(HeadingCol()), u8"时间控制（加速·实验）");
-  ImGui::SameLine();
-  ImGui::TextDisabled(u8"候选旋钮 [0xCB4098] logicFPS / [0xCB409C] updateFPS");
-
-  ImGui::Spacing();
-  ImGui::TextWrapped(u8"引擎 0x00655166 的帧循环：edi = updateFPS ÷ logicFPS，然后跑大约 6/edi 次"
-                     u8"逻辑更新。实测只把 updateFPS 调大，只会改变帧率、单位并不会变快（甚至略慢），"
-                     u8"所以下面把写入目标做成可切换项，请逐个试出真正管用的那个。");
-
-  ImGui::Spacing();
-  ImGui::Separator();
+static void draw_fps_section() {
+  ImGui::TextColored(CV(HeadingCol()), u8"帧率");
   ImGui::Spacing();
 
-  // ---- 实时状态 ----
-  const int logic_fps = probe.logic_fps > 0 ? probe.logic_fps : 15;
-  const int update_fps = probe.update_fps > 0 ? probe.update_fps : 30;
-  ImGui::Text(u8"logicFPS = %d", logic_fps);
-  ImGui::SameLine();
-  ImGui::TextColored(CV(SK().good), u8"| updateFPS = %d", update_fps);
-  ImGui::SameLine();
-  ImGui::TextDisabled(u8"| edi = %d", update_fps / (logic_fps > 0 ? logic_fps : 1));
-  if (probe.original_logic_fps > 0) {
-    ImGui::Text(u8"进局原值 logicFPS = %d  updateFPS = %d", probe.original_logic_fps,
-                probe.original_update_fps);
-  } else {
-    ImGui::TextDisabled(u8"还没写过（原值将在第一次写入时记录）");
-  }
-  if (!game_api::battle_clock(nullptr)) {
-    ImGui::TextDisabled(u8"当前不在对局中：加速只在遭遇战/战役里生效。");
+  // 一次性静态补丁：把引擎的帧时间基从 30fps 换成 60fps，移植自 RayaTrainer。
+  // 打开后不再每帧写 memory，关了就把原始字节写回去。
+  if (!fps_unlock::ready()) {
+    ImGui::TextDisabled(u8"未检测到 RA3 1.12 引擎模块（起义时刻不支持），开关不可用。");
+    return;
   }
 
-  ImGui::Spacing();
-  ImGui::TextColored(CV(SK().bad),
-                     u8"硬性不变式：logicFPS >= 1 且 updateFPS >= logicFPS。"
-                     u8"破坏后者会让 0x0065516D 的整除得 0，再在 0x0065519A 处除零崩溃");
-  ImGui::TextColored(CV(SK().bad),
-                     u8"（上一版就是这么崩的）。所以减速/暂停做不了，只能加速。"
-                     u8"旧实现写的 [[0xCE8138]+0x54] 其实是亮度，早已停止写入。");
-
-  ImGui::Spacing();
-  ImGui::Separator();
-  ImGui::Spacing();
-
-  // ---- 写入目标 ----
-  static int s_target = -1;
-  if (s_target < 0) s_target = game_api::time_control_speed_target();
-  ImGui::TextDisabled(u8"写入目标（默认「不改内存」，选错也不会崩，随时可切回）");
-  const char* kTargets[] = {u8"不改内存（只读）", u8"只改 logicFPS [0xCB4098]",
-                            u8"只改 updateFPS [0xCB409C]", u8"两者同步（保持 edi 不变）"};
-  game_api::TimeProbe p2;
-  ImGui::SetNextItemWidth(320.f);
-  if (ImGui::Combo(u8"##time_target", &s_target, kTargets, 4)) {
-    game_api::time_control_set_speed_target(s_target);
-    game_api::time_control_set_scale(s_scale);  // 立刻按当前倍率应用
-    g_last_msg = s_target == 0 ? u8"时间控制：已停止写内存并还原"
-                               : u8"已切换写入目标，请对比单位速度是否变化";
-  }
-
-  ImGui::Spacing();
-  ImGui::Separator();
-  ImGui::Spacing();
-
-  // ---- 倍率 ----
-  s_enabled = game_api::time_control_enabled();  // 以模块内状态为准
-  ImGui::SetNextItemWidth(220.f);
-  if (ImGui::SliderFloat(u8"倍率##time_scale", &s_scale, 1.0f, 8.0f, u8"%.2fx")) {
-    if (s_target != 0) {
-      game_api::time_control_set_scale(s_scale);
-      s_enabled = true;
-    }
-    g_last_msg = u8"已设置加速倍率";
-  }
-  ImGui::SameLine();
-  ImGui::TextDisabled(u8"1x = 进局原速，8x = 上限；低于 1x 会被抬到 1x");
-
-  ImGui::BeginDisabled(s_target == 0);
-  if (ImGui::Button(u8"1x##time_1x")) {
-    s_scale = 1.0f;
-    game_api::time_control_set_scale(1.0f);
-  }
-  ImGui::SameLine();
-  if (ImGui::Button(u8"1.5x##time_1_5x")) {
-    s_scale = 1.5f;
-    game_api::time_control_set_scale(1.5f);
-  }
-  ImGui::SameLine();
-  if (ImGui::Button(u8"2x##time_2x")) {
-    s_scale = 2.0f;
-    game_api::time_control_set_scale(2.0f);
-  }
-  ImGui::SameLine();
-  if (ImGui::Button(u8"3x##time_3x")) {
-    s_scale = 3.0f;
-    game_api::time_control_set_scale(3.0f);
-  }
-  ImGui::SameLine();
-  if (ImGui::Button(u8"4x##time_4x")) {
-    s_scale = 4.0f;
-    game_api::time_control_set_scale(4.0f);
-  }
-  ImGui::SameLine();
-  if (ImGui::Button(u8"6x##time_6x")) {
-    s_scale = 6.0f;
-    game_api::time_control_set_scale(6.0f);
-  }
-  ImGui::SameLine();
-  if (ImGui::Button(u8"8x##time_8x")) {
-    s_scale = 8.0f;
-    game_api::time_control_set_scale(8.0f);
-  }
-  ImGui::EndDisabled();
-  ImGui::SameLine();
-  if (ImGui::Button(u8"恢复原始速度##time_restore")) {
-    game_api::time_control_restore();
-    s_scale = 1.0f;
-    s_enabled = false;
-    g_last_msg = u8"已恢复原始游戏速度";
-  }
-
-  ImGui::Spacing();
-  ImGui::TextDisabled(u8"退出对局时会自动写回原值；写入次数 %d。", probe.writes);
-
-  // ---- 只读诊断：给将来找减速/暂停挂载点用 ----
-  ImGui::Spacing();
-  ImGui::Separator();
-  ImGui::Spacing();
-  if (ImGui::CollapsingHeader(u8"只读诊断（不会改动游戏）##time_diag")) {
-    if (probe.have_obj) {
-      ImGui::Text(u8"GameSpeedFactor [[0xCE8138]+0x30] = %.4f", probe.game_speed_factor);
-      ImGui::SameLine();
-      ImGui::TextDisabled(u8"（+0x54 = %.4f 是亮度，不写）", probe.brightness);
+  if (ImGui::Checkbox(u8"解锁 60 帧##unlock_60fps", &g_unlock_60fps)) {
+    fps_unlock::set_enabled(g_unlock_60fps);
+    if (!g_unlock_60fps) {
+      g_last_msg = u8"解锁 60 帧：已关闭";
+    } else if (fps_unlock::active()) {
+      g_last_msg = u8"解锁 60 帧：已生效";
     } else {
-      ImGui::TextDisabled(u8"[[0xCE8138]+0x30/+0x54] 未读到");
+      g_last_msg = u8"解锁 60 帧：已记录，进入对局后自动生效";
     }
-    if (probe.session) {
-      ImGui::Text(u8"会话对象 [0xCE811C] = 0x%X", probe.session);
-      if (probe.have_session_fps) {
-        ImGui::SameLine();
-        ImGui::Text(u8"| vtbl+0x40（max update FPS） = %d", probe.session_fps);
-      } else {
-        ImGui::SameLine();
-        ImGui::TextDisabled(u8"| vtbl+0x40 未取到");
-      }
-    } else {
-      ImGui::TextDisabled(u8"会话对象 [0xCE811C] 为空（不在对局中）");
-    }
-    if (ImGui::Button(u8"扫描会话对象字段##time_dump")) {
-      game_api::time_control_probe_dump_session();
-      g_last_msg = u8"已把会话对象字段扫描写入日志";
-    }
-    ImGui::SameLine();
-    ImGui::TextDisabled(u8"用于以后寻找「真正的减速/暂停」入口");
+    mark_settings_dirty();
   }
 
-  // ---- 快捷键（原「时间控制（快捷键）」分组并入此处）----
   ImGui::Spacing();
-  ImGui::Separator();
-  ImGui::Spacing();
-  if (ImGui::CollapsingHeader(u8"快捷键##time_hotkeys")) {
-    ImGui::TextDisabled(u8"点右侧齿轮可改键；这些键只负责设倍率/恢复，仍受上面的「写入目标」约束。");
-    end_chip_flow();
-    end_pair_flow();
-    int tk_count = 0;
-    const char* const* tk = game_api::time_feature_keys(&tk_count);
-    for (int i = 0; i < tk_count; ++i) {
-      draw_feature_row(game_api::find_feature(tk[i]));
-    }
-  }
-
-  // ---- 快进 ----
-  ImGui::Spacing();
-  ImGui::Separator();
-  ImGui::Spacing();
-  ImGui::TextColored(CV(HeadingCol()), u8"快进到指定对局时间");
-
-  float now_s = 0.f;
-  const bool have_clock = game_api::battle_clock(&now_s);
-  if (have_clock) {
-    ImGui::SameLine();
-    ImGui::TextDisabled(u8"当前对局时间 %s", fmt_clock(now_s).c_str());
+  if (fps_unlock::active()) {
+    ImGui::TextColored(CV(SK().good), u8"已生效：logicFPS 15 → 30，帧时间常量已换成 60fps 版本");
+  } else if (!fps_unlock::enabled()) {
+    ImGui::TextDisabled(u8"关闭：引擎保持原版 30 帧的帧时间基");
   } else {
-    ImGui::SameLine();
-    ImGui::TextDisabled(u8"读不到对局时钟");
-  }
-
-  static float s_ff_target = 60.f;
-  static float s_ff_speed = 4.f;
-  static bool  s_ff_auto = false;
-  static bool  s_ff_inited = false;
-  if (!s_ff_inited) {
-    s_ff_auto = game_api::time_control_ff_auto();
-    s_ff_inited = true;
-  }
-
-  ImGui::SetNextItemWidth(200.f);
-  ImGui::InputFloat(u8"目标时间（秒）##ff_target", &s_ff_target, 10.f, 60.f, "%.1f");
-  ImGui::SameLine();
-  if (ImGui::SmallButton(u8"+1 分##ff_add60")) s_ff_target += 60.f;
-  ImGui::SameLine();
-  if (have_clock && ImGui::SmallButton(u8"+2 分##ff_add120")) s_ff_target = now_s + 120.f;
-
-  ImGui::SetNextItemWidth(200.f);
-  ImGui::SliderFloat(u8"##ff_speed", &s_ff_speed, 1.0f, 8.0f, u8"快进倍率 %.1fx");
-
-  if (ImGui::Checkbox(u8"到达目标时间后自动开始快进##ff_auto", &s_ff_auto)) {
-    game_api::time_control_set_ff_auto(s_ff_auto);
+    // 开了但还没打上。区分「引擎还没初始化」和「版本不匹配」——
+    // 前者只要进一局对战就会自己好，后者是真的对不上。
+    switch (fps_unlock::pending_reason()) {
+      case fps_unlock::Reason::kNotReady:
+        ImGui::TextColored(CV(SK().warn),
+                           u8"待生效：引擎还没初始化这几个常量，进一局对战后会自动打上。");
+        break;
+      case fps_unlock::Reason::kVersionMismatch:
+        ImGui::TextColored(CV(SK().bad),
+                           u8"打不上：补丁位点的内容和预期不符（游戏版本/构建不匹配）。");
+        break;
+      default:
+        ImGui::TextColored(CV(SK().warn), u8"待生效：进入对局后自动打上。");
+        break;
+    }
   }
 
   ImGui::Spacing();
-  const bool ff_on = game_api::time_control_ff_active();
-  if (!ff_on) {
-    ImGui::BeginDisabled(!have_clock);
-    if (ImGui::Button(u8"快进至目标时间")) {
-      game_api::time_control_ff_start(s_ff_target, s_ff_speed);
-      s_scale = game_api::time_control_scale();
-      s_enabled = true;
-      g_last_msg = u8"已开始快进";
-    }
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::TextDisabled(u8"把倍率拉到快进倍率，到达目标时间后自动回到常速。");
-  } else {
-    ImGui::TextColored(CV(SK().warn), u8"快进中：目标 %s，倍率 %.1fx",
-                       fmt_clock(game_api::time_control_ff_target()).c_str(),
-                       game_api::time_control_ff_speed());
-    if (ImGui::Button(u8"取消快进")) {
-      game_api::time_control_ff_cancel();
-      s_scale = game_api::time_control_scale();
-      s_enabled = game_api::time_control_enabled();
-    }
-  }
+  ImGui::TextDisabled(u8"只对 1.12 原版（Retail）生效；开关状态会存进 overlay_ui.ini。");
+  ImGui::TextDisabled(u8"关闭时会把补丁过的字节逐个写回原值，不需要重开游戏。");
 }
 
 // 原「动画 / Lua」分组已并入本面板页，这里提供同一批快捷键的绑定入口。
@@ -4939,8 +4772,8 @@ void draw_lua_panel() {
   };
 
   if (ImGui::BeginTable("##lua_anim", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
-    ImGui::TableSetupColumn(u8"Lua 全局变量", ImGuiTableColumnFlags_WidthFixed, 330.f);
-    ImGui::TableSetupColumn(u8"类型", ImGuiTableColumnFlags_WidthFixed, 110.f);
+    ImGui::TableSetupColumn(u8"Lua 全局变量", ImGuiTableColumnFlags_WidthFixed, ui_px(330.f));
+    ImGui::TableSetupColumn(u8"类型", ImGuiTableColumnFlags_WidthFixed, ui_px(110.f));
     ImGui::TableSetupColumn(u8"值", ImGuiTableColumnFlags_WidthStretch);
     ImGui::TableHeadersRow();
     for (const Row& r : rows) {
@@ -4979,9 +4812,9 @@ void draw_lua_panel() {
   static std::string s_result;
 
   ImGui::Spacing();
-  ImGui::SetNextItemWidth(320.f);
+  ImGui::SetNextItemWidth(ui_px(320.f));
   ImGui::InputText(u8"变量名##lua_name", s_name, sizeof(s_name));
-  ImGui::SetNextItemWidth(320.f);
+  ImGui::SetNextItemWidth(ui_px(320.f));
   ImGui::InputText(u8"值##lua_value", s_value, sizeof(s_value));
 
   ImGui::Spacing();
@@ -5124,7 +4957,7 @@ static void draw_misc_panel() {
     for (int i = 0; i < 4; ++i) {
       if (s_size == kSizes[i]) cur = i;
     }
-    ImGui::SetNextItemWidth(220.f);
+    ImGui::SetNextItemWidth(ui_px(220.f));
     if (ImGui::Combo(u8"阴影贴图大小##misc_size", &cur, items, 4)) {
       g_misc_shadow_size = kSizes[cur];
       g_misc_shadow_take = true;
@@ -5138,7 +4971,7 @@ static void draw_misc_panel() {
     ImGui::TextDisabled(u8"（1024/2048/4096/8192，重新开始一局后生效，设置会保存）");
   }
 
-  ImGui::SetNextItemWidth(320.f);
+  ImGui::SetNextItemWidth(ui_px(320.f));
   ImGui::SliderFloat(u8"最大阴影距离##misc_dist", &s_dist, 0.f, 20000.f, u8"%.0f");
   // 松手后再写入，避免拖动时每帧改全局、退局拆设备时卡死。
   if (ImGui::IsItemDeactivatedAfterEdit()) {
@@ -5221,6 +5054,11 @@ static void draw_misc_panel() {
   if (!st.light.ok) {
     ImGui::TextDisabled(u8"没读到光照结构 [[0xCE0D78]+0x24]，进入对局后可用。");
   }
+
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+  draw_fps_section();
 
   ImGui::Spacing();
   ImGui::Separator();
@@ -5461,7 +5299,7 @@ static void draw_unit_ops_extra() {
   if (scope < 0 || scope > 3) scope = game_api::kUnitScopeSelected;
 
   ImGui::TextUnformatted(u8"选择哪些单位");
-  ImGui::SetNextItemWidth(200.f);
+  ImGui::SetNextItemWidth(ui_px(200.f));
   if (ImGui::BeginCombo("##unit_scope", kScopeLabels[scope])) {
     for (int i = 0; i < 4; ++i) {
       if (ImGui::Selectable(kScopeLabels[i], scope == i)) {
@@ -5817,15 +5655,6 @@ void draw() {
       g_show_lua = false;
       g_show_misc = false;
     }
-    if (draw_nav_item("time", u8"时间控制", g_show_time)) {
-      g_show_time = true;
-      g_show_settings = false;
-      g_show_build_lock = false;
-      g_show_protocol_lock = false;
-      g_show_camera = false;
-      g_show_lua = false;
-      g_show_misc = false;
-    }
     if (draw_nav_item("lua", u8"动画 / Lua", g_show_lua)) {
       g_show_lua = true;
       g_show_settings = false;
@@ -5865,8 +5694,6 @@ void draw() {
       draw_protocol_lock_panel();
     } else if (g_show_camera) {
       draw_camera_panel();
-    } else if (g_show_time) {
-      draw_time_panel();
     } else if (g_show_lua) {
       draw_lua_panel();
     } else if (g_show_misc) {

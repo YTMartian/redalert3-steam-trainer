@@ -35,6 +35,7 @@ add_library(ra3_overlay SHARED
   src/game_features.cpp
   src/camera.cpp
   src/time_control.cpp
+  src/fps_unlock.cpp
   src/lua_bridge.cpp
   src/render_misc.cpp
   ${IMGUI_DIR}/imgui.cpp
@@ -211,11 +212,21 @@ if(INJECTOR_PAYLOADS_OK)
   target_compile_options(ra3_injector PRIVATE /utf-8)
   target_link_libraries(ra3_injector PRIVATE user32 bcrypt shell32 advapi32)
 
-  # 默认请求管理员权限：普通权限启动时，这台机器会把进程放进低完整性 / 受限令牌，
-  # 进程列表被过滤，看不到游戏。写进 manifest 后双击就弹 UAC，点"是"即可，
-  # 不用再右键"以管理员身份运行"（旧 PyInstaller 版也是 --uac-admin）。
+  # 不申请管理员权限（asInvoker）。
+  #
+  # 之前写 requireAdministrator 是为了防止普通权限下看不到游戏进程，但那个前提
+  # 有两个问题：
+  #   1. 实测同用户、中等完整性级别注入就够（游戏本身也是普通权限启动的），
+  #      提权并非必需；
+  #   2. 代价太大：manifest 一旦声明 requireAdministrator，Windows 会在 UAC 之前
+  #      先跑 SmartScreen 的应用信誉检查，而未签名的 exe 会被直接"阻止"，弹窗里
+  #      连"仍要运行"都没有（提权前的拦截不可绕过）。也就是说申请提权反而让
+  #      双击变得完全跑不起来。
+  #
+  # 现在走 asInvoker：双击不触发提权，也就没有那道检查。真遇到注入被拒的机器，
+  # main.cpp 里保留了 needs_admin -> relaunch_elevated 的兜底，只有确实需要时才弹 UAC。
   target_link_options(ra3_injector PRIVATE
-    "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'")
+    "/MANIFESTUAC:level='asInvoker' uiAccess='false'")
 
   # 载荷换了内容要重新嵌进 exe，否则注入器会一直带着旧 DLL。
   set_property(SOURCE ${CMAKE_CURRENT_BINARY_DIR}/injector_payload.rc APPEND

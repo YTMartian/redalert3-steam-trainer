@@ -240,6 +240,35 @@ bool file_matches(const std::wstring& dst, const std::vector<unsigned char>& dat
   return size == data.size() && memcmp(want, have, 32) == 0;
 }
 
+// 读 PE 头里的 TimeDateStamp（链接时间戳）。
+// 内嵌载荷没有文件时间可用，只能从 PE 头自己取，用来和磁盘上那份比新旧。
+bool pe_timestamp(const std::vector<unsigned char>& data, DWORD* out) {
+  if (data.size() < 0x40 || data[0] != 'M' || data[1] != 'Z') return false;
+  const DWORD lfanew = (DWORD)data[0x3C] | ((DWORD)data[0x3D] << 8) |
+                       ((DWORD)data[0x3E] << 16) | ((DWORD)data[0x3F] << 24);
+  if (lfanew + 12 > data.size()) return false;
+  if (data[lfanew] != 'P' || data[lfanew + 1] != 'E' || data[lfanew + 2] != 0 ||
+      data[lfanew + 3] != 0) {
+    return false;
+  }
+  *out = (DWORD)data[lfanew + 8] | ((DWORD)data[lfanew + 9] << 8) |
+         ((DWORD)data[lfanew + 10] << 16) | ((DWORD)data[lfanew + 11] << 24);
+  return true;
+}
+
+bool pe_timestamp_file(const std::wstring& path, DWORD* out) {
+  HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         nullptr, OPEN_EXISTING, 0, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  std::vector<unsigned char> head(0x1000);
+  DWORD read = 0;
+  const bool got = ReadFile(h, head.data(), (DWORD)head.size(), &read, nullptr) != 0;
+  CloseHandle(h);
+  if (!got || read < 0x40) return false;
+  head.resize(read);
+  return pe_timestamp(head, out);
+}
+
 // 先写 .tmp 再原子替换（等价 shutil.copy2 + os.replace），失败重试 6 次。
 bool write_payload(const std::wstring& dst, const std::vector<unsigned char>& data,
                    std::wstring* note) {
@@ -291,6 +320,19 @@ void ensure_payloads(const std::wstring& dir, std::vector<std::wstring>* errors)
     }
     const std::wstring dst = join(dir, spec.name);
     if (file_exists(dst) && file_matches(dst, data)) continue;  // same
+
+    // 绝不把磁盘上更新的产物覆盖成注入器里嵌的旧副本。
+    // 旧注入器每次运行都会无条件重写旁边的 DLL，于是「只重编了 DLL、没重编 exe」
+    // 时会被静默降级回旧版，表现就是改了代码却看不到任何变化。
+    if (file_exists(dst)) {
+      DWORD on_disk = 0;
+      DWORD embedded = 0;
+      if (pe_timestamp_file(dst, &on_disk) && pe_timestamp(data, &embedded) &&
+          on_disk > embedded) {
+        log_line(L"%s 比注入器内嵌的更新，保留磁盘版本（不覆盖）", spec.name);
+        continue;
+      }
+    }
 
     std::wstring note;
     if (write_payload(dst, data, &note)) continue;

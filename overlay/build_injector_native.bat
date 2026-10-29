@@ -67,4 +67,7 @@ echo.
 echo Built: %~dp0bin\main.exe
 echo It writes ra3_overlay_v4.dll and arm_mustcode.dll beside itself on first run.
 echo No temp directory is used.
+rem 同上：bin 目录若带低完整性标签，双击启动的进程会被降为低完整性、看不到游戏
+rem （报"找不到游戏"，procs 只有几十）。构建后统一改回 Medium。
+icacls "%~dp0bin" /setintegritylevel "(OI)(CI)Medium" /T /C >nul 2>&1
 endlocal

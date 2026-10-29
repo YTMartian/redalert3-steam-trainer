@@ -19,7 +19,7 @@
 ## 快速开始
 
 1. Steam 库 → 右键游戏 → 属性 → 启动选项：**原版**填 `-runver 1.12`，**起义时刻**填 `-runver 1.0`（两个游戏各自的启动选项）。建议窗口化进入遭遇战。
-2. 进局后运行 `overlay\bin\main.exe`。弹窗标题就是结果：**注入成功** 或 **注入失败**；失败时正文写原因（没找到游戏、没有管理员权限、DLL 没载入）。如果运行的版本不对（原版不是 `ra3_1.12.game`，或起义时刻不是 `ra3ep1_1.0.game`），注入会失败，并按对应游戏弹出两张 Steam 属性的截图：在启动选项里填对应的 `-runver`，然后完全退出再重新进游戏。若 `Ra3.BattleNet.Client.exe` 或 `RA3BattleNet.exe` 正在运行（安装目录不限），修改器不会启动，提示「请关闭战网进程（RA3BattleNet）」。
+2. 进局后**双击**运行 `overlay\bin\main.exe`（**不需要「以管理员身份运行」**，也不会弹 UAC / SmartScreen）。弹窗标题就是结果：**注入成功** 或 **注入失败**；失败时正文写原因（没找到游戏、DLL 没载入、进程在受限令牌里）。如果运行的版本不对（原版不是 `ra3_1.12.game`，或起义时刻不是 `ra3ep1_1.0.game`），注入会失败，并按对应游戏弹出两张 Steam 属性的截图：在启动选项里填对应的 `-runver`，然后完全退出再重新进游戏。若 `Ra3.BattleNet.Client.exe` 或 `RA3BattleNet.exe` 正在运行（安装目录不限），修改器不会启动，提示「请关闭战网进程（RA3BattleNet）」。
 3. 游戏内按 **Home**（或 Insert / F8）打开菜单。观战开局先勾选 **「观战模式」**，再点 **「注入」**。
 
 改过 DLL 之后必须重新注入。游戏里仍是上一次注入的那份。
@@ -46,6 +46,8 @@
 菜单最下方有选中单位检查：选中后显示实体指针、血量、速度、星级。
 
 **界面设置**里可以调缩放（0.70–1.30，默认 1.00）和背景透明度（35%–100%，默认 80%）。标题栏旁有「调试」开关（**默认关**）：开启后才在下方固定高度的信息框里显示底层状态；诊断日志只写 `ra3_overlay.log`，不再撑开主窗口造成跳动。
+
+同一页还有 **禁用键盘快捷键**（**默认关**）：开启后修改器不再响应任何功能热键，只能用鼠标点菜单里的按钮，避免打游戏时误触。菜单显隐键（Home / Insert / F8）故意不跟着屏蔽——否则一旦关掉就再没有入口把开关改回来。这项和缩放、透明度一样写进 `overlay_ui.ini`（键名 `disable_hotkeys`），重新注入后自动恢复。
 
 ### 观战模式
 
@@ -182,6 +184,14 @@
 | 快进到指定对局时间 | 先填目标时间（秒，另有 `+1 分` / `+2 分` 快捷键，可见当前对局时间 mm:ss），再设快进倍率（1–8x）。点「快进至目标时间」后把倍率拉到该值，**到达目标时间后自动回到常速**（不是暂停）。另有「到达目标时间后自动开始快进」和「取消快进」 |
 
 **硬性不变式**：`logicFPS >= 1` 且 `updateFPS >= logicFPS`。引擎 `0x00655166` 用 `edi = updateFPS / logicFPS` 决定每帧跑几次逻辑更新，`edi = 0` 时会在 `0x0065519A` 除零崩溃（实测崩在 `0x25519A`）。所以这里只做加速，不做减速 / 暂停。旧实现写的 `[[0xCE8138]+0x54]` 其实是**亮度**（伽马），早已停止写入；`0x6F91C0` 也不是设速度的函数。对局里每帧只写目标字段，不在热路径里进游戏虚函数；"退出遭遇战"要连续 500ms 都不在对局里才算数（`battle_just_left`），避免在引擎拆 `TheGameLogic` / 玩家列表的那几帧里抢着恢复；诊断探针也只读内存，不再从渲染线程调用会话对象的虚函数。
+
+### 帧率 / 解锁 60 帧
+
+「时间控制」页底部有 **解锁 60 帧** 开关，**默认关**，持久化在 `overlay_ui.ini` 的 `unlock_60fps`。移植自 RayaTrainer 的 FrameRateUnlock：一次性把引擎的帧时间基从 30fps 换成 60fps（8 个 `.data` 常量 + 12 个代码位点，共 20 处静态补丁），不是每帧回写倍率。
+
+**已知代价：开起来画面是 60 帧，但整局是 2.00 倍速**，单位和动画也一起快。根因是引擎把每帧的逻辑节拍量化成 `1/R`（`R = updateFPS / logicFPS`）：`R=2` 给 0.50（60 帧 → 2 倍速），`R=3` 给 0.33，`R>=4` 被 `0x00655175` 截断到 1/6。而 60 帧 + 1 倍速需要每帧正好 0.25 个节拍，落在 `R=3` 与 `R=4` 之间的死区，没有整数 `R` 能表达。45 帧 + 1 倍速在数字上正好（`R=3`，每帧 1/3 个节拍），实测 `44.7–44.9 fps / 0.99–1.00x`，但画面上仍能看到单位/动画异常，因此也没保留。
+
+补丁位点在主菜单阶段读到的是 0（`.data` 段 `0x8D6000` 之后是 BSS，引擎初始化时才写入），所以勾选后不会立刻生效：面板显示「已记录，进入对局后自动生效」，进局后自动重试。完整推导、实测数据表和试过但没有保留的方案（半时间增量、隔帧跳过、帧限制器、`0x268783` 的 `jae → jmp`）见 `overlay/README.md` 的「解锁 60 帧」一节。
 
 ### 动画 / Lua
 
@@ -521,6 +531,18 @@ Steam 版是重编译的二进制，零售版全局指针 `0x8DB73C` 在这份�
 
 快进用同一组字段：把 updateFPS 拉到设定倍率，`Present` 里读对局时钟，到达目标时间就写回 1x 并清掉快进状态（**不会写 0**）。
 
+### 帧节拍与「解锁 60 帧」（`fps_unlock.cpp`）
+
+帧时间预算在 `0x00668722`：`Frame_Time_ms = 66.667 / R`，`R = updateFPS / logicFPS`（预算常量在 `0x8E0DBC`）。每帧跑几个逻辑 tick 由 `0x00655140` 按 `R` 摊分，并在 `0x00655175`（`cmp edi, 6`）处截断：
+
+| `R` | tick/帧 | 对应帧率 | 相对原速 |
+|-----|---------|----------|----------|
+| 2 | 0.50 | 60 | 2.00x |
+| 3 | 0.33 | 45 | 1.00x |
+| ≥4 | 0.167（1/6） | 60 | 0.67x |
+
+所以 60 帧 + 1.00x 要求每帧 0.25 个 tick，而引擎只有 0.50 / 0.33 / 0.167 三档，0.25 无法用整数 `R` 表达——这就是「60 帧必然 2 倍速」的根。补丁集本身来自 RayaTrainer.Agent.dll 的 `0x1005A340`，共 58 处（43 个代码跳转 + 15 处常量）；本仓库只取其中 8 个 `.data` 常量 + 12 个代码位点。完整推导、实测表和所有被否掉的方案见 `overlay/README.md` 的「解锁 60 帧」一节。
+
 ### Lua 桥（`lua_bridge.cpp`）
 
 内嵌的是 SAGE/Corona 定制版 Lua 5.0。栈上一个值（TValue）16 字节，`+0x00` 是类型标签，`+0x08` 是 `double` / `GCObject*` / `int`；string 的字符数据在 `((TString*)value) + 0x14`。类型表由 `0x40A570`（lua_typename）从名字表 `0xBE2388` 读出：`0 = userdata / 1 = nil / 2 = number / 3 = string / 4 = table / 5 = function / 6 = lightuserdata`。
@@ -671,23 +693,35 @@ build.bat
 
 ### 注入器
 
-需要 Python、PyInstaller 和 keystone-engine：
+`main.exe` 是原生 C++ 注入器（CMake target `ra3_injector`，输出名 `main`）：载荷（DLL、装配程序、四张引导图）编进资源段，运行时只把两个 DLL 写到 exe 旁边，**不解包、不用临时目录、不需要 Python**。
 
 ```bat
 cd overlay
-build_injector.bat
+build_injector_native.bat
 ```
 
-脚本会先自动跑一遍 `build.bat` 把 DLL 编出来再打包（否则 `main.exe` 里会包着一份旧的 DLL，新加的界面在游戏里看不到）。已经单独编过 DLL、只想重打包时用 `build_injector.bat norebuild`。
+它依赖 `bin\ra3_overlay_v4.dll` 和 `bin\arm_mustcode.dll`：DLL 内容变了会触发重新嵌入，所以要先跑 `build.bat`。`build_injector.bat` 是完整流程——先用 PyInstaller 打 `arm_mustcode.dll`（装配器，仍需要 Python + PyInstaller + keystone-engine），再转调 `build_injector_native.bat` 编 `main.exe`。想一次搞定就用它：
 
-注入器会把当时的 DLL、`arm_mustcode.dll`、名字表和图标打进去。
-
-单文件 exe 的解包目录用 `--runtime-tmpdir` 钉在 `%LOCALAPPDATA%\RA3Overlay\pyi`：PyInstaller 引导器会自己把这棵树建出来，再把 `_MEI<pid>xxxxxx` 放进去，不再依赖 `%TEMP%` 是否还存在 / 是否可写。正常退出时引导器会删掉自己那层目录；异常退出残留的 `_MEI*`（每个约 20 MB）在修改器没运行时可以手动删。
+```bat
+cd overlay
+build_injector.bat              rem 会先自动 build.bat
+build_injector.bat norebuild    rem 已经单独编过 DLL，只重打包
+```
 
 输出：
 
 - `overlay\bin\main.exe`（发给别人只需要这一个文件）
 - `overlay\bin\arm_mustcode.dll`（装配程序，扩展名是 dll，避免被当成要双击的程序；玩家那边由注入器自己释出）
+
+`main.exe` 的 manifest 是 **`asInvoker`**：双击不弹 UAC，也不会被 SmartScreen 拦。只有游戏本身是管理员启动、`OpenProcess` 打不开时，它才用 `runas` 把自己重启成管理员。旧版写的是 `requireAdministrator`，而 Windows 对「带 `requireAdministrator` 的未签名 exe」会在弹 UAC 之前先过一遍 SmartScreen——没有签名证书就是死路，只能看到「Windows 已保护你的电脑」和唯一的「不运行」。这条已经改掉。
+
+如果注入器报「没有找到游戏」但游戏确实在跑，看 `injector_startup.log`：`procs=` 只有几十说明进程在受限令牌 / 沙箱里（别从 IDE 终端、聊天面板里启动）；`integrity=0x1000` 说明目录被打了低完整性标签，在那棵树里启动的进程看不到别的进程，用
+
+```bat
+icacls "你的目录" /setintegritylevel "(OI)(CI)Medium" /T /C
+```
+
+恢复。`build.bat` 和 `build_injector_native.bat` 编完会自动对 `overlay\bin` 跑一次同样的命令。
 
 若改过 `mustcode_body.asm` / `payload.py`，先在仓库根目录：
 
@@ -705,8 +739,10 @@ Windows 安全中心有时会把注入器隔离。这是附加进程、写内存
 
 | 现象 | 可能原因 |
 |------|----------|
-| 注入弹窗写「注入失败」 | 先看正文：游戏没开、没管理员权限，或 DLL 被安全软件隔离 |
-| 启动就弹 `Fatal error detected`，正文 `INTERNAL ERROR: cannot create temporary directory!` | PyInstaller 引导器建解包目录失败，发生在 Python 起来之前（`injector_startup.log` 不会有新行）。旧包落在 `%TEMP%\_MEIxxxxxx`：确认 `echo %TEMP%` 指向的目录还存在且可写，`mkdir "%TEMP%"` 后重试。当前包已固定到 `%LOCALAPPDATA%\RA3Overlay\pyi`，仍出现就查该目录是否被安全软件拦 / ACL 被改（删掉重建，加排除项） |
+| 注入弹窗写「注入失败」 | 先看正文：游戏没开、DLL 被安全软件隔离，或游戏本身以管理员启动而注入器没能提权 |
+| 双击就弹「Windows 已保护你的电脑」，只有「不运行」 | SmartScreen 在 UAC 之前拦未签名 exe。当前 `main.exe` 的 manifest 已是 `asInvoker`，正常构建不会出现；出现说明用的是旧 exe，用 `build_injector_native.bat` 重编，或在文件属性里勾「解除锁定」 |
+| 游戏明明在跑，注入器却说「没有找到游戏」 | 看 `overlay\bin\injector_startup.log`：`procs=` 只有几十 = 进程在受限令牌 / 沙箱里（别从 IDE 终端或聊天面板启动，去资源管理器双击）；`integrity=0x1000` = 目录带低完整性标签，用 `icacls "目录" /setintegritylevel "(OI)(CI)Medium" /T /C` 修 |
+| 启动就弹 `Fatal error detected`，正文 `INTERNAL ERROR: cannot create temporary directory!` | 只剩 `arm_mustcode.dll` 这条 PyInstaller 路径会解包到临时目录（`main.exe` 已经不解包了）。旧包落在 `%TEMP%\_MEIxxxxxx`：确认 `echo %TEMP%` 指向的目录还在且可写，`mkdir "%TEMP%"` 后重试；仍出现就查该目录是否被安全软件拦 / ACL 被改 |
 | 弹窗正文是 `Failed to extract XXX: failed to open target file!` | 解包目录已经建好、写文件被拒：安全软件拦截或磁盘满。加排除项、清盘后重试 |
 | 请关闭战网进程（RA3BattleNet） | 在线客户端还在运行。关掉 `Ra3.BattleNet.Client.exe` 和 `RA3BattleNet.exe` 后再开修改器 |
 | 弹出两张 Steam 截图 | 当前进程不是 `ra3_1.12.game`。按图在启动选项填 `-runver 1.12` 后重开游戏 |
@@ -727,6 +763,8 @@ Windows 安全中心有时会把注入器隔离。这是附加进程、写内存
 | 摄像机页显示「相机 hook 安装失败」 | 重新注入。多半是注入的那份 DLL 不是当前编出来的 |
 | 摄像机 XYZ 改了单位却不动 | 摄像机页只改镜头，不改单位位置；复制单位用「单位操作」 |
 | 时间控制 / 动画 Lua 显示「未读到」 | 只支持原版 1.12，且要进入对局。仍未读到就把 `ra3_overlay.log` 里 `time:` / `lua:` 开头的行发出来 |
+| 解锁 60 帧勾了没反应 | 补丁位点在主菜单阶段还是 BSS（读到 0），要进对局才生效；勾选后进局会自动重试。仍无效看 log 的 `fps:` 行 |
+| 解锁 60 帧生效后整局变快 | 这是预期结果：60 帧在引擎里就是 2.00 倍速，见「帧率 / 解锁 60 帧」 |
 | 退出遭遇战卡死，后台音效一直循环 | 确认用的是当前编出来的 `main.exe`（内嵌最新 DLL）。旧版在退局时仍会改相机矩阵 / 阴影全局 / 把音频速率设成 0。日志里应有 `camera: battle left` / `misc: battle left` / `time: battle left` |
 | 主窗口随状态文字上下跳动 | 关掉标题旁「调试」；诊断只写 log，信息框高度固定 |
 | 切换队伍后单位不动 | 那是「启用 AI 操控」没勾选时的原地冻结。勾上「启用 AI 操控」会立刻还原被冻结的速度（日志 `unit team thaw`），也可以再点一次切换 |

@@ -10,6 +10,7 @@ namespace {
 
 bool g_show = true;
 bool g_toggle_was_down = false;
+bool g_hotkeys_disabled = false;
 
 bool key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
@@ -20,6 +21,9 @@ bool any_menu_toggle_down() {
 void poll_feature_hotkeys() {
   static bool pressed[64] = {};
   if (game_api::hotkey_capture_active()) return;
+  // 禁用状态下仍继续跟踪按下状态（只是不触发），这样在「按住某个热键时
+  // 把这个开关关掉」的情况下，重新启用不会因为 pressed 还是旧值而误触发。
+  const bool disabled = g_hotkeys_disabled;
   const bool ctrl = key_down(VK_CONTROL);
   const bool alt = key_down(VK_MENU);
   const bool shift = key_down(VK_SHIFT);
@@ -34,7 +38,8 @@ void poll_feature_hotkeys() {
     }
     const bool down = key_down(vk);
     const bool was = pressed[i];
-    if (down && !was && ctrl == want_ctrl && alt == want_alt && shift == want_shift) {
+    if (down && !was && !disabled && ctrl == want_ctrl && alt == want_alt &&
+        shift == want_shift) {
       std::string msg;
       game_api::trigger_hotkey(game_api::hotkey_slot_id(i), &msg);
       if (!msg.empty()) game_api::set_status(msg.c_str());
@@ -62,5 +67,9 @@ bool menu_visible() { return g_show; }
 void set_menu_visible(bool v) { g_show = v; }
 
 void toggle_menu() { g_show = !g_show; }
+
+void set_hotkeys_disabled(bool v) { g_hotkeys_disabled = v; }
+
+bool hotkeys_disabled() { return g_hotkeys_disabled; }
 
 }  // namespace input

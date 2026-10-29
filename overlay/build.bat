@@ -67,6 +67,18 @@ if exist "%~dp0bin\unit_names_csf.txt" del /q "%~dp0bin\unit_names_csf.txt"
 if errorlevel 1 exit /b 1
 "%CMAKE%" --build build --config Release
 if errorlevel 1 exit /b 1
+
+rem 清掉低完整性标签。
+rem
+rem 如果 bin 目录（或任何上层目录）带着 "Mandatory Label\Low" 的继承标签，双击
+rem main.exe 启动出来的进程就是低完整性 + 受限令牌：Process32First 被过滤，
+rem 看不到游戏进程，注入器于是判定"找不到游戏"（弹窗会写受限令牌 / procs 偏少）。
+rem 这跟签名无关，是文件夹标签的问题。
+rem
+rem 构建产物会继承目录标签，所以每次构建后强制改回 Medium。
+if exist "%~dp0bin" (
+  icacls "%~dp0bin" /setintegritylevel "(OI)(CI)Medium" /T /C >nul 2>&1
+)
 echo.
 echo Built: %~dp0bin\ra3_overlay_v4.dll
 echo Name tables: packed into the DLL from ..\unit_names*.txt (no loose files)

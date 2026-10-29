@@ -59,7 +59,7 @@ if errorlevel 1 goto :err
 echo [4/4] done
 echo.
 echo Done:
-echo   overlay\bin\main.exe        (native injector, needs admin - UAC)
+echo   overlay\bin\main.exe        (native injector, asInvoker - no UAC/SmartScreen)
 echo   overlay\bin\arm_mustcode.dll (MustCode assembler, loaded by the overlay DLL)
 echo Ship main.exe alone. It writes the two DLLs beside itself on first run;
 echo no temp directory, no Python, no unpacking.
