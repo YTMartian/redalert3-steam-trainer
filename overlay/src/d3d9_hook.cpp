@@ -2,7 +2,6 @@
 #include "ui.h"
 #include "input.h"
 #include "game_api.h"
-#include "fps_unlock.h"
 
 #include <Windows.h>
 #include <Psapi.h>
@@ -383,18 +382,6 @@ HRESULT APIENTRY hk_present(IDirect3DDevice9* device, const RECT* src, const REC
   game_api::air_hold_tick();
   game_api::camera_tick();
   game_api::time_control_tick();
-  fps_unlock::tick();
-  // 60 帧开关的实际生效状态可能比点击晚（要等引擎初始化 / 进对局），所以提示音
-  // 跟着 active() 的跳变走，而不是跟着点击走。这样点下去没立刻生效也不会误报。
-  {
-    static bool was_active = false;
-    const bool now_active = fps_unlock::active();
-    if (now_active != was_active) {
-      // 开启用 asterisk、关闭用默认提示音，两种状态听起来能区分。
-      MessageBeep(now_active ? MB_ICONASTERISK : MB_OK);
-      was_active = now_active;
-    }
-  }
   game_api::lua_bridge_tick();
   game_api::misc_tick();
   game_api::invincible_tick();

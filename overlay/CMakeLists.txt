@@ -35,7 +35,6 @@ add_library(ra3_overlay SHARED
   src/game_features.cpp
   src/camera.cpp
   src/time_control.cpp
-  src/fps_unlock.cpp
   src/lua_bridge.cpp
   src/render_misc.cpp
   ${IMGUI_DIR}/imgui.cpp

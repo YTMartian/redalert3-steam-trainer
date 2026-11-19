@@ -651,9 +651,8 @@ bool time_control_ff_auto() {
 
 // engine/hotkey 入口。handled=false 表示不是本模块的键。
 //
-// 这组「加速倍率」热键已经停用：帧率设置改成了 fps_unlock 的静态补丁开关
-// （移植自 RayaTrainer）。旧的倍率实现会改写 [0xCB4098] logicFPS，和 60 帧
-// 补丁直接冲突，所以这里一律不认领任何键，按下去什么都不会发生。
+// 加速倍率热键不认领任何键。旧实现会改写 [0xCB4098] logicFPS，
+// 这里一律不处理，按下去什么都不会发生。
 bool time_control_engine_cmd(const char* key, bool* handled, std::string* out_msg) {
   (void)key;
   (void)out_msg;

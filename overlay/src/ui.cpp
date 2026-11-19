@@ -1,7 +1,6 @@
 #include "ui.h"
 #include "input.h"
 #include "game_api.h"
-#include "fps_unlock.h"
 #include "paint.h"
 #include "shell.h"
 #include "skin.h"
@@ -114,8 +113,6 @@ bool g_unit_inspect_open = true;
 bool g_show_debug_status = false;  // 顶部调试状态，默认关闭，避免长日志撑开窗口
 // 「禁用键盘快捷键」：默认关闭。开启后功能热键一律不响应，只能点菜单里的按钮。
 bool g_disable_hotkeys = false;
-// 「解锁 60 帧」：默认关闭。持久化到 overlay_ui.ini 的 unlock_60fps。
-bool g_unlock_60fps = false;
 char g_ui_settings_path[MAX_PATH] = {};
 bool g_settings_dirty = false;
 float g_settings_save_timer = 0.f;
@@ -460,8 +457,6 @@ void load_ui_settings() {
       g_unit_inspect_open = (val == "1" || val == "true" || val == "yes");
     } else if (key == "disable_hotkeys") {
       g_disable_hotkeys = (val == "1" || val == "true" || val == "yes");
-    } else if (key == "unlock_60fps") {
-      g_unlock_60fps = (val == "1" || val == "true" || val == "yes");
     } else if (key == "stats_pinned") {
       // 固定是可选项，启动时一律不固定。
       g_stats_pinned = false;
@@ -513,12 +508,6 @@ void load_ui_settings() {
 
   // ini 里没有这一项、或按了「恢复默认」，都会落到默认值 false。
   input::set_hotkeys_disabled(g_disable_hotkeys);
-
-  // 60 帧解锁是静态补丁，读盘时若配置为开就先试打一次。打不上不丢弃意图：
-  // 那几个常量在 .data 的 BSS 段里，要等引擎进对局时才写入，tick 会自动重试。
-  if (g_unlock_60fps) {
-    fps_unlock::set_enabled(true);
-  }
 }
 
 void save_ui_settings() {
@@ -541,7 +530,6 @@ void save_ui_settings() {
   f << "theme=" << skin::KeyAt(skin::Current()) << "\n";
   f << "unit_inspect_open=" << (g_unit_inspect_open ? 1 : 0) << "\n";
   f << "disable_hotkeys=" << (g_disable_hotkeys ? 1 : 0) << "\n";
-  f << "unlock_60fps=" << (g_unlock_60fps ? 1 : 0) << "\n";
   f << "stats_pinned=" << (g_stats_pinned ? 1 : 0) << "\n";
   f << "stats_compact=" << (g_stats_compact ? 1 : 0) << "\n";
   f << "stats_minimal=" << (g_stats_minimal ? 1 : 0) << "\n";
@@ -4655,60 +4643,6 @@ void draw_camera_panel() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// 帧率（原独立「时间控制」实验页，现并入「杂项操作」的末尾）
-// ---------------------------------------------------------------------------
-static void draw_fps_section() {
-  ImGui::TextColored(CV(HeadingCol()), u8"帧率");
-  ImGui::Spacing();
-
-  // 一次性静态补丁：把引擎的帧时间基从 30fps 换成 60fps，移植自 RayaTrainer。
-  // 打开后不再每帧写 memory，关了就把原始字节写回去。
-  if (!fps_unlock::ready()) {
-    ImGui::TextDisabled(u8"未检测到 RA3 1.12 引擎模块（起义时刻不支持），开关不可用。");
-    return;
-  }
-
-  if (ImGui::Checkbox(u8"解锁 60 帧##unlock_60fps", &g_unlock_60fps)) {
-    fps_unlock::set_enabled(g_unlock_60fps);
-    if (!g_unlock_60fps) {
-      g_last_msg = u8"解锁 60 帧：已关闭";
-    } else if (fps_unlock::active()) {
-      g_last_msg = u8"解锁 60 帧：已生效";
-    } else {
-      g_last_msg = u8"解锁 60 帧：已记录，进入对局后自动生效";
-    }
-    mark_settings_dirty();
-  }
-
-  ImGui::Spacing();
-  if (fps_unlock::active()) {
-    ImGui::TextColored(CV(SK().good), u8"已生效：logicFPS 15 → 30，帧时间常量已换成 60fps 版本");
-  } else if (!fps_unlock::enabled()) {
-    ImGui::TextDisabled(u8"关闭：引擎保持原版 30 帧的帧时间基");
-  } else {
-    // 开了但还没打上。区分「引擎还没初始化」和「版本不匹配」——
-    // 前者只要进一局对战就会自己好，后者是真的对不上。
-    switch (fps_unlock::pending_reason()) {
-      case fps_unlock::Reason::kNotReady:
-        ImGui::TextColored(CV(SK().warn),
-                           u8"待生效：引擎还没初始化这几个常量，进一局对战后会自动打上。");
-        break;
-      case fps_unlock::Reason::kVersionMismatch:
-        ImGui::TextColored(CV(SK().bad),
-                           u8"打不上：补丁位点的内容和预期不符（游戏版本/构建不匹配）。");
-        break;
-      default:
-        ImGui::TextColored(CV(SK().warn), u8"待生效：进入对局后自动打上。");
-        break;
-    }
-  }
-
-  ImGui::Spacing();
-  ImGui::TextDisabled(u8"只对 1.12 原版（Retail）生效；开关状态会存进 overlay_ui.ini。");
-  ImGui::TextDisabled(u8"关闭时会把补丁过的字节逐个写回原值，不需要重开游戏。");
-}
-
 // 原「动画 / Lua」分组已并入本面板页，这里提供同一批快捷键的绑定入口。
 static void draw_lua_hotkey_section() {
   ImGui::Spacing();
@@ -5054,11 +4988,6 @@ static void draw_misc_panel() {
   if (!st.light.ok) {
     ImGui::TextDisabled(u8"没读到光照结构 [[0xCE0D78]+0x24]，进入对局后可用。");
   }
-
-  ImGui::Spacing();
-  ImGui::Separator();
-  ImGui::Spacing();
-  draw_fps_section();
 
   ImGui::Spacing();
   ImGui::Separator();
