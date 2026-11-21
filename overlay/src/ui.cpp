@@ -4898,7 +4898,7 @@ static void draw_misc_panel() {
       mark_settings_dirty();
       std::string msg;
       game_api::misc_set_shadow_size(kSizes[cur], &msg);
-      if (msg.empty()) g_last_msg = u8"阴影贴图大小已保存，重新开始一局后生效";
+      if (msg.empty()) g_last_msg = u8"阴影贴图大小已保存";
       else g_last_msg = msg + u8"（已保存，下一局自动下发）";
     }
     ImGui::SameLine();
@@ -4995,7 +4995,7 @@ static void draw_misc_panel() {
   ImGui::TextDisabled(u8"说明：血条 / 剪影是渲染对象 [0xCE08F0] 的 +0x139 / +0x138 两个字节；"
                       u8"光照结构在 [[0xCE0D78]+0x24]；阴影贴图大小与最大阴影距离在 "
                       u8"[0xCEEDB4] / [0xCEEDB8]。写入前都会校验指针与当前值。"
-                      u8"阴影贴图大小需要重新开始一局才会重建阴影贴图。");
+                      u8"可在主菜单设置阴影贴图大小，进图时自动应用。");
 }
 
 static void draw_unit_inspector() {

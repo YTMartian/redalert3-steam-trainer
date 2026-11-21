@@ -13,6 +13,7 @@
 #include "game_api.h"
 #include "game_api_internal.h"
 
+#include "MinHook.h"
 #include <windows.h>
 #include <cmath>
 #include <cstdio>
@@ -56,7 +57,6 @@ bool g_take_silhouette = false;
 bool g_hide_silhouette = false;
 
 bool g_shadow_take = false;
-int g_shadow_size = 0;            // 0 = 不下发
 bool g_have_shadow_dist = false;
 float g_shadow_dist = 0.f;
 
@@ -84,6 +84,49 @@ float rd_f32(uint32_t a) { return *reinterpret_cast<float*>(a); }
 void wr_u8(uint32_t a, uint8_t v) { *reinterpret_cast<uint8_t*>(a) = v; }
 void wr_i32(uint32_t a, int32_t v) { *reinterpret_cast<int32_t*>(a) = v; }
 void wr_f32(uint32_t a, float v) { *reinterpret_cast<float*>(a) = v; }
+
+// Retail's map configuration callback returns the four shadow globals to its
+// caller. Apply the chosen size before the caller can consume the map default.
+using ShadowConfigFn = uint32_t(__stdcall*)(const void*);
+ShadowConfigFn g_original_shadow_config = nullptr;
+volatile LONG g_requested_shadow_size = 0;
+
+uint32_t __stdcall configure_shadow(const void* config) {
+  const uint32_t globals = g_original_shadow_config(config);
+  const LONG requested = InterlockedCompareExchange(&g_requested_shadow_size, 0, 0);
+  if (requested && globals) wr_i32(globals + 4, requested);
+  return globals;
+}
+
+bool valid_shadow_size(int size) {
+  for (int supported : kShadowSizes) if (size == supported) return true;
+  return false;
+}
+
+// Mirror the renderer update at 0x928855 when injection or a menu change
+// happens after map creation. Zero is the game's "shadows disabled" size.
+void apply_shadow_size(uint32_t base, int size, bool in_battle) {
+  if (!base || !size) return;
+  __try {
+    const uint32_t config = base + (kShadowSizeVa - kModBase);
+    if (rd_i32(config) != size) wr_i32(config, size);
+    if (!in_battle) return;
+    const uint32_t options = rd_u32(base + (0xCE8128 - kModBase));
+    if (!is_ptr(options) || !rd_u8(options + 0x305)) return;
+    const uint32_t dim = rd_u32(base + (0xCD8D9C - kModBase));
+    const uint32_t uv = rd_u32(base + (0xCD8DA0 - kModBase));
+    if (!is_ptr(dim) || !is_ptr(uv)) return;
+    const uint32_t current = rd_u32(dim + 0x4C);
+    if (!is_ptr(current) || rd_i32(current) == size ||
+        !is_ptr(rd_u32(dim + 0x50)) || !is_ptr(rd_u32(uv + 0x50)) ||
+        !is_ptr(rd_u32(dim + 0x34)) || !is_ptr(rd_u32(uv + 0x34))) return;
+    using SetRenderSize = void(__cdecl*)(int);
+    reinterpret_cast<SetRenderSize>(base + (0x4DE4E0 - kModBase))(size);
+    game_api::log("misc: applied shadow render size %d", size);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    ++g_write_fail;
+  }
+}
 
 // 解析渲染对象；失败返回 0。
 uint32_t render_obj() {
@@ -250,15 +293,14 @@ void misc_tick() {
     log("misc: battle left — pausing overrides (will resume next match)");
   }
 
-  // 退出战局 / 不在对局里：绝不写内存。退局时 D3D 与光照对象正在拆掉，
-  // 继续写阴影/光照会卡死 Present。目标值保留，下一局进场后自动再应用。
+  const int requested = InterlockedCompareExchange(&g_requested_shadow_size, 0, 0);
+  if (requested) apply_shadow_size(module_base(), requested, in_battle);
+  // Only the static configuration above is written outside a match.
   if (!in_battle) return;
 
   // 先把需要的目标值取出来（不要在 __try 里拿锁）。
   bool want_hp = false, hp_val = false;
   bool want_sil = false, sil_val = false;
-  bool want_size = false;
-  int size_val = 0;
   bool want_dist = false;
   float dist_val = 0.f;
   bool want_light[4] = {false, false, false, false};
@@ -269,8 +311,6 @@ void misc_tick() {
   hp_val = !g_hide_health;
   want_sil = g_take_silhouette;
   sil_val = !g_hide_silhouette;
-  want_size = g_shadow_take && g_shadow_size != 0;
-  size_val = g_shadow_size;
   want_dist = g_shadow_take && g_have_shadow_dist;
   dist_val = g_shadow_dist;
   if (g_light_lock) {
@@ -300,17 +340,11 @@ void misc_tick() {
   }
 
   const uint32_t base = module_base();
-  if (base && (want_size || want_dist)) {
+  if (base && want_dist) {
     __try {
-      if (want_size) {
-        const int32_t cur = rd_i32(base + (kShadowSizeVa - kModBase));
-        if (cur != size_val) wr_i32(base + (kShadowSizeVa - kModBase), size_val);
-      }
-      if (want_dist) {
-        const float cur = rd_f32(base + (kShadowDistVa - kModBase));
-        const float d = cur - dist_val;
-        if (!(d > -0.01f && d < 0.01f)) wr_f32(base + (kShadowDistVa - kModBase), dist_val);
-      }
+      const float cur = rd_f32(base + (kShadowDistVa - kModBase));
+      const float d = cur - dist_val;
+      if (!(d > -0.01f && d < 0.01f)) wr_f32(base + (kShadowDistVa - kModBase), dist_val);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
       g_write_fail++;
     }
@@ -367,11 +401,7 @@ bool misc_set_hide_silhouette(bool hide, bool take_over, std::string* out_msg) {
 }
 
 bool misc_set_shadow_size(int size, std::string* out_msg) {
-  bool valid = false;
-  for (int v : kShadowSizes) {
-    if (size == v) valid = true;
-  }
-  if (!valid) {
+  if (!valid_shadow_size(size)) {
     if (out_msg) *out_msg = u8"杂项：阴影贴图大小只能是 1024 / 2048 / 4096 / 8192";
     return false;
   }
@@ -394,7 +424,7 @@ bool misc_set_shadow_size(int size, std::string* out_msg) {
   }
   EnterCriticalSection(&g_cs);
   g_shadow_take = true;
-  g_shadow_size = size;
+  InterlockedExchange(&g_requested_shadow_size, size);
   LeaveCriticalSection(&g_cs);
   if (cur != size) {
     __try {
@@ -405,7 +435,7 @@ bool misc_set_shadow_size(int size, std::string* out_msg) {
     }
   }
   char buf[160];
-  std::snprintf(buf, sizeof(buf), u8"杂项：阴影贴图大小 = %d（重新开始一局后生效）", size);
+  std::snprintf(buf, sizeof(buf), u8"杂项：阴影贴图大小 = %d", size);
   if (out_msg) *out_msg = buf;
   log("misc: shadow_size %d -> %d", (int)cur, size);
   return true;
@@ -505,7 +535,7 @@ void misc_get_persist(MiscPersist* out) {
   if (!g_cs_ready) return;
   EnterCriticalSection(&g_cs);
   out->shadow_take = g_shadow_take;
-  out->shadow_size = g_shadow_size;
+  out->shadow_size = InterlockedCompareExchange(&g_requested_shadow_size, 0, 0);
   out->shadow_dist = g_have_shadow_dist ? g_shadow_dist : 0.f;
   out->take = g_take_health || g_take_silhouette;
   out->hide_health = g_hide_health;
@@ -525,7 +555,8 @@ bool misc_apply_persist(const MiscPersist& in, std::string* out_msg) {
   g_take_silhouette = in.take;
   g_hide_silhouette = in.hide_silhouette;
   g_shadow_take = in.shadow_take;
-  if (in.shadow_size > 0) g_shadow_size = in.shadow_size;
+  InterlockedExchange(&g_requested_shadow_size,
+                      in.shadow_take && valid_shadow_size(in.shadow_size) ? in.shadow_size : 0);
   if (in.shadow_dist > 0.f) {
     g_shadow_dist = in.shadow_dist;
     g_have_shadow_dist = true;
@@ -584,6 +615,15 @@ void misc_install() {
   if (!g_cs_ready) {
     InitializeCriticalSection(&g_cs);
     g_cs_ready = true;
+  }
+  const uint32_t base = module_base();
+  if (base) {
+    void* target = reinterpret_cast<void*>(base + (0x928A50 - kModBase));
+    const MH_STATUS init = MH_Initialize();
+    if ((init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) ||
+        MH_CreateHook(target, reinterpret_cast<void*>(&configure_shadow),
+                      reinterpret_cast<void**>(&g_original_shadow_config)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) log("misc: map shadow config hook unavailable");
   }
   log("misc: ops ready (robj@0x%X light@0x%X shadow@0x%X/0x%X)", kRenderObjPtrVa,
       kLightCfgPtrVa, kShadowSizeVa, kShadowDistVa);

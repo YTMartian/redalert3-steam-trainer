@@ -383,9 +383,9 @@ HRESULT APIENTRY hk_present(IDirect3DDevice9* device, const RECT* src, const REC
   game_api::camera_tick();
   game_api::time_control_tick();
   game_api::lua_bridge_tick();
+  ui::pump_pending_settings();
   game_api::misc_tick();
   game_api::invincible_tick();
-  ui::pump_pending_settings();
   LARGE_INTEGER t1{};
   QueryPerformanceCounter(&t1);
   InterlockedIncrement(&g_present_count);
