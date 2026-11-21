@@ -179,6 +179,7 @@ struct ProtocolLockEntry {
 const ProtocolLockEntry* protocol_lock_catalog(int* count);
 bool protocol_lock_set(const char* type_id, bool locked, std::string* out_msg);
 void protocol_lock_reset();
+void release_purchase_locks();
 // Drain Create/Destroy / seed-enqueue queues a little each Present frame
 // (~12 catalog resolves while seeding). Keeps open-panel seed off the UI poll.
 void roster_tick();

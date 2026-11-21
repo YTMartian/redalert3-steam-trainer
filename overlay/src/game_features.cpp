@@ -5588,7 +5588,7 @@ static bool protocol_key_banned(uint32_t key);                    // defined bel
 static bool btn_holds_forced_obj(uint32_t self);                  // defined below
 static void majority_locked_image(uint32_t* ref_out);             // defined below
 static void force_cell(uint32_t impl, uint32_t idx, const char* why);  // defined below
-static void protocol_panel_live_lock();                           // defined below
+static void install_purchase_store_hooks();                           // defined below
 static void protocol_panel_clear_locks();                         // defined below
 static bool tech_graph_matches_ban(uint32_t obj, char* out, size_t out_sz);   // below
 static bool tech_namekey(uint32_t tech, uint32_t* key_out, char* name_out, size_t name_sz);
@@ -5713,129 +5713,7 @@ static uint32_t g_btn_refresh_calls = 0;
 static int g_btn_refresh_seq = 0;
 static uint32_t g_btn_refresh_self[32];
 
-static void __cdecl btn_refresh_pre(uint32_t self) {
-  __try {
-    if (!is_ptr(self)) return;
-    uint32_t state = 0, elem = 0;
-    safe_read_u32(self + 0x60u, &state);
-    safe_read_u32(self + 0x08u, &elem);
-    // 同一个面板刷新里每个按钮一次，按出现顺序和 filling 顺序一致。
-    const int seq = g_btn_refresh_seq;
-    if (seq < 32) {
-      g_btn_refresh_self[seq] = self;
-      ++g_btn_refresh_seq;
-    }
 
-    // ★ 真正生效的一步
-    //   用实测反推出的槽位公式定位格子：btn = dialog + 0x110 + idx*0xBC。
-    //   命中被限制的格子时，在引擎执行原函数（会把 [self+0x60] 映射成
-    //   "SetAvailability" 推给 Flash、画出锁图）之前，先把状态改成 1。
-    //   注意这里不能提前 return —— 上面的 80 次上限只能限制日志输出，
-    //   否则用户中途改限制、面板再刷新时就完全不生效了。
-    uint32_t idx = button_cell_index(self);
-
-    // ★ 锁图持久化
-    //   0xA44AB0 的执行顺序是：先读 [self+0x5C] 推 "Image"，再读 [self+0x60]
-    //   推 "SetAvailability"。所以在这里把 Image 换成通用锁图，
-    //   引擎紧接着就会把锁图推给 Flash —— 面板每次重绘都会保持一致，
-    //   不需要靠悬停（avail 钩子）才触发。
-    if (idx < 15) {
-      uint32_t ref = 0;
-      majority_locked_image(&ref);
-      uint32_t cell_state = 0, my_img = 0;
-      if (safe_read_u32(self + 0x60u, &cell_state) &&
-          safe_read_u32(self + 0x5Cu, &my_img) && is_ptr(ref) && my_img != ref) {
-        // 只有"引擎判为锁定"的格子才换图：可用/已拥有格保持原样。
-        const bool should_lock = g_cell_locked[idx] || cell_state == 1;
-        if (should_lock) {
-          safe_write_u32(self + 0x5Cu, ref);
-          static bool img_logged[16] = {};
-          if (!img_logged[idx]) {
-            img_logged[idx] = true;
-            log("btn IMAGE idx=%u img %08X -> %08X (state=%u)", idx, my_img, ref, cell_state);
-          }
-        }
-      }
-    }
-
-    if (idx < 15 && g_cell_locked[idx] && state != 1) {
-      safe_write_u32(self + 0x60u, 1);
-      uint32_t after = 0;
-      safe_read_u32(self + 0x60u, &after);
-      state = after;
-      log("btn LOCK idx=%u self=%08X state -> %u (padlock forced)", idx, self, after);
-    }
-
-    // 把外观字段抄成"原生锁定格"的样子：Image / dependence / selected。
-    // 这是让 SWF 真正画出锁图的关键 —— 只改 SetAvailability 只会置灰。
-    if (idx < 15 && g_cell_locked[idx] && g_ref_state == 1 && is_ptr(g_ref_cell) &&
-        g_ref_cell != self && !g_visual_copied[idx]) {
-      g_visual_copied[idx] = true;
-      uint32_t ref_img = 0, my_img = 0;
-      safe_read_u32(g_ref_cell + 0x5Cu, &ref_img);
-      safe_read_u32(self + 0x5Cu, &my_img);
-      if (my_img != ref_img) {
-        safe_write_u32(self + 0x5Cu, ref_img);
-        char s[64] = {};
-        if (is_ptr(ref_img)) read_name_ascii(ref_img, s, sizeof(s));
-        log("btn IMAGE idx=%u img %08X -> %08X \"%s\"", idx, my_img, ref_img, s);
-      }
-      // +0x70/+0x71 是 SetDependenceUponPriorRow 的一对开关，+0x72 是 SetSelected。
-      unsigned char r70 = 0, r71 = 0, r72 = 0;
-      safe_read_u8(g_ref_cell + 0x70u, &r70);
-      safe_read_u8(g_ref_cell + 0x71u, &r71);
-      safe_read_u8(g_ref_cell + 0x72u, &r72);
-      safe_write_u8(self + 0x70u, r70);
-      safe_write_u8(self + 0x71u, r71);
-      safe_write_u8(self + 0x72u, r72);
-      log("btn FLAGS idx=%u dep70=%u dep71=%u sel72=%u (copied from ref=%08X)", idx,
-          (unsigned)r70, (unsigned)r71, (unsigned)r72, g_ref_cell);
-    }
-
-    if (g_btn_refresh_calls >= 400) return;
-    ++g_btn_refresh_calls;
-    uint32_t vt = 0;
-    safe_read_u32(self, &vt);
-    log("btnrefresh seq=%d idx=%u self=%08X vt=%08X elem=%08X state=%u locked=%d",
-        seq, idx, self, vt, elem, state, idx < 15 ? (g_cell_locked[idx] ? 1 : 0) : -1);
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-  }
-}
-
-// __thiscall(this)，ret。取 ecx 转发。
-static __declspec(naked) void hk_btn_refresh(void) {
-  __asm {
-    pushfd
-    pushad
-    mov ecx, [esp + 0x18]
-    push ecx
-    call btn_refresh_pre
-    add esp, 4
-    mov ecx, [esp + 0x18]
-    call dword ptr [g_orig_btn_refresh]
-    popad
-    popfd
-    ret
-  }
-}
-
-static void install_protocol_btn_refresh_hook() {
-  static bool tried = false;
-  if (tried || !loaded_module() || uprising_active()) return;
-  tried = true;
-  MH_STATUS st = MH_Initialize();
-  if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) return;
-  void* fn = reinterpret_cast<void*>(loaded_module() + (0xA44AB0u - kModBase));
-  st = MH_CreateHook(fn, reinterpret_cast<void*>(&hk_btn_refresh),
-                     reinterpret_cast<void**>(&g_orig_btn_refresh));
-  if (st == MH_OK && g_orig_btn_refresh) {
-    MH_EnableHook(fn);
-    log("protocol btn-refresh hook armed at %p", fn);
-  } else {
-    log("protocol btn-refresh hook failed: %d", (int)st);
-    g_orig_btn_refresh = nullptr;
-  }
-}
 static uint32_t g_panel_calls;
 static uint32_t g_panel_rows;
 static bool protocol_key_banned(uint32_t key);                   // defined below
@@ -5916,33 +5794,13 @@ static const char* row_from_template_scan(uint32_t tmpl) {
 // 零售版里模板 +8 那条链拿不到字符串（[NameDesc+0] 不是 char*），但 [NameDesc+4]
 // 就是货真价实的 NameKey —— 实测 24 个模块的 key 全部能在游戏的 stringhashes 表里
 // 反查到 SpecialPower 模板名，所以按 key 比才是可靠的路。
-struct ModuleBanCache {
-  uint32_t self = 0;
-  bool hit = false;
-};
-static ModuleBanCache g_mod_ban_cache[256];
-
 static bool module_protocol_banned(void* self) {
-  if (!protocol_ban_active() || !self) return false;
-  const uint32_t s = reinterpret_cast<uint32_t>(self);
-  ModuleBanCache& cached = g_mod_ban_cache[(s >> 4) & 255u];
-  if (cached.self == s) return cached.hit;
-  cached.self = s;
-  cached.hit = false;
-  const uint32_t tmpl = sp_module_template(self);
-  if (tmpl) {
-    uint32_t key = 0;
-    sp_template_name(tmpl, &key);
-    if (key && protocol_key_banned(key)) {
-      cached.hit = true;
-      ++g_ban_hook_hits;
-      std::snprintf(g_ban_hook_last, sizeof(g_ban_hook_last), "key=%08X", key);
-      // 记住这个协议在引擎里的身份，供协议面板格子匹配用。
-      remember_ban_ptr(s, tmpl);
-      return true;
-    }
-  }
-  return false;
+  if (!self || !protocol_ban_active()) return false;
+  // The same live module can be allowed, banned, then allowed again.
+  // Resolve its current template (module addresses are also reused on load).
+  const uint32_t desc = sp_template_namedesc(sp_module_template(self));
+  uint32_t key = 0;
+  return desc && safe_read_u32(desc + 4u, &key) && protocol_key_banned(key);
 }
 
 // 诊断：把 isReady / getReadyPercent 见到的模块打出来（每种模块一次）。
@@ -7362,7 +7220,80 @@ static bool protocol_banned(const char* id) {
 }
 
 // 给就绪钩子用的快速判断：一条禁止都没有时不做任何名字解析。
-static bool protocol_ban_active() { return !g_protocol_bans.empty(); }
+// Purchase templates reference PlayerTech assets in global.12.manifest.
+struct PurchaseTech {
+  const char* row;
+  const char* asset;
+};
+static const PurchaseTech kPurchaseTechs[] = {
+    {"PlayerPower_SatelliteSweep", "PlayerTech_Allied_SatelliteSweep"},
+    {"PlayerPower_AirPower", "PlayerTech_Allied_AirPower"},
+    {"PlayerPower_HighTechnology", "PlayerTech_Allied_HighTechnology"},
+    {"PlayerPower_PrecisionStrike", "PlayerTech_Allied_PrecisionStrike"},
+    {"PlayerPower_CryoSatellite1", "PlayerTech_Allied_CryoSatellite_Rank1"},
+    {"PlayerPower_ChronoSwap", "PlayerTech_Allied_ChronoSwap"},
+    {"PlayerPower_ChronoRift1", "PlayerTech_Allied_ChronoRift_Rank1"},
+    {"PlayerPower_CryoSatellite2", "PlayerTech_Allied_CryoSatellite_Rank2"},
+    {"PlayerPower_TimeBomb1", "PlayerTech_Allied_TimeBomb_Rank1"},
+    {"PlayerPower_ChronoRift2", "PlayerTech_Allied_ChronoRift_Rank2"},
+    {"PlayerPower_CryoSatellite3", "PlayerTech_Allied_CryoSatellite_Rank3"},
+    {"PlayerPower_TimeBomb2", "PlayerTech_Allied_TimeBomb_Rank2"},
+    {"PlayerPower_ChronoRift3", "PlayerTech_Allied_ChronoRift_Rank3"},
+    {"PlayerPower_FreeTrade", "PlayerTech_ProductionBonus_Allies"},
+    {"PlayerPower_TimeBomb3", "PlayerTech_Allied_TimeBomb_Rank3"},
+    {"PlayerPower_CrushPuppies", "PlayerTech_Soviet_CrushPuppies"},
+    {"PlayerPower_TerrorDroneEggs", "PlayerTech_Soviet_TerrorDroneEggs"},
+    {"PlayerPower_ProductionKickback", "PlayerTech_Soviet_ProductionKickbacks"},
+    {"PlayerPower_IrradiateTarget", "PlayerTech_Soviet_IrradiateTarget"},
+    {"PlayerPower_OrbitalRefuse1", "PlayerTech_Soviet_OrbitalRefuse_Rank1"},
+    {"PlayerPower_DesolatorBomb1", "PlayerTech_Soviet_DesolatorBomb_Rank1"},
+    {"PlayerPower_MagneticSatellite1", "PlayerTech_Soviet_MagneticSatellite_Rank_1"},
+    {"PlayerPower_OrbitalRefuse2", "PlayerTech_Soviet_OrbitalRefuse_Rank2"},
+    {"PlayerPower_DesolatorBomb2", "PlayerTech_Soviet_DesolatorBomb_Rank2"},
+    {"PlayerPower_MagneticSatellite2", "PlayerTech_Soviet_MagneticSatellite_Rank_2"},
+    {"PlayerPower_OrbitalRefuse3", "PlayerTech_Soviet_OrbitalRefuse_Rank3"},
+    {"PlayerPower_DesolatorBomb3", "PlayerTech_Soviet_DesolatorBomb_Rank3"},
+    {"PlayerPower_MagneticSatellite3", "PlayerTech_Soviet_MagneticSatellite_Rank_3"},
+    {"PlayerPower_MassProduction", "PlayerTech_ProductionBonus_Soviet"},
+    {"PlayerPower_MagneticSingularity", "PlayerTech_Soviet_MagneticSingularity"},
+    {"PlayerPower_NavalPower", "PlayerTech_Japan_NavalPower"},
+    {"PlayerPower_AdvMissilePacks", "PlayerTech_Japan_AdvancedMissilePacks"},
+    {"PlayerPower_EnhancedKamikaze", "PlayerTech_Japan_EnhancedKamikaze"},
+    {"PlayerPower_Ambush", "PlayerTech_Japan_Ambush"},
+    {"PlayerPower_FinalSquadron1", "PlayerTech_Japan_FinalSquadron_Rank1"},
+    {"PlayerPower_PointDefenseDrones", "PlayerTech_Japan_PointDefenseDrones"},
+    {"PlayerPower_BalloonAttack1", "PlayerTech_Japan_BalloonAttack_Rank1"},
+    {"PlayerPower_FinalSquadron2", "PlayerTech_Japan_FinalSquadron_Rank2"},
+    {"PlayerPower_EmperorRage1", "PlayerTech_Japan_EmperorsRage_Rank1"},
+    {"PlayerPower_BalloonAttack2", "PlayerTech_Japan_BalloonAttack_Rank2"},
+    {"PlayerPower_FinalSquadron3", "PlayerTech_Japan_FinalSquadron_Rank3"},
+    {"PlayerPower_EmperorRage2", "PlayerTech_Japan_EmperorsRage_Rank2"},
+    {"PlayerPower_BalloonAttack3", "PlayerTech_Japan_BalloonAttack_Rank3"},
+    {"PlayerPower_RoboticAssembly", "PlayerTech_ProductionBonus_Japan"},
+    {"PlayerPower_EmperorRage3", "PlayerTech_Japan_EmperorsRage_Rank3"},
+};
+
+static SRWLOCK g_purchase_lock = SRWLOCK_INIT;
+static std::unordered_set<uint32_t> g_purchase_keys;
+static uint32_t g_purchase_store = 0;
+static bool g_purchase_overrides[15] = {};
+static void sync_purchase_cells();
+
+static void publish_purchase_bans() {
+  std::unordered_set<uint32_t> keys;
+  for (const auto& tech : kPurchaseTechs) {
+    if (protocol_banned(tech.row)) keys.insert(name_key(tech.asset));
+  }
+  AcquireSRWLockExclusive(&g_purchase_lock);
+  g_purchase_keys.swap(keys);
+  sync_purchase_cells();
+  ReleaseSRWLockExclusive(&g_purchase_lock);
+}
+
+static volatile LONG g_published_ban_count = 0;
+static bool protocol_ban_active() {
+  return InterlockedCompareExchange(&g_published_ban_count, 0, 0) != 0;
+}
 
 static const ProtocolLockEntry* protocol_lock_catalog_impl(int* count) {
   static std::vector<ProtocolLockEntry> view;
@@ -7387,6 +7318,8 @@ static const ProtocolLockEntry* protocol_lock_catalog_impl(int* count) {
   return view.empty() ? nullptr : view.data();
 }
 
+static void rebuild_ban_keys();
+
 static bool protocol_lock_set_impl(const char* type_id, bool locked, std::string* out_msg) {
   if (!type_id || !type_id[0]) {
     if (out_msg) *out_msg = u8"缺少协议代号";
@@ -7408,6 +7341,8 @@ static bool protocol_lock_set_impl(const char* type_id, bool locked, std::string
   } else {
     g_protocol_bans.erase(type_id);
   }
+  rebuild_ban_keys();
+  publish_purchase_bans();
   log("protocol lock %s: %s (%d banned)", type_id, locked ? "ban" : "allow",
       (int)g_protocol_bans.size());
   if (out_msg) {
@@ -7416,7 +7351,7 @@ static bool protocol_lock_set_impl(const char* type_id, bool locked, std::string
   return true;
 }
 
-static void protocol_lock_reset_impl() { g_protocol_bans.clear(); }
+static void protocol_lock_reset_impl() { g_protocol_bans.clear(); rebuild_ban_keys(); publish_purchase_bans(); }
 
 // ---------------------------------------------------------------------------
 // 协议限制（引擎侧）
@@ -7820,43 +7755,35 @@ static void log_name_key_selftest() {
 }
 
 // 当前禁止集合对应的 NameKey 集合，只在禁止表内容变化时重算。
-static uint32_t g_ban_keys[128];
-static int g_ban_keys_n = 0;
-static char g_ban_keys_sig[512] = {};
-
+static SRWLOCK g_ban_keys_lock = SRWLOCK_INIT;
+static std::vector<uint32_t> g_ban_keys;
+static volatile LONG g_ban_keys_n = 0;
 static void rebuild_ban_keys() {
-  char sig[512] = {};
-  size_t used = 0;
+  std::vector<uint32_t> keys;
   for (const std::string& id : g_protocol_bans) {
-    if (used + id.size() + 2 >= sizeof(sig)) break;
-    std::memcpy(sig + used, id.c_str(), id.size());
-    used += id.size();
-    sig[used++] = '\x1f';
+    uint32_t powers[2] = {};
+    const int n = protocol_row_keys(id.c_str(), powers, 2);
+    keys.insert(keys.end(), powers, powers + n);
   }
-  if (std::strcmp(sig, g_ban_keys_sig) == 0) return;
-  std::snprintf(g_ban_keys_sig, sizeof(g_ban_keys_sig), "%s", sig);
-  g_ban_keys_n = 0;
-  for (const std::string& id : g_protocol_bans) {
-    uint32_t keys[2] = {};
-    const int n = protocol_row_keys(id.c_str(), keys, 2);
-    if (n == 0) {
-      log("protocol key: no engine template for %s", id.c_str());
-      continue;
-    }
-    for (int i = 0; i < n && g_ban_keys_n < 128; ++i) g_ban_keys[g_ban_keys_n++] = keys[i];
+  // The sidebar's hasTech check takes the PlayerTech key, whereas the
+  // ready/ready-percent checks take the SpecialPower template key.
+  for (const auto& tech : kPurchaseTechs) {
+    if (protocol_banned(tech.row)) keys.push_back(name_key(tech.asset));
   }
+  std::sort(keys.begin(), keys.end());
+  AcquireSRWLockExclusive(&g_ban_keys_lock);
+  g_ban_keys.swap(keys);
+  InterlockedExchange(&g_ban_keys_n, static_cast<LONG>(g_ban_keys.size()));
+  InterlockedExchange(&g_published_ban_count, static_cast<LONG>(g_protocol_bans.size()));
+  ReleaseSRWLockExclusive(&g_ban_keys_lock);
 }
 
 static bool protocol_key_banned(uint32_t key) {
   if (!key) return false;
-  // 热路径：本函数会被扫描循环调用上万次，绝不能每次都 rebuild_ban_keys()
-  // （它要构造 512 字节签名 + 每项字符串拷贝，之前正是卡顿主因）。
-  // 改为：直接查现成的表；只在表为空时补建一次。
-  if (g_ban_keys_n == 0 && !g_protocol_bans.empty()) rebuild_ban_keys();
-  for (int i = 0; i < g_ban_keys_n; ++i) {
-    if (g_ban_keys[i] == key) return true;
-  }
-  return false;
+  AcquireSRWLockShared(&g_ban_keys_lock);
+  const bool banned = std::binary_search(g_ban_keys.begin(), g_ban_keys.end(), key);
+  ReleaseSRWLockShared(&g_ban_keys_lock);
+  return banned;
 }
 
 constexpr uint32_t kFnPlayerLockTech = 0x00883B10;
@@ -7881,8 +7808,10 @@ static void apply_protocol_tech_locks() {
     return;
   }
   uint32_t seats[kPlayerListSlots] = {};
+  uint32_t count = 0;
+  if (!safe_read_u32(list + kPlayerListCountOff, &count) || count > kPlayerListSlots) return;
   int n = 0;
-  for (int i = 0; i < static_cast<int>(kPlayerListSlots); ++i) {
+  for (uint32_t i = 0; i < count; ++i) {
     uint32_t p = 0;
     if (!safe_read_u32(list + kPlayerListArrayOff + static_cast<uint32_t>(i) * 4u, &p)) continue;
     if (is_ptr(p)) seats[n++] = p;
@@ -7894,8 +7823,6 @@ static void apply_protocol_tech_locks() {
   using FnTech = void(__thiscall*)(uint32_t player, const uint32_t* key_ptr);
   const uint32_t fn_lock = module_base() + (kFnPlayerLockTech - kModBase);
   const uint32_t fn_unlock = module_base() + (kFnPlayerUnlockTech - kModBase);
-
-  rebuild_ban_keys();
 
   // 用引擎自己的 Player::hasTech 验证锁定是否真的生效。
   using FnHasTech = unsigned char(__thiscall*)(uint32_t player, const uint32_t* key_ptr);
@@ -8020,15 +7947,9 @@ static void protocol_ban_tick() {
 
   // 钩子一律尽早装好：面板的行数据只在首次打开时构建，装晚了就永远看不到。
   install_protocol_tech_hook();
-  install_protocol_store_hook();
-  install_protocol_panel_hook();
-  install_protocol_grid_hook();
-  install_protocol_avail_hook();
-  install_protocol_lock_hook();
-  install_protocol_btn_refresh_hook();
-  install_protocol_invoke_hook();
+  install_purchase_store_hooks();
 
-  if (!protocol_ban_active()) {
+  if (!protocol_ban_active() && !g_tech_locked_n) {
     if (want_log) {
       next_log = now + 5000;
       log("protocol ban idle: 0 banned, hook hits=%u last=%s panelCalls=%u panelRows=%u", (unsigned)g_ban_hook_hits,
@@ -8057,33 +7978,17 @@ static void protocol_ban_tick() {
   // 先把已知 key 的禁止项写成引擎自己的科技锁定（协议面板出锁图）。
   apply_protocol_tech_locks();
 
-  // 禁止集合变化时，重算哪些格子该锁：清掉旧记录，等面板下次构建时重新识别。
-  {
-    static size_t last_n = (size_t)-1;
-    static uint32_t last_hash = 0;
-    uint32_t h = 2166136261u;
-    for (const std::string& s : g_protocol_bans) {
-      for (char c : s) h = (h ^ (unsigned char)c) * 16777619u;
-      h = (h ^ 0xFFu) * 16777619u;
-    }
-    if (last_n != g_protocol_bans.size() || last_hash != h) {
-      last_n = g_protocol_bans.size();
-      last_hash = h;
-      protocol_panel_clear_locks();
-      log("protocol ban set changed: %u items, panel lock map reset", (unsigned)last_n);
-    }
-  }
-  // 面板正开着的时候也立刻把状态推给 Flash，不用关掉重开。
-  protocol_panel_live_lock();
   uint32_t local0 = 0;
   safe_read_u32(list + kPlayerListLocalOff, &local0);
+  if (!protocol_ban_active()) return;
   dump_player_protocol_tables(local0);
   int held = 0, seats = 0, nodes = 0, matched = 0;
   uint32_t first_player = 0, local = 0;
     safe_read_u32(list + kPlayerListLocalOff, &local);
   std::string watch;
-
-  for (int i = 0; i < static_cast<int>(kPlayerListSlots); ++i) {
+  uint32_t seat_count = 0;
+  if (!safe_read_u32(list + kPlayerListCountOff, &seat_count) || seat_count > kPlayerListSlots) return;
+  for (uint32_t i = 0; i < seat_count; ++i) {
     uint32_t p = 0;
     if (!safe_read_u32(list + kPlayerListArrayOff + static_cast<uint32_t>(i) * 4u, &p) ||
         !is_ptr(p)) {
@@ -8269,6 +8174,12 @@ static __declspec(naked) void hk_has_tech(void) {
     push dword ptr [esp + 40]    // key（相对 esp4 是 +20，esp9=esp4-20）
     call has_tech_body
     add esp, 24
+    // 上面为了抄现场 push 了 ecx/edx/ebp/edi。不弹掉就 ret 的话，
+    // 返回地址会变成 Player 指针，CPU 跳进去把对象数据当指令执行。
+    pop ecx
+    pop edx
+    pop ebp
+    pop edi
     ret 4
   }
 }
@@ -8634,12 +8545,13 @@ static void __cdecl panel_row_probe(uint32_t self, uint32_t a1, uint32_t a2, uin
       }
     }
     protocol_identity_hunt(self);
-    if (!panel_row_should_dump(row)) return;
-    ++g_panel_rows;
+
     uint32_t dialog = 0;
     safe_read_u32(self + 4u, &dialog);
     if (is_ptr(dialog)) g_panel_dialog = dialog;
     g_panel_row_tick = GetTickCount();
+    if (!panel_row_should_dump(row)) return;
+    ++g_panel_rows;
     compute_lock_reference(dialog);
     log("panel row self=%08X dialog=%08X a1=%u a2=%u row=%08X idx=%u btn=%08X", self, dialog,
         a1, a2, row, a1 + 5u * a2, cell_button_addr(a1 + 5u * a2));
@@ -8970,48 +8882,90 @@ static void protocol_panel_rescan() {
 
 // 面板正开着时立刻生效：写状态并主动让引擎重推一次 SetAvailability，
 // 这样不用关掉重开面板就能看到锁图。
-static void protocol_panel_live_lock() {
-  if (g_protocol_bans.empty()) return;
-  if (!is_ptr(g_panel_dialog)) return;
-  // 面板很久没构建过行数据，说明早就关了，别去碰可能已释放的对象。
-  const DWORD now = GetTickCount();
-  if (g_panel_row_tick == 0) return;
-  if ((int32_t)(now - g_panel_row_tick) > 8000) return;
+// 1.12 store cell constructor and both selection handlers consult cell+0x18.
+// The constructor sets the faction lock image via the native view's image setter.
+using StoreCtor = uint32_t(__thiscall*)(uint32_t, uint32_t, uint32_t);
+using StoreDtor = void(__thiscall*)(uint32_t);
+static StoreCtor g_store_ctor = nullptr;
+static StoreDtor g_store_dtor = nullptr;
 
-  // 先确认哪些格子该锁（先开面板、后设限制的情况靠这一步补上）。
-  bool any = false;
-  for (int i = 0; i < 16; ++i) {
-    if (g_cell_locked[i]) { any = true; break; }
-  }
-  if (!any) {
-    // 这个 rescan 会从渲染线程反向调用引擎的 lookup，代价高且不适合每帧跑。
-    // 限流到 2 秒一次，避免开面板时卡顿。
-    static DWORD last_rescan = 0;
-    if (last_rescan != 0 && (int32_t)(now - last_rescan) < 2000) return;
-    last_rescan = now;
-    protocol_panel_rescan();
-    for (int i = 0; i < 16; ++i) {
-      if (g_cell_locked[i]) { any = true; break; }
+static void sync_purchase_cells() {
+  const uint32_t store = g_purchase_store;
+  if (!store) return;
+  using SetView = void(__thiscall*)(uint32_t, uint32_t);
+  using UpdateCell = void(__thiscall*)(uint32_t);
+  using RemovePending = void(__thiscall*)(uint32_t, uint32_t);
+  using LockImage = uint32_t(__cdecl*)(uint32_t);
+  for (unsigned i = 0; i < 15; ++i) {
+    uint32_t cell, item, data, tech, desc, record, key, view, vt, set_image, set_state;
+    if (!safe_read_u32(store + 0x20 + i * 4, &cell) || !is_ptr(cell) ||
+        !safe_read_u32(cell + 0x14, &item) || !is_ptr(item) ||
+        !safe_read_u32(item, &data) || !safe_read_u32(data + 4, &tech) ||
+        !safe_read_u32(tech, &desc) || !safe_read_u32(desc, &record) ||
+        !safe_read_u32(record + 4, &key)) continue;
+    const bool ban = g_purchase_keys.count(key) != 0;
+    if (ban == g_purchase_overrides[i]) continue;
+    unsigned char native_lock;
+    if (!safe_read_u8(cell + 0x18, &native_lock) || (ban && native_lock)) continue;
+    if (!safe_read_u32(cell + 0x10, &view) || !safe_read_u32(view, &vt) ||
+        !safe_read_u32(vt + 0x24, &set_image) || !safe_read_u32(vt + 0x14, &set_state)) continue;
+    uint32_t image = 0;
+    if (ban) {
+      uint32_t player, side, side_data, side_key;
+      if (safe_read_u32(store + 0x18, &player) && safe_read_u32(player + 0x10, &side) &&
+          safe_read_u32(side, &side_data) && safe_read_u32(side_data + 0x30, &side_key))
+        image = reinterpret_cast<LockImage>(va_of(0xA229B0))(side_key);
+      reinterpret_cast<RemovePending>(va_of(0xA2F5C0))(cell, 0);
+      safe_write_u8(cell + 0x18, 1);
+      reinterpret_cast<SetView>(set_image)(view, image);
+      reinterpret_cast<SetView>(set_state)(view, 1);
+    } else {
+      uint32_t art, art_data;
+      if (safe_read_u32(data + 8, &art) && safe_read_u32(art, &art_data))
+        safe_read_u32(art_data + 4, &image);
+      safe_write_u8(cell + 0x18, 0);
+      reinterpret_cast<SetView>(set_image)(view, image);
+      reinterpret_cast<UpdateCell>(va_of(0xA29910))(cell);
     }
-    if (!any) return;
-  }
-
-  using FnRefresh = void(__thiscall*)(uint32_t self);
-  FnRefresh refresh = reinterpret_cast<FnRefresh>(g_orig_btn_refresh);
-  if (!refresh) return;
-
-  // ★ 只维护"已经确定要锁"的格子，并且限流。
-  //   之前每次 tick 都对全部格子调 refresh，会把面板刷爆导致明显卡顿。
-  static DWORD last_live = 0;
-  if (last_live != 0 && (int32_t)(now - last_live) < 500) return;
-  last_live = now;
-
-  for (uint32_t idx = 0; idx < 15; ++idx) {
-    if (g_cell_locked[idx]) apply_cell_visual_lock(idx);
+    g_purchase_overrides[i] = ban;
+    log("protocol store cell %u key=%08X lock=%d image=%08X", i, key, ban, image);
   }
 }
 
+static uint32_t __fastcall purchase_store_open(uint32_t self, void*, uint32_t a, uint32_t b) {
+  const uint32_t store = g_store_ctor(self, a, b);
+  AcquireSRWLockExclusive(&g_purchase_lock);
+  g_purchase_store = store;
+  std::fill_n(g_purchase_overrides, 15, false);
+  sync_purchase_cells();
+  ReleaseSRWLockExclusive(&g_purchase_lock);
+  return store;
+}
 
+static void __fastcall purchase_store_close(uint32_t self, void*) {
+  AcquireSRWLockExclusive(&g_purchase_lock);
+  if (g_purchase_store == self) g_purchase_store = 0;
+  ReleaseSRWLockExclusive(&g_purchase_lock);
+  g_store_dtor(self);
+}
+
+static void install_purchase_store_hooks() {
+  static bool tried = false;
+  if (tried || uprising_active() || !loaded_module()) return;
+  tried = true;
+  auto close = reinterpret_cast<void*>(va_of(0xA29970));
+  auto open = reinterpret_cast<void*>(va_of(0xA2F610));
+  const MH_STATUS init = MH_Initialize();
+  if ((init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) ||
+      MH_CreateHook(close, reinterpret_cast<void*>(&purchase_store_close),
+                    reinterpret_cast<void**>(&g_store_dtor)) != MH_OK || MH_EnableHook(close) != MH_OK ||
+      MH_CreateHook(open, reinterpret_cast<void*>(&purchase_store_open),
+                    reinterpret_cast<void**>(&g_store_ctor)) != MH_OK || MH_EnableHook(open) != MH_OK) {
+    log("protocol purchase store hooks failed");
+    return;
+  }
+  log("protocol purchase store hooks ready");
+}
 
 // ---------------------------------------------------------------------------
 // 协议身份识别（两条独立通道，只要一条命中就够）
@@ -9518,33 +9472,8 @@ static unsigned char __cdecl panel_avail_probe(uint32_t self, uint32_t a1, uint3
                                                uint32_t ret) {
   const unsigned char orig = (unsigned char)(ret & 1);
   __try {
-    if (a1 > 7 || a2 > 2) return orig;
-
-    // 0xA1B470 返回的是「该格的锁字节」：
-    //     impl = [this + 4]
-    //     obj  = [impl + 0x20 + (a1 + 5*a2)*4]
-    //     ret  = byte [obj + 0x18]        ← 1 = 锁定，0 = 可用
-    // （早期日志 idx=0/1 为 0、idx=2..14 为 1，与此完全一致。）
-    const uint32_t idx = a1 + 5u * a2;
-    // 记录"刚问过哪一格"，供紧随其后的 hasTech 做调用邻接绑定。
-    g_last_avail_idx = (int)idx;
-    g_last_avail_tick = GetTickCount();
-
-    uint32_t impl = 0, obj = 0;
-    const bool geo_ok = safe_read_u32(self + 4u, &impl) && is_ptr(impl) &&
-                        safe_read_u32(impl + 0x20u + idx * 4u, &obj) && is_ptr(obj);
-
-    if (!g_cell_locked[idx]) return orig;   // 只处理被限制的格子，其余一律不碰
-
-    // 科技锁定（锁字节 + 锁图 + 状态）统一交给 apply_cell_visual_lock，
-    // 避免同一份逻辑散落在两处、也避免重复做昂贵的锁图统计。
-    apply_cell_visual_lock(idx);
-
-    if (g_avail_logged < 60) {
-      ++g_avail_logged;
-      log("avail LOCKED a1=%u a2=%u idx=%u orig=%u -> 1", a1, a2, idx, (unsigned)orig);
-    }
-    return 1;   // 强制"锁定"
+    if (a1 >= 5 || a2 >= 3) return orig;
+    return orig;
   } __except (EXCEPTION_EXECUTE_HANDLER) {
   }
   return orig;
@@ -9631,28 +9560,28 @@ static void __cdecl panel_lock_probe(uint32_t thisptr, uint32_t locked, uint32_t
   }
 }
 
-// 0xA69800(ecx=this, arg1=locked, arg2) ret 8
+// 0xA69800(ecx=this, arg1=locked 一个字节) ret 4。
+// 之前按 ret 8、两个参数转发，原函数只弹出 4 字节，栈少了一格，
+// 返回后下一次虚调用会跳到栈上的小整数（这次是 0x202）。
 static __declspec(naked) void hk_lock_set(void) {
   __asm {
     pushfd
     pushad
-    // 先转发原函数，保持流程完全不变
-    mov eax, [esp + 0x2C]        // arg2
-    mov edx, [esp + 0x28]        // arg1 = locked
+    mov edx, [esp + 0x28]        // locked
     mov ecx, [esp + 0x18]        // this
-    push eax
     push edx
-    call dword ptr [g_orig_lock_set]
+    call dword ptr [g_orig_lock_set]  // ret 4，清掉这一次 push
     mov [esp + 0x1C], eax
-    push eax                     // panel_lock_probe(this, locked, arg2)
-    push dword ptr [esp + 0x30]
-    push dword ptr [esp + 0x30]
-    push dword ptr [esp + 0x24]
+    mov edx, [esp + 0x28]
+    mov ecx, [esp + 0x18]
+    push 0
+    push edx
+    push ecx
     call panel_lock_probe
-    add esp, 16
+    add esp, 12
     popad
     popfd
-    ret 8
+    ret 4
   }
 }
 
@@ -12135,6 +12064,13 @@ bool protocol_lock_set(const char* type_id, bool locked, std::string* out_msg) {
 }
 
 void protocol_lock_reset() { protocol_lock_reset_impl(); }
+
+void release_purchase_locks() {
+  AcquireSRWLockExclusive(&g_purchase_lock);
+  g_purchase_keys.clear();
+  sync_purchase_cells();
+  ReleaseSRWLockExclusive(&g_purchase_lock);
+}
 
 void roster_set_active(bool on) {
   const bool rising = on && !g_roster_active;

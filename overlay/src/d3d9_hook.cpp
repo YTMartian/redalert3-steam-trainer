@@ -714,6 +714,7 @@ void stop() {
   }
   if (g_hooked || g_target_present || g_target_end_scene || g_target_reset ||
       g_target_swap_present || g_target_begin_scene) {
+    game_api::release_purchase_locks();
     MH_DisableHook(MH_ALL_HOOKS);
   }
   // 等还在 hk_present 里的帧走完（Present 可能被 vsync 卡住），最多等 800ms。
